@@ -35,13 +35,15 @@ class NotificationService:
         recipient_id: str,
         channel: str,
         payload: str,
+        fallback_group: str = "",
     ) -> int:
-        """Enqueue a message into the persistent outbox table."""
+        """Enqueue a message into the persistent outbox table with deduplication."""
         now = int(time.time())
         sql = """
         INSERT INTO notification_outbox (
             event_key, recipient_id, channel, payload, status, attempts, next_retry_at, created_at
         ) VALUES (?, ?, ?, ?, 'PENDING', 0, ?, ?)
+        ON CONFLICT(event_key) DO NOTHING
         """
         params = (
             str(event_key).strip(),
@@ -65,7 +67,7 @@ class NotificationService:
         recipients: list[str],
         fallback_group: str = "",
     ) -> None:
-        """Enqueue application notice to reviewer private messages and optional fallback group."""
+        """Enqueue application notice to reviewer private messages. Fallback group only used on failure."""
         msg = (
             f"【Bot 使用权限申请】\n\n"
             f"申请编号：{app_id}\n"
@@ -86,9 +88,12 @@ class NotificationService:
                     recipient_id=admin_qq,
                     channel="private",
                     payload=msg,
+                    fallback_group=fallback_group,
                 )
 
-        if fallback_group:
+        # Store fallback group association in case all private notifications fail
+        if fallback_group and not recipients:
+            # If no private admin configured at all, fallback directly
             await self.enqueue(
                 event_key=f"APP_NOTIF_{app_id}_GROUP_{fallback_group}",
                 recipient_id=str(fallback_group).strip(),
@@ -152,14 +157,14 @@ class NotificationService:
 
             try:
                 if channel == "private":
-                    res = await self.client.send_private_msg(recipient, payload)
+                    ok, data, err_msg, retcode = await self.client.send_private_msg(recipient, payload)
                 else:
-                    res = await self.client.send_group_msg(recipient, payload)
+                    ok, data, err_msg, retcode = await self.client.send_group_msg(recipient, payload)
 
-                if res.get("status") == "ok" or res.get("retcode") == 0:
+                if ok:
                     success = True
                 else:
-                    last_error = str(res.get("msg") or res.get("message") or f"retcode {res.get('retcode')}")
+                    last_error = f"{err_msg} (retcode={retcode})"
             except Exception as e:
                 last_error = str(e)
 

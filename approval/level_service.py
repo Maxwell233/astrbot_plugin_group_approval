@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 from .models import GroupMemberLevelResult
-from .napcat_client import NapCatClient
+from .napcat_client import NapCatClient, normalize_onebot_response
 
 logger = logging.getLogger("astrbot_plugin_group_approval.level")
 
@@ -102,7 +102,7 @@ class LevelService:
 
         # 3. Perform actual remote query
         try:
-            result = await self._fetch_from_napcat(g_id, u_id, force_refresh)
+            result = await self._fetch_from_napcat(b_id, g_id, u_id, force_refresh)
             # Store in cache only on successful member lookup
             if result.success and result.is_member:
                 self._cache[key] = (result, now + self.cache_ttl)
@@ -110,14 +110,14 @@ class LevelService:
             if not future.done():
                 future.set_result(result)
             return result
-        except Exception:
+        except Exception as e:
             err_res = GroupMemberLevelResult(
                 success=False,
                 level=0,
                 is_member=False,
                 group_id=g_id,
                 user_id=u_id,
-                error_code="QUERY_EXCEPTION",
+                error_code=f"QUERY_EXCEPTION_{type(e).__name__}",
             )
             if not future.done():
                 future.set_result(err_res)
@@ -128,25 +128,35 @@ class LevelService:
 
     async def _fetch_from_napcat(
         self,
+        bot_id: str,
         group_id: str,
         user_id: str,
         force_refresh: bool,
     ) -> GroupMemberLevelResult:
         """Call NapCat OneBot API and validate responses."""
-        resp = await self.client.get_group_member_info(
-            group_id=group_id,
-            user_id=user_id,
-            no_cache=force_refresh,
-        )
+        try:
+            res = await self.client.get_group_member_info(
+                group_id=group_id,
+                user_id=user_id,
+                bot_self_id=bot_id,
+                no_cache=force_refresh,
+            )
+        except TypeError:
+            res = await self.client.get_group_member_info(
+                group_id=group_id,
+                user_id=user_id,
+                no_cache=force_refresh,
+            )
 
-        status = resp.get("status")
-        retcode = resp.get("retcode")
-        data = resp.get("data")
+        if isinstance(res, tuple) and len(res) == 4:
+            ok, data, err_msg, retcode = res
+        else:
+            ok, data, err_msg, retcode = normalize_onebot_response(res)
 
         # Check for successful OneBot response
-        if status != "ok" or retcode != 0 or not isinstance(data, dict):
+        if not ok or not isinstance(data, dict):
             logger.warning(
-                f"NapCat get_group_member_info failed for group={group_id}, user={user_id}: {resp}"
+                f"NapCat get_group_member_info failed for bot={bot_id}, group={group_id}, user={user_id}: {err_msg} (retcode={retcode})"
             )
             return GroupMemberLevelResult(
                 success=False,
@@ -155,8 +165,8 @@ class LevelService:
                 is_member=False,
                 group_id=group_id,
                 user_id=user_id,
-                error_code=f"RETCODE_{retcode}",
-                raw_data=resp,
+                error_code=f"RETCODE_{retcode}" if retcode != 0 else err_msg,
+                raw_data={"error_msg": err_msg, "retcode": retcode},
             )
 
         # Validate that returned group_id and user_id match
