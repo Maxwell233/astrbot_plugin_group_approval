@@ -443,9 +443,16 @@ class NapCatClient:
         await self._discover()
         return self._match_binding(target, normalized_platform_id)
 
-    async def verify_bot(self, bot_self_id: str) -> bool:
-        """Require a fresh routed login probe for a Dashboard mutation."""
-        binding = await self._resolve_verified(bot_self_id, None)
+    async def has_verified_bot(self, bot_self_id: str, platform_id: str) -> bool:
+        """Confirm an inbound Bot is bound to this AIOCQHTTP instance."""
+        if not platform_id:
+            return False
+        binding = await self._resolve_verified(bot_self_id, platform_id)
+        return binding is not None and binding.source == "login_info"
+
+    async def verify_bot(self, bot_self_id: str, *, platform_id: str | None = None) -> bool:
+        """Require a fresh routed login probe for an administrative mutation."""
+        binding = await self._resolve_verified(bot_self_id, platform_id)
         if binding is None:
             return False
         qq = await self._query_login_info(binding.client, self_id_hint=binding.self_id)

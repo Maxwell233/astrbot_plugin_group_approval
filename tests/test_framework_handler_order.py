@@ -8,8 +8,8 @@ These tests run only in an environment where the real AstrBot package is install
 
 What is REAL here: the AstrBot decorators, the global ``star_handlers_registry``, the
 actual ``extras_configs["priority"]`` values, the registry's dispatch order, a real
-``AstrMessageEvent`` and its real ``stop_event()``/``is_stopped()``, and the plugin's own
-gate handler registration (imported from ``main``).
+``AstrMessageEvent`` and its real ``stop_event()``/``is_stopped()``, and the plugin's command registration. The proxy gate tests preserve
+regression evidence for the old layout.
 
 What is still simulated: the pipeline loop itself. It is reproduced from the verified
 AstrBot source (``astrbot/core/pipeline/process_stage/method/star_request.py:39-41,88-89``:
@@ -27,12 +27,11 @@ astrbot = pytest.importorskip("astrbot")
 
 from astrbot.api.event import filter  # noqa: E402
 from astrbot.core.platform.astr_message_event import AstrMessageEvent  # noqa: E402
-from astrbot.core.platform.astrbot_message import AstrBotMessage, Group, MessageMember  # noqa: E402
-from astrbot.core.platform.message_type import MessageType  # noqa: E402
-from astrbot.core.platform.platform_metadata import PlatformMetadata  # noqa: E402
+from astrbot.core.platform.astrbot_message import MessageMember  # noqa: E402
 from astrbot.core.star.star_handler import EventType, star_handlers_registry  # noqa: E402
 
 from main import GroupApprovalPlugin  # noqa: E402
+from tests.framework_event import _make_event  # noqa: E402
 
 GATE_PRIORITY = 50
 
@@ -62,26 +61,6 @@ async def ordinary_business_default(event: AstrMessageEvent):
     event.set_extra("business_ran", True)
 
 
-def _make_event(message_str: str = "hello", stop: bool = False) -> AstrMessageEvent:
-    msg = AstrBotMessage()
-    msg.type = MessageType.GROUP_MESSAGE
-    msg.self_id = "11111"
-    msg.session_id = "10001"
-    msg.message_id = "m1"
-    msg.group = Group(group_id="10001")
-    msg.sender = MessageMember(user_id="30001", nickname="tester")
-    msg.message = []
-    msg.message_str = message_str
-    meta = PlatformMetadata(name="aiocqhttp", description="test", id="test-platform")
-    event = AstrMessageEvent(
-        message_str=message_str,
-        message_obj=msg,
-        platform_meta=meta,
-        session_id="10001",
-    )
-    if stop:
-        event.stop_event()
-    return event
 
 
 @pytest.fixture(autouse=True)
@@ -147,11 +126,11 @@ def test_registry_stores_real_priority_from_decorator():
     assert _index_of(handlers, "proxy_gate_50") < _index_of(handlers, "ordinary_business_default")
 
 
-def test_plugin_gate_is_registered_at_priority_50_in_real_registry():
+
+def test_plugin_registers_only_commands_and_no_global_gate():
     handlers = _adapter_handlers_in_dispatch_order()
-    gate = next(h for h in handlers if h.handler_name == "on_message_gate")
-    assert int(gate.extras_configs["priority"]) == GATE_PRIORITY
-    assert gate.handler_full_name.endswith("on_message_gate")
+    assert all(h.handler_name != "on_message_gate" for h in handlers)
+    assert {"cmd_apply_group", "cmd_apply_private", "cmd_ga"} <= {h.handler_name for h in handlers}
 
 
 def test_patched_moderation_runs_before_gate_and_business_never_runs():
@@ -224,106 +203,74 @@ async def _make_plugin(tmp_path):
     return plugin
 
 
-def _gate_result(event, plugin):
-    """Drain the real plugin gate async generator the way AstrBot does."""
-    import asyncio
 
-    async def _run():
-        replies = []
-        async for item in plugin.on_message_gate(event):
-            replies.append(item)
-        return replies
-
-    return asyncio.run(_run())
+async def _verified(*args):
+    return True
 
 
-def test_real_gate_blocks_unauthorized_user_end_to_end(tmp_path):
-    import asyncio
 
-    plugin = asyncio.run(_make_plugin(tmp_path))
+async def test_native_check_denies_without_stopping_message(tmp_path, monkeypatch):
+    plugin = await _make_plugin(tmp_path)
     try:
-        # Untargeted plain text is blocked silently (anti-spam design): stopped, no reply.
-        silent = _make_event("请帮我写一段代码")
-        silent.is_at_or_wake_command = False
-        silent_replies = _gate_result(silent, plugin)
-        assert silent.is_stopped() is True
-        assert silent_replies == []
-
-        # A prefixed command gets an explicit rejection notice.
+        monkeypatch.setattr(plugin.napcat, "has_verified_bot", _verified)
         event = _make_event("/jrys")
-        event.is_at_or_wake_command = False
-        replies = _gate_result(event, plugin)
-        assert event.is_stopped() is True
-        assert replies, "gate must yield the rejection notice for a prefixed request"
-        assert "权限拦截" in str(replies[0])
-    finally:
-        asyncio.run(plugin.terminate())
-
-
-def test_real_gate_executes_admission_command_and_stops_event(tmp_path):
-    """An admission command is executed by the gate itself, never forwarded to handlers."""
-    import asyncio
-
-    plugin = asyncio.run(_make_plugin(tmp_path))
-    try:
-        event = _make_event("我的权限")
-        event.is_at_or_wake_command = True
-        replies = _gate_result(event, plugin)
-        assert event.is_stopped() is True, "gate must stop the event after executing the command"
-        assert replies
-        # CommandDispatcher.handle_my_status actually ran (the group has no policy yet).
-        assert "群 10001" in str(replies[0])
-    finally:
-        asyncio.run(plugin.terminate())
-
-
-def test_real_gate_blocks_unauthorized_but_allows_granted_user(tmp_path):
-    import asyncio
-    import time
-
-    plugin = asyncio.run(_make_plugin(tmp_path))
-    try:
-        now = int(time.time())
-        asyncio.run(
-            plugin.db.execute(
-                "INSERT INTO group_policies (bot_self_id, group_id, enabled, min_level, "
-                "recheck_interval_seconds, created_at, updated_at) VALUES "
-                "('11111', '10001', 1, 10, 300, ?, ?)",
-                (now, now),
-            )
-        )
-        asyncio.run(
-            plugin.db.execute(
-                "INSERT INTO grants (id, bot_self_id, group_id, user_id, status, approved_by, "
-                "approved_at, expires_at, last_verified_level, last_verified_at) VALUES "
-                "('G1', '11111', '10001', '30001', 'ACTIVE', 'test', ?, 0, 20, ?)",
-                (now, now),
-            )
-        )
-
-        allowed_event = _make_event("请帮我写一段代码")
-        _gate_result(allowed_event, plugin)
-        assert allowed_event.is_stopped() is False, "granted user must reach business handlers"
-
-        other_user = _make_event("请帮我写一段代码")
-        other_user.message_obj.sender = MessageMember(user_id="30002", nickname="other")
-        _gate_result(other_user, plugin)
-        assert other_user.is_stopped() is True, "a different unauthorized user is still blocked"
-    finally:
-        asyncio.run(plugin.terminate())
-
-
-def test_non_onebot_event_skips_registered_gate(tmp_path):
-    plugin = asyncio.run(_make_plugin(tmp_path))
-    try:
-        event = _make_event("!help")
-        event.platform_meta.name = "telegram"
-        gate = next(h for h in _adapter_handlers_in_dispatch_order() if h.handler_name == "on_message_gate")
-        assert not all(item.filter(event, {}) for item in gate.event_filters)
-        _gate_result(event, plugin)
+        assert "尚无" in await plugin._check_native_chat(event)
         assert not event.is_stopped()
     finally:
-        asyncio.run(plugin.terminate())
+        await plugin.terminate()
+
+
+
+async def test_admission_command_skips_only_implicit_llm(tmp_path, monkeypatch):
+    plugin = await _make_plugin(tmp_path)
+    try:
+        monkeypatch.setattr(plugin.napcat, "has_verified_bot", _verified)
+        event = _make_event("我的权限")
+        replies = [reply async for reply in plugin.cmd_my_status(event)]
+        assert replies
+        assert event.call_llm
+        assert not event.is_stopped()
+    finally:
+        await plugin.terminate()
+
+
+
+async def test_native_check_allows_scope_grant_and_rejects_other_user(tmp_path, monkeypatch):
+    plugin = await _make_plugin(tmp_path)
+    try:
+        monkeypatch.setattr(plugin.napcat, "has_verified_bot", _verified)
+        await plugin.scopes.manual_grant(
+            "11111", "30001", "GROUP", "99999", level_exempt=True, membership_exempt=True
+        )
+        assert await plugin._check_native_chat(_make_event()) is None
+        from astrbot.core.platform.message_type import MessageType
+
+        other_group = _make_event()
+        other_group.message_obj.group.group_id = "90001"
+        assert await plugin._check_native_chat(other_group) is None
+        private = _make_event()
+        private.message_obj.type = MessageType.FRIEND_MESSAGE
+        private.session.message_type = MessageType.FRIEND_MESSAGE
+        assert "私聊" in await plugin._check_native_chat(private)
+        event = _make_event()
+        event.message_obj.sender = MessageMember(user_id="30002", nickname="other")
+        assert await plugin._check_native_chat(event)
+    finally:
+        await plugin.terminate()
+
+
+
+async def test_non_onebot_event_skips_registered_commands(tmp_path):
+    plugin = await _make_plugin(tmp_path)
+    try:
+        event = _make_event("我的权限")
+        event.platform_meta.name = "telegram"
+        command = next(h for h in _adapter_handlers_in_dispatch_order() if h.handler_name == "cmd_my_status")
+        assert not all(item.filter(event, {}) for item in command.event_filters)
+        assert [reply async for reply in plugin.cmd_my_status(event)] == []
+        assert not event.is_stopped()
+    finally:
+        await plugin.terminate()
 
 
 def test_diagnostics_does_not_mistake_a_high_priority_sibling_for_main(monkeypatch):
@@ -335,7 +282,12 @@ def test_diagnostics_does_not_mistake_a_high_priority_sibling_for_main(monkeypat
     from approval.diagnostics import HandlerDiagnostics
 
     module = "data.plugins.astrbot_plugin_group_guardian.main"
-    gate = next(h for h in star_handlers_registry if h.handler_name == "on_message_gate")
+    gate = copy(next(h for h in star_handlers_registry if h.handler_name == "proxy_gate_50"))
+    from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterTypeFilter
+    gate.handler_name = "on_message_gate"
+    gate.handler_full_name = f"{gate.handler_module_path}_on_message_gate"
+    gate.event_filters = [*gate.event_filters, PlatformAdapterTypeFilter("aiocqhttp")]
+    star_handlers_registry.append(gate)
     monkeypatch.setitem(star_map, gate.handler_module_path, SimpleNamespace(
         activated=True, name="astrbot_plugin_group_approval",
     ))
@@ -348,8 +300,6 @@ def test_diagnostics_does_not_mistake_a_high_priority_sibling_for_main(monkeypat
     main_handler.handler_module_path = module
     main_handler.handler_name = "_handle_message"
     main_handler.handler_full_name = f"{module}__handle_message"
-    from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterTypeFilter
-
     main_handler.event_filters = [*main_handler.event_filters, PlatformAdapterTypeFilter("aiocqhttp")]
     star_handlers_registry.append(sibling)
     star_handlers_registry.append(main_handler)
@@ -365,28 +315,22 @@ def test_diagnostics_does_not_mistake_a_high_priority_sibling_for_main(monkeypat
     assert HandlerDiagnostics().diagnose_handlers()["moderation_precedence"] == "UNVERIFIED"
 
 
-def test_passive_capture_waits_for_admission_decision(tmp_path):
-    plugin = asyncio.run(_make_plugin(tmp_path))
-    try:
-        captured = []
-        denied = _make_event("!help")
-        denied.set_extra("group_approval.livingmemory_capture", lambda: captured.append("denied"))
-        _gate_result(denied, plugin)
-        assert denied.is_stopped()
-        assert not captured
 
-        allowed = _make_event("hello")
-        plugin.plugin_config.owner_qq_ids.append(allowed.get_sender_id())
-        plugin.plugin_config.default_policy = "allow"
-        allowed.set_extra("group_approval.livingmemory_capture", lambda: captured.append("allowed"))
-        _gate_result(allowed, plugin)
-        assert captured == ["allowed"]
+async def test_native_admission_leaves_passive_capture_alone(tmp_path, monkeypatch):
+    plugin = await _make_plugin(tmp_path)
+    try:
+        monkeypatch.setattr(plugin.napcat, "has_verified_bot", _verified)
+        event = _make_event("hello")
+        sentinel = object()
+        event.set_extra("group_approval.livingmemory_capture", sentinel)
+        assert await plugin._check_native_chat(event)
+        assert event.get_extra("group_approval.livingmemory_capture") is sentinel
+        assert not event.is_stopped()
     finally:
-        asyncio.run(plugin.terminate())
+        await plugin.terminate()
 
 
 async def test_shipped_guardian_decorators_register_priority_and_run_in_real_stage(monkeypatch, tmp_path):
-    from copy import copy
     from pathlib import Path
     from types import SimpleNamespace
 
@@ -408,24 +352,22 @@ async def test_shipped_guardian_decorators_register_priority_and_run_in_real_sta
 
     plugin = await _make_plugin(tmp_path)
     try:
-        gate = copy(next(h for h in star_handlers_registry if h.handler_name == "on_message_gate"))
-        gate.handler = plugin.on_message_gate
+        monkeypatch.setattr(plugin.napcat, "has_verified_bot", _verified)
         business = next(h for h in star_handlers_registry if h.handler_name == "ordinary_business_default")
-        for handler in (guardian, gate, business):
+        for handler in (guardian, business):
             monkeypatch.setitem(star_map, handler.handler_module_path, SimpleNamespace(
                 activated=True, name=handler.handler_module_path, display_name="",
             ))
         event = _make_event()
         event.set_extra("activated_handlers", [
-            gate if h.handler_name == "on_message_gate" else h
-            for h in _adapter_handlers_in_dispatch_order()
-            if h in (guardian, business) or h.handler_name == "on_message_gate"
+            h for h in _adapter_handlers_in_dispatch_order() if h in (guardian, business)
         ])
         async for _ in StarRequestSubStage().process(event):
             pass
         assert event.get_extra("moderation_ran") is True
-        assert event.is_stopped()
-        assert event.get_extra("business_ran") is None
+        assert await plugin._check_native_chat(event)
+        assert not event.is_stopped()
+        assert event.get_extra("business_ran") is True
     finally:
         await plugin.terminate()
 

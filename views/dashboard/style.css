@@ -479,3 +479,14 @@ body {
   opacity: 0;
   transform: translateY(8px);
 }
+
+.scope-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-block: 12px;
+}
+#bot-panel section { margin-block: 16px; }
+#bot-panel .table-container { overflow-x: auto; margin-block: 12px; }
+#bot-panel table { width: 100%; }

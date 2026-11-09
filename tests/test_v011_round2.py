@@ -14,7 +14,6 @@ from approval.level_service import LevelService
 from approval.models import GrantStatus
 from approval.napcat_client import NapCatClient, normalize_onebot_response
 from approval.notification_service import NotificationService
-from main import GroupApprovalPlugin
 
 
 # 1. Dashboard authentication & authorization (identity separation)
@@ -67,64 +66,13 @@ async def test_webui_auth_enforcement(access_system):
 
 
 # 2. Post-Type Filtering: Notices & Requests are NEVER intercepted
-@pytest.mark.asyncio
-async def test_gate_post_type_filtering(access_system):
-    access, approval, db, napcat, config = access_system
-    plugin = GroupApprovalPlugin(context=None)
-    plugin.plugin_config = config
-    plugin.access_service = access
-    plugin.approval_service = approval
-    plugin.gate.access = access
-    plugin.gate.config = config
+def test_post_type_filtering_only_identifies_chat_messages():
+    from main import _is_chat_message
 
-    # Mock AstrBot event
-    class MockAstrEvent:
-        def __init__(self, post_type: str, msg_str: str = "hello"):
-            self.stopped = False
-            self.results = []
-            self.post_type = post_type
-            self.message_str = msg_str
-            self.message_obj = MagicMock()
-            self.message_obj.post_type = post_type
-            self.message_obj.self_id = "11111"
-            self.message_obj.sender = MagicMock(role="member")
-            self.message_obj.message = []
-
-        def get_platform_name(self):
-            return "aiocqhttp"
-
-        def get_self_id(self):
-            return "11111"
-
-        def get_group_id(self):
-            return "10001"
-
-        def get_sender_id(self):
-            return "30001"
-
-        def stop_event(self):
-            self.stopped = True
-
-        def plain_result(self, text):
-            return text
-
-    # Event 1: Notice event (member join) -> MUST NOT be intercepted
-    notice_event = MockAstrEvent(post_type="notice")
-    async for _ in plugin.on_message_gate(notice_event):
-        pass
-    assert notice_event.stopped is False
-
-    # Event 2: Request event (friend request / group invite) -> MUST NOT be intercepted
-    request_event = MockAstrEvent(post_type="request")
-    async for _ in plugin.on_message_gate(request_event):
-        pass
-    assert request_event.stopped is False
-
-    # Event 3: Message event from unauthorized user -> MUST be intercepted
-    msg_event = MockAstrEvent(post_type="message", msg_str="!help")
-    async for _ in plugin.on_message_gate(msg_event):
-        pass
-    assert msg_event.stopped is True
+    event = object()
+    assert not _is_chat_message(event, {"post_type": "notice"})
+    assert not _is_chat_message(event, {"post_type": "request"})
+    assert _is_chat_message(event, {"post_type": "message"})
 
 
 # 3. Strict Level Pattern Parsing

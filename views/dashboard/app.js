@@ -1,6 +1,6 @@
 /**
  * Frontend script for the AstrBot Group Approval WebUI dashboard.
- * Version: 0.1.1 (Early Development & Debugging)
+ * Version: 0.1.2 (Early Development & Debugging)
  *
  * CANONICAL LOCATION: views/dashboard/ (AstrBot 4.26+ / 4.29.4 prefers "views";
  * "pages/" is only a legacy alias and must not carry a second copy).
@@ -27,11 +27,7 @@ const BRIDGE_READY_TIMEOUT_MS = 1500;
 const IS_EMBEDDED = window.parent !== window;
 const BRIDGE = IS_EMBEDDED ? (window.AstrBotPluginView || window.AstrBotPluginPage) : null;
 
-const state = {
-  verifiedBots: [],
-  groupPolicies: [],
-  diagnostics: null,
-};
+const state = { verifiedBots: [], settingsBot: "", readSequence: 0 };
 
 // ---------------------------------------------------------------------------
 // Tiny DOM helpers (XSS-safe by construction)
@@ -80,40 +76,6 @@ function formatDate(ts) {
   return new Date(n * 1000).toLocaleString("zh-CN", { hour12: false });
 }
 
-function statusTag(status) {
-  const map = {
-    PENDING: ["待审批", "tag-pending"],
-    APPROVED: ["已批准", "tag-active"],
-    ACTIVE: ["正常使用", "tag-active"],
-    REJECTED: ["已拒绝", "tag-rejected"],
-    REVOKED: ["已撤销", "tag-revoked"],
-    SUSPENDED: ["已暂停", "tag-suspended"],
-    CANCELLED: ["已取消", "tag-expired"],
-    EXPIRED: ["已过期", "tag-expired"],
-  };
-  const key = String(status || "").toUpperCase();
-  const entry = map[key];
-  if (entry) return el("span", { className: `tag ${entry[1]}`, text: entry[0] });
-  return el("span", { className: "tag", text: key || "-" });
-}
-
-function actionButton(label, className, onClick, botId = "") {
-  const button = el("button", {
-    className: `btn btn-sm ${className}`,
-    text: label,
-    attrs: { type: "button" },
-  });
-  if (botId) button.disabled = !state.verifiedBots.includes(String(botId));
-  button.addEventListener("click", (event) => {
-    event.preventDefault();
-    onClick(button);
-  });
-  return button;
-}
-
-// ---------------------------------------------------------------------------
-// Toast notifications
-// ---------------------------------------------------------------------------
 function toast(message, type = "info") {
   let container = $("toast-container");
   if (!container) {
@@ -288,801 +250,164 @@ function getSelectedBotId() {
   return state.verifiedBots.includes(value) ? value : "";
 }
 
-function getWriteBotId() {
-  const selected = getSelectedBotId();
-  if (selected) return selected;
-  // A single verified bot is unambiguous; never fall back to "default" or a guess.
-  return state.verifiedBots.length === 1 ? state.verifiedBots[0] : "";
+async function mutate(bot, action, payload = {}) {
+  if (!state.verifiedBots.includes(String(bot))) {
+    throw new Error("请选择已核验的 Bot。");
+  }
+  const response = await apiCall("scope/action", "POST", { ...payload, bot_self_id: bot, action });
+  return response.data?.message || response.message || "已保存";
 }
 
-function requireWriteBot(botId = getWriteBotId()) {
-  if (botId && !state.verifiedBots.includes(botId)) {
-    toast("此记录所属的 Bot 当前未通过连接验证", "error");
-    return "";
-  }
-  if (!botId) {
-    toast(
-      state.verifiedBots.length === 0
-        ? "未检测到已验证的 Bot 实例"
-        : "请先在右上角选择具体的已验证 Bot",
-      "error"
-    );
-    return "";
-  }
-  return botId;
+function button(label, work) {
+  const node = el("button", { text: label, className: "btn btn-secondary btn-sm", attrs: { type: "button" } });
+  node.addEventListener("click", () => runAction(work, node));
+  return node;
 }
 
-function syncActionAvailability() {
-  const writeBot = getWriteBotId();
-  const hint = $("bot-hint");
-  if (hint) {
-    if (state.verifiedBots.length === 0) {
-      hint.textContent = "未检测到已验证的 Bot 实例";
-      hint.hidden = false;
-    } else if (writeBot && !getSelectedBotId()) {
-      hint.textContent = `写操作将使用唯一已验证 Bot: ${writeBot}`;
-      hint.hidden = false;
-    } else if (!writeBot) {
-      hint.textContent = "请选择具体 Bot 以启用写操作";
-      hint.hidden = false;
-    } else {
-      hint.hidden = true;
-      hint.textContent = "";
-    }
+async function runAction(work, node) {
+  node.disabled = true;
+  try {
+    const message = await work();
+    if (message) toast(message, "success");
+    await loadState();
+  } catch (error) {
+    toastError(error);
+  } finally {
+    node.disabled = false;
   }
+}
 
-  document.querySelectorAll(".requires-bot").forEach((button) => {
-    button.disabled = !writeBot;
-    if (writeBot) {
-      button.removeAttribute("title");
-    } else {
-      button.setAttribute("title", "请先选择已验证的 Bot 实例");
+async function reviewApplication(row, action, note = "") {
+  return mutate(row.bot_self_id, action, { application_id: row.id, note });
+}
+
+async function changeGrant(row, action) {
+  return mutate(row.bot_self_id, action, { user_id: row.user_id, scope: row.scope });
+}
+
+function renderRows(id, rows, columns, actions) {
+  const body = $(id);
+  body.replaceChildren();
+  if (!rows.length) {
+    renderTableMessage(body, columns.length + Number(Boolean(actions)), "暂无记录");
+    return;
+  }
+  for (const row of rows) {
+    const tr = el("tr");
+    for (const column of columns) tr.appendChild(cell(column(row)));
+    if (actions) {
+      const td = el("td");
+      for (const action of actions(row)) td.appendChild(action);
+      tr.appendChild(td);
     }
-  });
+    body.appendChild(tr);
+  }
+}
 
-  const groupSave = $("modal-group-save");
-  if (groupSave) groupSave.disabled = !state.verifiedBots.includes(groupModalBotId);
-  const grantOpen = $("btn-open-manual-grant");
-  if (grantOpen) grantOpen.disabled = !writeBot;
+function renderSettings(bot, data) {
+  state.settingsBot = bot;
+  const settings = data.settings;
+  $("primary-group").value = settings.primary_group_id;
+  $("cache-ttl").value = settings.cache_ttl;
+  for (const key of ["group_to_private", "private_to_group", "owner_bypass"]) {
+    $(key).checked = Boolean(settings[key]);
+  }
+  for (const scope of ["GROUP", "PRIVATE"]) {
+    $(`level-${scope}`).value = data.policies[scope].min_level;
+    $(`approval-${scope}`).checked = Boolean(data.policies[scope].approval_required);
+  }
+}
+
+async function saveSettings() {
+  const bot = state.settingsBot;
+  const payload = {
+    cache_ttl: $("cache-ttl").value,
+    group_to_private: $("group_to_private").checked,
+    private_to_group: $("private_to_group").checked,
+    owner_bypass: $("owner_bypass").checked,
+    group: { min_level: $("level-GROUP").value, approval_required: $("approval-GROUP").checked },
+    private: { min_level: $("level-PRIVATE").value, approval_required: $("approval-PRIVATE").checked },
+  };
+  const primary = $("primary-group").value.trim();
+  if (primary) payload.primary_group_id = primary;
+  return mutate(bot, "configure", payload);
 }
 
 async function loadBots() {
+  const { data } = await apiCall("bots");
+  state.verifiedBots = Array.isArray(data.verified_bots) ? data.verified_bots.map(String) : [];
   const select = $("global-bot-select");
-  if (!select) return;
-  try {
-    const res = await apiCall("bots");
-    const data = res && res.data && typeof res.data === "object" ? res.data : {};
-    state.verifiedBots = Array.isArray(data.verified_bots) ? data.verified_bots : [];
-
-    const previous = select.value;
-    select.replaceChildren();
-    select.appendChild(el("option", { text: "全部 Bot", attrs: { value: "" } }));
-    state.verifiedBots.forEach((bot) => {
-      select.appendChild(el("option", { text: `Bot: ${bot}`, attrs: { value: bot } }));
-    });
-    if (state.verifiedBots.includes(previous)) select.value = previous;
-    syncActionAvailability();
-  } catch (error) {
-    state.verifiedBots = [];
-    toastError(error);
-    syncActionAvailability();
+  const previous = select.value;
+  select.replaceChildren(el("option", { text: "选择 QQ Bot", attrs: { value: "" } }));
+  for (const bot of state.verifiedBots) {
+    select.appendChild(el("option", { text: bot, attrs: { value: bot } }));
   }
+  select.value = state.verifiedBots.includes(previous) ? previous :
+    (state.verifiedBots.length === 1 ? state.verifiedBots[0] : "");
+  $("guard-status").textContent = data.guard_active ? "原生聊天准入已启用" : "原生聊天准入未启用";
 }
 
-// ---------------------------------------------------------------------------
-// Diagnostics banner (read-only GroupGuardian precedence status)
-// ---------------------------------------------------------------------------
-function diagnosticsPrecedence(data) {
-  if (!data || typeof data !== "object") return { verified: false, status: "UNKNOWN" };
-  if (typeof data.moderation_precedence === "string") {
-    return { verified: data.moderation_precedence === "VERIFIED", status: data.moderation_precedence };
-  }
-  // Legacy shape (older backend): group_guardian_status OPTIMAL/WARNING/NOT_INSTALLED/UNKNOWN.
-  const legacy = String(data.group_guardian_status || "UNKNOWN");
-  return { verified: false, status: legacy };
-}
-
-function renderDiagnostics(data) {
-  state.diagnostics = data || null;
-  const badge = $("handler-diag-badge");
-  const banner = $("diag-banner");
-  const precedence = diagnosticsPrecedence(data);
-  const message = data && data.message ? String(data.message) : "未能获取审核链诊断信息。";
-  const recommendations = data && data.recommendations ? String(data.recommendations) : "";
-
-  if (badge) {
-    if (precedence.verified) {
-      badge.className = "status-badge live";
-      badge.textContent = "主审核顺序已验证";
-    } else {
-      badge.className = "status-badge danger";
-      badge.textContent = "主审核顺序未验证";
-    }
-    badge.title = message;
-  }
-
-  if (!banner) return;
-  banner.hidden = false;
-  banner.className = `diag-banner ${precedence.verified ? "ok" : "danger"}`;
-  const icon = $("diag-banner-icon");
-  if (icon) icon.textContent = precedence.verified ? "✅" : "⛔";
-  const title = $("diag-banner-title");
-  if (title) {
-    title.textContent = precedence.verified
-      ? "审核链已验证：GroupGuardian 优先于准入闸门"
-      : `审核链风险（${precedence.status}）：内容审核可能被准入闸门抢先拦截`;
-  }
-  const messageNode = $("diag-banner-message");
-  if (messageNode) messageNode.textContent = message;
-  const recommendationNode = $("diag-banner-recommendations");
-  if (recommendationNode) {
-    recommendationNode.textContent = recommendations;
-    recommendationNode.hidden = !recommendations;
-  }
-}
-
-async function loadDiagnostics() {
-  try {
-    const res = await apiCall("diagnostics");
-    renderDiagnostics(res && res.data ? res.data : {});
-  } catch (error) {
-    renderDiagnostics({
-      moderation_precedence: "UNAVAILABLE",
-      message: `无法加载审核链诊断：${error instanceof Error ? error.message : error}`,
-      recommendations: "请确认 AstrBot 与插件版本匹配后重试。",
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Tabs / filters / modals
-// ---------------------------------------------------------------------------
-function loadActiveTab() {
-  const active = document.querySelector(".nav-tab.active");
-  if (!active) return;
-  const tab = active.dataset.tab;
-  if (tab === "tab-overview") loadDashboard();
-  if (tab === "tab-applications") loadApplications();
-  if (tab === "tab-users") loadUsers();
-  if (tab === "tab-groups") loadGroups();
-  if (tab === "tab-audit") loadAuditLogs();
-}
-
-function initTabs() {
-  const tabs = document.querySelectorAll(".nav-tab");
-  tabs.forEach((tab) => {
-    tab.addEventListener("click", () => {
-      tabs.forEach((item) => item.classList.remove("active"));
-      document.querySelectorAll(".tab-pane").forEach((pane) => pane.classList.remove("active"));
-      tab.classList.add("active");
-      const pane = document.getElementById(tab.dataset.tab);
-      if (pane) pane.classList.add("active");
-      loadActiveTab();
-    });
-  });
-
-  const refresh = $("btn-refresh");
-  if (refresh) {
-    refresh.addEventListener("click", () => {
-      loadActiveTab();
-      loadDiagnostics();
-    });
-  }
-}
-
-function initFilters() {
-  $("btn-filter-apps")?.addEventListener("click", () => loadApplications());
-  $("btn-filter-users")?.addEventListener("click", () => loadUsers());
-  $("btn-filter-audit")?.addEventListener("click", () => loadAuditLogs());
-  $("btn-export-audit-json")?.addEventListener("click", () => exportAudit("json"));
-  $("btn-export-audit-csv")?.addEventListener("click", () => exportAudit("csv"));
-
-  const botSelect = $("global-bot-select");
-  if (botSelect) {
-    botSelect.addEventListener("change", () => {
-      syncActionAvailability();
-      loadActiveTab();
-    });
-  }
-}
-
-let currentAction = null;
-let groupModalBotId = "";
-
-function openApprovalModal(type, application) {
-  const botId = requireWriteBot(String(application.bot_self_id || ""));
-  if (!botId) return;
-  currentAction = { type, id: String(application.id || ""), botId };
-  const title = $("modal-title");
-  const label = $("modal-input-label");
-  const note = $("modal-input-note");
-  if (title) title.textContent = type === "approve" ? `批准申请：${currentAction.id}` : `拒绝申请：${currentAction.id}`;
-  if (label) label.textContent = type === "approve" ? "审批备注：" : "拒绝原因：";
-  if (note) note.value = type === "approve" ? "符合群等级要求，准予授权" : "不符合本群准入要求";
-  $("modal-action")?.classList.add("show");
-}
-
-function initModals() {
-  const modalAction = $("modal-action");
-  const modalClose = $("modal-close");
-  const modalCancel = $("modal-btn-cancel");
-  const modalConfirm = $("modal-btn-confirm");
-
-  const closeActionModal = () => modalAction?.classList.remove("show");
-  modalClose?.addEventListener("click", closeActionModal);
-  modalCancel?.addEventListener("click", closeActionModal);
-
-  modalConfirm?.addEventListener("click", async () => {
-    if (!currentAction || !requireWriteBot(currentAction.botId)) return;
-    const noteInput = $("modal-input-note");
-    const note = noteInput ? noteInput.value.trim() : "";
-    modalConfirm.disabled = true;
-    try {
-      let res;
-      if (currentAction.type === "approve") {
-        res = await apiCall("applications/approve", "POST", {
-          application_id: currentAction.id,
-          bot_self_id: currentAction.botId,
-          note: note || "管理员批准",
-        });
-      } else {
-        res = await apiCall("applications/reject", "POST", {
-          application_id: currentAction.id,
-          bot_self_id: currentAction.botId,
-          reason: note || "管理员拒绝",
-        });
-      }
-      toast(res.message || (currentAction.type === "approve" ? "批准成功" : "拒绝成功"), "success");
-      closeActionModal();
-      loadApplications();
-      loadDashboard();
-    } catch (error) {
-      toastError(error);
-    } finally {
-      modalConfirm.disabled = false;
-    }
-  });
-
-  // Group policy modal
-  const modalGroup = $("modal-group");
-  const groupClose = $("modal-group-close");
-  const groupCancel = $("modal-group-cancel");
-  const groupSave = $("modal-group-save");
-
-  const closeGroupModal = () => modalGroup?.classList.remove("show");
-  groupClose?.addEventListener("click", closeGroupModal);
-  groupCancel?.addEventListener("click", closeGroupModal);
-
-  $("btn-open-add-group")?.addEventListener("click", () => {
-    groupModalBotId = requireWriteBot();
-    if (!groupModalBotId) return;
-    const idInput = $("group-form-id");
-    const levelInput = $("group-form-level");
-    if (idInput) idInput.value = "";
-    if (levelInput) levelInput.value = "10";
-    modalGroup?.classList.add("show");
-    syncActionAvailability();
-  });
-
-  groupSave?.addEventListener("click", async () => {
-    const botId = requireWriteBot(groupModalBotId);
-    if (!botId) return;
-
-    const groupId = String($("group-form-id")?.value || "").trim();
-    if (!/^\d{1,20}$/.test(groupId)) {
-      toast("请输入有效的 QQ 群号（纯数字）", "error");
-      return;
-    }
-
-    const minLevel = Number.parseInt(String($("group-form-level")?.value || ""), 10);
-    if (!Number.isInteger(minLevel) || minLevel < 0 || minLevel > 1000) {
-      toast("最低群等级必须是 0 - 1000 之间的整数", "error");
-      return;
-    }
-
-    const durationDays = Number.parseInt(String($("group-form-duration")?.value || ""), 10);
-    if (!Number.isInteger(durationDays) || durationDays < 0 || durationDays > 36500) {
-      toast("授权有效期必须是 0 - 36500 之间的整数（天）", "error");
-      return;
-    }
-
-    const recheckSeconds = Number.parseInt(String($("group-form-recheck")?.value || ""), 10);
-    if (!Number.isInteger(recheckSeconds) || recheckSeconds < 10) {
-      toast("等级复核间隔必须是不小于 10 的整数（秒）", "error");
-      return;
-    }
-
-    const restorePolicy = String($("group-form-restore")?.value || "");
-    if (!["automatic", "manual"].includes(restorePolicy)) {
-      toast("资格恢复策略无效", "error");
-      return;
-    }
-
-    const payload = {
-      bot_self_id: botId,
-      group_id: groupId,
-      enabled: String($("group-form-enabled")?.value || "true") === "true",
-      min_level: minLevel,
-      approval_required: String($("group-form-approval")?.value || "true") === "true",
-      grant_duration_days: durationDays,
-      recheck_interval_seconds: recheckSeconds,
-      restore_policy: restorePolicy,
-      group_admin_bypass: String($("group-form-admin-bypass")?.value || "false") === "true",
-    };
-
-    groupSave.disabled = true;
-    try {
-      const res = await apiCall("groups/update", "POST", payload);
-      toast(res.message || "群策略保存成功", "success");
-      closeGroupModal();
-      loadGroups();
-    } catch (error) {
-      toastError(error);
-    } finally {
-      groupSave.disabled = false;
-      syncActionAvailability();
-    }
-  });
-
-  // Manual grant modal
-  const modalGrant = $("modal-grant");
-  const grantClose = $("modal-grant-close");
-  const grantCancel = $("modal-grant-cancel");
-  const grantSave = $("modal-grant-save");
-
-  const closeGrantModal = () => modalGrant?.classList.remove("show");
-  grantClose?.addEventListener("click", closeGrantModal);
-  grantCancel?.addEventListener("click", closeGrantModal);
-
-  $("btn-open-manual-grant")?.addEventListener("click", () => {
-    if (!requireWriteBot()) return;
-    ["grant-form-group", "grant-form-user", "grant-form-note"].forEach((id) => {
-      const node = $(id);
-      if (node) node.value = "";
-    });
-    const days = $("grant-form-days");
-    if (days) days.value = "0";
-    modalGrant?.classList.add("show");
-  });
-
-  grantSave?.addEventListener("click", async () => {
-    const botId = requireWriteBot();
-    if (!botId) return;
-
-    const groupId = String($("grant-form-group")?.value || "").trim();
-    if (!/^\d{1,20}$/.test(groupId)) {
-      toast("请输入有效的 QQ 群号（纯数字）", "error");
-      return;
-    }
-    const userId = String($("grant-form-user")?.value || "").trim();
-    if (!/^\d{1,20}$/.test(userId)) {
-      toast("请输入有效的用户 QQ 号（纯数字）", "error");
-      return;
-    }
-    const durationDays = Number.parseInt(String($("grant-form-days")?.value || "0"), 10);
-    if (!Number.isInteger(durationDays) || durationDays < 0 || durationDays > 36500) {
-      toast("授权有效期必须是 0 - 36500 之间的整数（天）", "error");
-      return;
-    }
-    const payload = {
-      bot_self_id: botId,
-      group_id: groupId,
-      user_id: userId,
-      duration_days: durationDays,
-      note: String($("grant-form-note")?.value || "").trim() || "Dashboard手动授权",
-      is_level_exempt: String($("grant-form-exempt")?.value || "false") === "true",
-    };
-    grantSave.disabled = true;
-    try {
-      const res = await apiCall("users/grant", "POST", payload);
-      toast(res.message || "手动授权成功", "success");
-      closeGrantModal();
-      loadUsers();
-    } catch (error) {
-      toastError(error);
-    } finally {
-      grantSave.disabled = false;
-      syncActionAvailability();
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// 1. Overview
-// ---------------------------------------------------------------------------
-async function loadDashboard() {
-  try {
-    const res = await apiCall("dashboard");
-    const data = res.data || {};
-    const stats = data.stats || {};
-    const setMetric = (id, value) => {
-      const node = $(id);
-      if (node) node.textContent = String(value === undefined || value === null ? 0 : value);
-    };
-    setMetric("metric-groups", stats.enabled_groups);
-    setMetric("metric-pending", stats.pending_applications);
-    setMetric("metric-active", stats.active_grants);
-    setMetric("metric-suspended", stats.suspended_grants);
-    setMetric("metric-blacklist", stats.blacklisted_users);
-
-    const pendingBadge = $("nav-pending-badge");
-    if (pendingBadge) pendingBadge.textContent = String(stats.pending_applications || 0);
-
-    const tbody = $("overview-recent-table");
-    const applications = Array.isArray(data.recent_applications) ? data.recent_applications : [];
-    if (applications.length === 0) {
-      renderTableMessage(tbody, 7, "暂无申请记录");
-      return;
-    }
-    tbody.replaceChildren();
-    applications.forEach((application) => {
-      const tr = document.createElement("tr");
-      tr.appendChild(cell(application.id, "font-strong"));
-      tr.appendChild(cell(application.group_id));
-      tr.appendChild(cell(application.user_id));
-      tr.appendChild(cell(`LV${application.level}`));
-      tr.appendChild(cell(formatDate(application.created_at)));
-      tr.appendChild(cell(statusTag(application.status)));
-      const actions = document.createElement("td");
-      if (String(application.status || "").toUpperCase() === "PENDING") {
-        actions.appendChild(actionButton("批准", "btn-success", () => openApprovalModal("approve", application), application.bot_self_id));
-        actions.appendChild(document.createTextNode(" "));
-        actions.appendChild(actionButton("拒绝", "btn-danger", () => openApprovalModal("reject", application), application.bot_self_id));
-      } else {
-        actions.appendChild(el("span", { className: "text-muted", text: "-" }));
-      }
-      tr.appendChild(actions);
-      tbody.appendChild(tr);
-    });
-  } catch (error) {
-    toastError(error);
-    renderTableMessage($("overview-recent-table"), 7, "加载失败");
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 2. Applications
-// ---------------------------------------------------------------------------
-async function loadApplications() {
-  const tbody = $("applications-table-body");
-  renderTableMessage(tbody, 9, "加载中...");
-  try {
-    const params = {};
-    const gid = String($("app-filter-group")?.value || "").trim();
-    const uid = String($("app-filter-user")?.value || "").trim();
-    const status = String($("app-filter-status")?.value || "");
-    if (gid) params.group_id = gid;
-    if (uid) params.user_id = uid;
-    if (status) params.status = status;
-
-    const res = await apiCall("applications", "GET", null, params);
-    const data = res.data || {};
-    const applications = Array.isArray(data.applications) ? data.applications : [];
-    if (applications.length === 0) {
-      renderTableMessage(tbody, 9, "无符合条件的申请记录");
-      return;
-    }
-    tbody.replaceChildren();
-    applications.forEach((application) => {
-      const tr = document.createElement("tr");
-      tr.appendChild(cell(application.id, "font-strong"));
-      tr.appendChild(cell(application.group_id));
-      tr.appendChild(cell(application.user_id));
-      tr.appendChild(cell(`LV${application.level_at_application}`));
-      tr.appendChild(cell(application.reason || "-"));
-      tr.appendChild(cell(formatDate(application.created_at)));
-      tr.appendChild(cell(statusTag(application.status)));
-      tr.appendChild(cell(application.review_note || "-"));
-      const actions = document.createElement("td");
-      if (String(application.status || "").toUpperCase() === "PENDING") {
-        actions.appendChild(actionButton("批准", "btn-success", () => openApprovalModal("approve", application), application.bot_self_id));
-        actions.appendChild(document.createTextNode(" "));
-        actions.appendChild(actionButton("拒绝", "btn-danger", () => openApprovalModal("reject", application), application.bot_self_id));
-      } else {
-        actions.appendChild(el("span", { className: "text-muted", text: "已处理" }));
-      }
-      tr.appendChild(actions);
-      tbody.appendChild(tr);
-    });
-  } catch (error) {
-    toastError(error);
-    renderTableMessage(tbody, 9, "加载失败");
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 3. Users & grants
-// ---------------------------------------------------------------------------
-async function loadUsers() {
-  const tbody = $("users-table-body");
-  renderTableMessage(tbody, 9, "加载中...");
-  try {
-    const params = {};
-    const gid = String($("user-filter-group")?.value || "").trim();
-    const uid = String($("user-filter-qq")?.value || "").trim();
-    const status = String($("user-filter-status")?.value || "");
-    if (gid) params.group_id = gid;
-    if (uid) params.user_id = uid;
-    if (status) params.status = status;
-
-    const res = await apiCall("users", "GET", null, params);
-    const data = res.data || {};
-    const grants = Array.isArray(data.grants) ? data.grants : [];
-    if (grants.length === 0) {
-      renderTableMessage(tbody, 9, "未找到用户授权记录");
-      return;
-    }
-    tbody.replaceChildren();
-    grants.forEach((grant) => {
-      const tr = document.createElement("tr");
-      tr.appendChild(cell(grant.id, "font-mono"));
-      tr.appendChild(cell(grant.group_id));
-      tr.appendChild(cell(grant.user_id, "font-strong"));
-      tr.appendChild(cell(statusTag(grant.status)));
-      tr.appendChild(cell(`LV${grant.last_verified_level}`));
-      tr.appendChild(cell(Number(grant.expires_at) === 0 ? "永久" : formatDate(grant.expires_at)));
-      tr.appendChild(cell(grant.approved_by || "-"));
-      tr.appendChild(cell(formatDate(grant.last_verified_at)));
-      const actions = document.createElement("td");
-      if (String(grant.status || "").toUpperCase() === "ACTIVE") {
-        actions.appendChild(
-          actionButton(
-            "撤销",
-            "btn-danger",
-            () => revokeGrant(grant),
-            grant.bot_self_id
-          )
-        );
-        actions.appendChild(document.createTextNode(" "));
-      }
-      actions.appendChild(actionButton("拉黑", "btn-secondary", () => banUser(grant), grant.bot_self_id));
-      tr.appendChild(actions);
-      tbody.appendChild(tr);
-    });
-    syncActionAvailability();
-  } catch (error) {
-    toastError(error);
-    renderTableMessage(tbody, 9, "加载失败");
-  }
-}
-
-async function revokeGrant(grant) {
-  const botId = requireWriteBot(String(grant.bot_self_id || ""));
-  if (!botId) return;
-  const confirmed = window.confirm(`确定撤销 QQ ${grant.user_id} 在群 ${grant.group_id} 的授权吗？`);
-  if (!confirmed) return;
-  try {
-    const res = await apiCall("users/revoke", "POST", {
-      bot_self_id: botId,
-      group_id: grant.group_id,
-      user_id: grant.user_id,
-      reason: "管理员手动撤销",
-    });
-    toast(res.message || "操作完成", "success");
-    loadUsers();
-  } catch (error) {
-    toastError(error);
-  }
-}
-
-async function banUser(grant) {
-  const botId = requireWriteBot(String(grant.bot_self_id || ""));
-  if (!botId) return;
-  const reason = window.prompt(`输入将 QQ ${grant.user_id} 加入黑名单的原因：`, "违规使用");
-  if (reason === null) return;
-  try {
-    const res = await apiCall("users/ban", "POST", {
-      bot_self_id: botId,
-      group_id: grant.group_id,
-      user_id: grant.user_id,
-      reason: reason || "违反规则",
-    });
-    toast(res.message || "已加入黑名单", "success");
-    loadUsers();
-  } catch (error) {
-    toastError(error);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 4. Group policies
-// ---------------------------------------------------------------------------
-async function loadGroups() {
-  const tbody = $("groups-table-body");
-  renderTableMessage(tbody, 9, "加载中...");
-  try {
-    const res = await apiCall("groups");
-    const data = res.data || {};
-    state.groupPolicies = Array.isArray(data.groups) ? data.groups : [];
-    if (state.groupPolicies.length === 0) {
-      renderTableMessage(tbody, 9, "尚未配置专属群策略");
-      return;
-    }
-    tbody.replaceChildren();
-    state.groupPolicies.forEach((policy, index) => {
-      const tr = document.createElement("tr");
-      tr.appendChild(cell(policy.group_id, "font-strong"));
-      tr.appendChild(cell(policy.enabled ? el("span", { className: "tag tag-active", text: "开启" }) : el("span", { className: "tag tag-expired", text: "关闭" })));
-      tr.appendChild(cell(`LV${policy.min_level}`));
-      tr.appendChild(cell(policy.approval_required ? "是" : "否"));
-      const durationSeconds = Number(policy.grant_duration_seconds);
-      tr.appendChild(cell(durationSeconds === 0 ? "永久" : `${durationSeconds / 86400} 天`));
-      tr.appendChild(cell(`${policy.recheck_interval_seconds}s`));
-      tr.appendChild(cell(policy.restore_policy === "automatic" ? "自动重新激活" : "手动重新审批"));
-      tr.appendChild(cell(policy.group_admin_bypass ? "豁免" : "不豁免"));
-      const actions = document.createElement("td");
-      actions.appendChild(
-        actionButton(
-          "编辑",
-          "btn-secondary",
-          () => openGroupModal(index),
-          policy.bot_self_id
-        )
-      );
-      tr.appendChild(actions);
-      tbody.appendChild(tr);
-    });
-    syncActionAvailability();
-  } catch (error) {
-    toastError(error);
-    renderTableMessage(tbody, 9, "加载失败");
-  }
-}
-
-function openGroupModal(index) {
-  const policy = state.groupPolicies[index];
-  if (!policy) return;
-  groupModalBotId = requireWriteBot(String(policy.bot_self_id || ""));
-  if (!groupModalBotId) return;
-  syncActionAvailability();
-  const set = (id, value) => {
-    const node = $(id);
-    if (node) node.value = value === undefined || value === null ? "" : String(value);
-  };
-  set("group-form-id", policy.group_id);
-  set("group-form-enabled", policy.enabled ? "true" : "false");
-  set("group-form-level", policy.min_level);
-  set("group-form-approval", policy.approval_required ? "true" : "false");
-  set("group-form-duration", Number(policy.grant_duration_seconds) / 86400);
-  set("group-form-recheck", policy.recheck_interval_seconds);
-  set("group-form-restore", policy.restore_policy);
-  set("group-form-admin-bypass", policy.group_admin_bypass ? "true" : "false");
-  $("modal-group")?.classList.add("show");
-}
-
-// ---------------------------------------------------------------------------
-// 5. Audit logs + real file export
-// ---------------------------------------------------------------------------
-async function loadAuditLogs() {
-  const tbody = $("audit-table-body");
-  renderTableMessage(tbody, 8, "加载中...");
-  try {
-    const params = {};
-    const gid = String($("audit-filter-group")?.value || "").trim();
-    const uid = String($("audit-filter-user")?.value || "").trim();
-    const action = String($("audit-filter-action")?.value || "");
-    if (gid) params.group_id = gid;
-    if (uid) params.user_id = uid;
-    if (action) params.action = action;
-
-    const res = await apiCall("audit_logs", "GET", null, params);
-    const data = res.data || {};
-    const logs = Array.isArray(data.audit_logs) ? data.audit_logs : [];
-    if (logs.length === 0) {
-      renderTableMessage(tbody, 8, "无符合条件的审计日志");
-      return;
-    }
-    tbody.replaceChildren();
-    logs.forEach((log) => {
-      const tr = document.createElement("tr");
-      tr.appendChild(cell(formatDate(log.timestamp)));
-      tr.appendChild(cell(log.actor_id, "font-strong"));
-      tr.appendChild(cell(log.actor_type || "-"));
-      tr.appendChild(cell(log.group_id || "-"));
-      tr.appendChild(cell(log.target_user_id || "-"));
-      tr.appendChild(cell(log.action || "-", "font-mono"));
-      tr.appendChild(
-        cell(
-          log.old_state
-            ? `${log.old_state} ➔ ${log.new_state}`
-            : log.new_state || "-"
-        )
-      );
-      tr.appendChild(cell(log.details_json || "{}"));
-      tbody.appendChild(tr);
-    });
-  } catch (error) {
-    toastError(error);
-    renderTableMessage(tbody, 8, "加载失败");
-  }
-}
-
-function buildExportFilename(format) {
-  const now = new Date();
-  const pad = (value) => String(value).padStart(2, "0");
-  const stamp =
-    `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
-    `_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  return `audit_logs_${stamp}.${format === "csv" ? "csv" : "json"}`;
-}
-
-function triggerBlobDownload(content, mime, filename) {
-  const blob = new Blob([content], { type: mime });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.style.display = "none";
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
-}
-
-async function exportAudit(format) {
-  const normalized = format === "csv" ? "csv" : "json";
-  const mime = normalized === "csv" ? "text/csv;charset=utf-8" : "application/json";
-  const params = { format: normalized };
-  const gid = String($("audit-filter-group")?.value || "").trim();
-  const action = String($("audit-filter-action")?.value || "");
-  const botId = getSelectedBotId();
-  if (gid) params.group_id = gid;
-  if (action) params.action = action;
-  if (botId) params.bot_self_id = botId;
-
-  try {
-    const res = await apiCall("audit_logs/export", "GET", null, params);
-    const payload = res.data;
-    let content;
-    if (typeof payload === "string") {
-      content = payload;
-    } else if (payload !== undefined && payload !== null) {
-      content = JSON.stringify(payload, null, 2);
-    } else {
-      throw new Error("导出接口返回为空");
-    }
-    triggerBlobDownload(content, mime, buildExportFilename(normalized));
-    toast(`已导出 ${normalized.toUpperCase()} 文件`, "success");
-  } catch (error) {
-    toastError(error);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------------
-async function waitForBridgeReady() {
-  if (!BRIDGE || typeof BRIDGE.ready !== "function") return null;
-  try {
-    return await Promise.race([
-      BRIDGE.ready(),
-      new Promise((resolve) => window.setTimeout(() => resolve(null), BRIDGE_READY_TIMEOUT_MS)),
-    ]);
-  } catch (error) {
-    console.warn("Bridge ready notice:", error);
-    return null;
-  }
-}
-
-async function initApp() {
-  initTabs();
-  initModals();
-  initFilters();
-  syncActionAvailability();
-
-  await waitForBridgeReady();
-  await loadBots();
-  await Promise.allSettled([loadDashboard(), loadDiagnostics()]);
+async function loadState() {
+  const bot = getSelectedBotId();
+  const seq = ++state.readSequence;
+  $("bot-panel").hidden = true;
+  state.settingsBot = "";
+  if (!bot) return;
+  const user = $("user-filter").value.trim();
+  const { data } = await apiCall("scope/state", "GET", null, { bot_self_id: bot, user_id: user });
+  if (seq !== state.readSequence || bot !== getSelectedBotId()) return;
+  renderSettings(bot, data);
+  const time = (value) => value ? formatDate(value) : "—";
+  const pendingScope = $("pending-scope").value;
+  const pendingOnly = $("pending-only").checked;
+  renderRows("applications", data.applications.filter(row =>
+    (!pendingScope || row.scope === pendingScope) && (!pendingOnly || row.status === "PENDING")
+  ), [
+    row => row.id, row => row.user_id, row => row.scope, row => row.status,
+    row => row.reason, row => row.reviewer_id, row => row.review_note,
+  ], row => row.status === "PENDING" ? [
+    button("批准", () => reviewApplication(row, "approve")),
+    button("拒绝", () => {
+      const note = window.prompt("拒绝原因", "");
+      return note === null ? undefined : reviewApplication(row, "reject", note);
+    }),
+  ] : []);
+  renderRows("grants", data.grants, [
+    row => row.user_id, row => row.scope, row => row.status, row => row.source,
+    row => [row.level_exempt && "等级", row.membership_exempt && "成员"].filter(Boolean).join("、"),
+    row => row.actor_id,
+  ], row => [
+    ...(row.status === "SUSPENDED" ? [button("恢复", () => changeGrant(row, "restore"))] : []),
+    ...(row.status !== "REVOKED" ? [button("撤销", () => changeGrant(row, "revoke"))] : []),
+  ]);
+  renderRows("levels", data.levels, [row => row.user_id, row => row.level, row => time(row.verified_at)]);
+  renderRows("audit", data.audit, [
+    row => time(row.timestamp), row => row.actor_id, row => row.target_user_id, row => row.action,
+    row => row.request_id, row => row.details_json,
+  ]);
+  $("bot-panel").hidden = false;
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  initApp().catch((error) => toastError(error));
-});
-
-// Expose a tiny read-only surface for debugging without leaking internals.
-window.GroupApprovalDashboard = Object.freeze({
-  apiRoutePrefix: API_ROUTE_PREFIX,
-  isEmbedded: IS_EMBEDDED,
-  hasBridge: Boolean(BRIDGE),
-  timeoutMs: REQUEST_TIMEOUT_MS,
+  $("global-bot-select").addEventListener("change", () => loadState().catch(toastError));
+  $("pending-scope").addEventListener("change", () => loadState().catch(toastError));
+  $("pending-only").addEventListener("change", () => loadState().catch(toastError));
+  $("refresh").addEventListener("click", () => loadBots().then(loadState).catch(toastError));
+  $("search").addEventListener("click", () => loadState().catch(toastError));
+  $("settings").addEventListener("submit", (event) => {
+    event.preventDefault();
+    runAction(saveSettings, $("save-settings"));
+  });
+  $("manual-grant").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const bot = state.settingsBot;
+    const payload = {
+      user_id: $("grant-user").value.trim(), scope: $("grant-scope").value,
+      level_exempt: $("level-exempt").checked, membership_exempt: $("membership-exempt").checked,
+    };
+    const submitter = event.submitter || $("save-grant");
+    const action = submitter.id === "save-exemptions" ? "exemptions" : "grant";
+    runAction(() => mutate(bot, action, payload), submitter);
+  });
+  loadBots().then(loadState).catch(toastError);
 });
