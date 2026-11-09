@@ -1,6 +1,7 @@
 """AstrBot Plugin Group Approval (群等级准入与管理员审批)."""
 
-__version__ = "1.0.0"
+__version__ = "0.1.1"
+__status__ = "Development / 调试开发版"
 __author__ = "Maxwell233"
 
 from .access_service import AccessService

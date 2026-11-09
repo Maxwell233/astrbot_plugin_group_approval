@@ -24,6 +24,7 @@
 | `expire_hours` | `int` | `72` | 申请有效期（小时）。超时未审核的申请将自动转为 `EXPIRED`。 |
 | `reject_cooldown_hours` | `int` | `24` | 申请被拒绝后的再次申请冷却时间（小时）。防止被拒用户频繁骚扰。 |
 | `duplicate_pending_allowed` | `bool` | `false` | 是否允许同一用户在同一群存在多条待审申请。生产环境强制保持 `false`。 |
+| `rate_limit_per_hour` | `int` | `5` | 单用户每小时最大提交申请次数（滑动窗口防刷机制）。 |
 
 ---
 

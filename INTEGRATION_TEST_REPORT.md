@@ -1,8 +1,12 @@
 # 集成测试与验证报告 (INTEGRATION_TEST_REPORT.md)
 
+**当前版本：** `0.1.1`（早期开发与调试阶段，非生产正式版）  
 **测试时间：** 2026-11-09  
 **测试环境：** macOS / Python 3.12.16 / pytest 9.2.0 / pytest-asyncio 1.4.1 / ruff 0.17.4  
 **目标部署平台：** Windows 10/11, AstrBot Launcher, NapCat OneBot v11, SQLite WAL  
+
+> [!WARNING]
+> **版本与调试阶段说明**：本项目目前仍处于**早期开发与调试阶段**，尚未达到生产环境的全面稳定运行标准。本报告记录代码在模拟协议端与自动化测试套件下的验证结果。所有未在真实 Windows + NapCatQQ + 真实 QQ 群中实操的功能均标注为「待实测」，代码推送 GitHub 供持续集成与开发调试，**暂不发布正式稳定版 Release**。  
 
 ---
 
@@ -50,9 +54,9 @@
 
 ---
 
-## 三、自动化测试执行清单 (34 / 34 PASSED)
+## 三、自动化测试执行清单 (43 / 43 PASSED)
 
-所有 34 项测试在本地测试沙箱中全部通过（0.19 秒）：
+所有 43 项测试在本地测试沙箱中全部通过（0.22 秒）：
 
 ### 1. 群等级解析与服务 (`test_level_service.py`)
 - [x] `test_level_parsing_formats`: 支持整数、"18"、"LV18"、"等级20" 等多种格式严格提取。
@@ -100,19 +104,35 @@
 - [x] `test_web_api_group_policy_update`: 群准入策略动态编辑 API。
 - [x] `test_web_api_audit_export`: 审计日志检索与 JSON/CSV 格式导出。
 
+### 7. v0.1.1 安全修复与扩展测试 (`test_v011_features.py`)
+- [x] `test_napcat_normalization_formats`: 兼容完整 OneBot 包裹响应与已解包字典格式；准确识别网络错误与超时状态码。
+- [x] `test_napcat_multi_bot_resolution`: 多 Bot 环境下按 `bot_self_id` 精准寻址目标 NapCat 实例，无串号串群风险。
+- [x] `test_transaction_rollback_on_error`: `BEGIN IMMEDIATE` 显式事务，在写入中途发生异常时完整回滚，无残留脏数据。
+- [x] `test_level_exemption_lifecycle`: 仅 Owner 可授予 `is_level_exempt=True`；免等级核验用户等级下滑时不被挂起。
+- [x] `test_application_rate_limiting`: 滑动窗口申请频次限制，超频自动拦截并友好提示。
+- [x] `test_reviewer_persistence_in_db`: 审核员数据持久化落盘至 SQLite `reviewers` 表，重启与重载后不丢失。
+- [x] `test_group_unban_does_not_clear_global_ban`: 单群解黑名单绝不误清全局黑名单；全局解黑名单与群黑名单权限隔离。
+- [x] `test_web_api_v011_features`: 支持 `/bots` 多实例查询，兼容 `request.query.get` 与 `await request.json(default={})`，提取真实管理员凭证。
+- [x] `test_group_guardian_priority_promotion`: 插件初始化时动态扫描并提升 GroupGuardian 至 priority=100，确保全群安全审核优先执行。
+
 ---
 
-## 四、真实环境验收状态与说明
+## 四、真实环境验收状态与待实测说明
 
 按照任务书验收原则，严格区分**自动化测试**与**真实环境验收**：
 
-1. **已完全通过项目**：
-   - 全套 Python 3.12 单元与集成测试套件（34/34 测试通过）。
+1. **已完全通过自动化验证项目**：
+   - 全套 Python 3.12 单元与集成测试套件（43/43 测试通过）。
    - Ruff 严格静态类型与代码质量检查（0 报错）。
-   - SQLite 事务原子性、WAL 模式、外键约束与 Schema 迁移。
-   - OneBot v11 协议适配与 Mock 响应校验。
-   - WebUI 前端与后端 REST API 链路。
+   - SQLite 事务原子性、WAL 模式、外键约束与 Migration V2 迁移。
+   - OneBot v11 协议适配与双响应格式标准化处理。
+   - WebUI XSS 安全防护与多 Bot 切换 API。
    - GitHub Actions CI 自动化构建配置。
 
-2. **生产实测前建议**：
-   - 本地开发机基于模拟协议端测试通过；在真实 Windows 生产环境中，需通过 AstrBot Launcher 启动一次并在目标群内发送 `/申请使用`，实测腾讯官方对该特定群成员等级字段的即时网络返回。
+2. **待实机验证清单（Pending Live Verification）**：
+   > [!NOTE]
+   > 下列项目在模拟端测试通过，但尚未在真实物理生产环境中完成实测验收，使用前需在测试群逐步确认：
+   - 真实的 Windows 10/11 生产机上的 AstrBot Launcher 守护进程常驻。
+   - 真实的 NapCatQQ 实际二进制在百人以上活跃群中读取 `memberRealLevel` 的延迟与网络抖动。
+   - 真实 QQ 客户端私聊防骚扰风控策略对审批通知到达率的实际影响。
+   - AstrBot 官方 Web 控制台多用户鉴权 Header (`X-AstrBot-User`) 在真实跨域反向代理下的传递表现。

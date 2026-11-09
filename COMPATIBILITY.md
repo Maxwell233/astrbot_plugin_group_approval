@@ -49,11 +49,15 @@
 
 ### 2.5 GroupGuardian 兼容性保障
 - **核心原则**：权限插件绝不能替代或阻止全群内容审查。
+- **上游优先级冲突与双轨解决方案**：
+  - **背景**：上游 `GroupGuardian` 主审核 Handler 未显式声明优先级（在 AstrBot 中默认优先级为 0），若 Group Approval 运行于 `priority = 50`，可能导致未授权用户的违规发言在被 GroupGuardian 审核前先被准入闸门拦截。
+  - **内置动态运行时提升**：Group Approval 在插件初始化 `_init_plugin()` 时，自动检查 AstrBot Handler 注册表，将扫描到的 `GroupGuardian` 审核 Handler 优先级动态提升至 `priority = 100`，确保内容安全审查永远先于准入拦截运行。
+  - **上游补丁建议**：建议向 `zcj-ui/astrbot_plugin_group_guardian` 提交 PR，在其主过滤装饰器显式添加 `priority=100`（如 `@filter.event_message_type(..., priority=100)`）。
 - **执行时序保证**：
   ```text
   群成员发言
      ↓
-  GroupGuardian (priority=100)
+  GroupGuardian (priority=100，动态提升/显式配置)
      ↓ 违规检测：撤回/禁言/告警
      ↓ 未违规或审核完毕后向下传递
   Group Approval Gate (priority=50)

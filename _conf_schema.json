@@ -41,6 +41,11 @@
         "description": "是否允许同群提交多条待审申请",
         "type": "bool",
         "default": false
+      },
+      "rate_limit_per_hour": {
+        "description": "单用户每小时最大提交申请次数",
+        "type": "int",
+        "default": 5
       }
     }
   },

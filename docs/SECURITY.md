@@ -31,12 +31,16 @@
 ## 3. GroupGuardian 兼容保障
 
 - **核心目标**：内容安全审核必须覆盖全群，绝不可被准入插件中断。
+- **优先级冲突与防御架构**：
+  - 上游 `GroupGuardian` 默认注册未指定优先级时为 0。为了防止被 priority=50 的准入闸门提前拦截，Group Approval 采取了**双重防护**：
+    1. **内置动态提升**：在插件启动时自动扫描上下文，将所有 `GroupGuardian` 审核 Handler 优先级动态提升至 `priority = 100`。
+    2. **上游补丁建议**：建议 GroupGuardian 官方在主消息过滤器中显式设置 `@filter.event_message_type(..., priority=100)`。
 - **优先级布局**：
-  - `GroupGuardian` 运行于 `priority = 100`。
-  - `Group Approval Gate` 运行于 `priority = 50`。
+  - `GroupGuardian` 运行于 `priority = 100`（安全内容审计第一防线）。
+  - `Group Approval Gate` 运行于 `priority = 50`（准入授权判定第二防线）。
   - 业务插件（签到、运势、小猪、AI）运行于 `priority = 0`。
 - **审核时序**：
-  未获批成员发送的所有消息（包括文字、图片、表情）会最先送达 GroupGuardian 进行安全与合规检测，若触发违规行为立即执行撤回、禁言或告警。随后才由 Group Approval 在 priority=50 拦截并阻止其调用 Bot 业务。
+  未获批成员发送的所有消息（包括文字、图片、表情）会最先送达 GroupGuardian 进行安全与合规检测，若触发违规行为立即执行撤回、禁言或告警。随后才由 Group Approval 在 priority=50 拦截并阻止其调用 Bot 业务。未授权用户的消息绝不会穿透至普通插件。
 
 ---
 
