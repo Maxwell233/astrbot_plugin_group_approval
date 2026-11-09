@@ -530,3 +530,40 @@ async def test_verified_self_id_wins_over_caller_supplied_self_id():
 
     assert ok is True
     assert_routed_self_id(transport, "10001")
+
+
+class MultiAccountReverseClient(FakeCQHttpClient):
+    def __init__(self):
+        super().__init__("10001")
+        self._wsr_api_clients = {"10001": object(), "20002": object()}
+        self.login_mismatch = set()
+
+    async def call_action(self, action, **params):
+        target = params.get("self_id")
+        if target not in self._wsr_api_clients:
+            raise ConnectionError("unknown reverse WebSocket")
+        if action == "get_login_info":
+            return {"user_id": 10001 if target in self.login_mismatch else int(target)}
+        return await super().call_action(action, **params)
+
+
+async def test_discover_route_and_disconnect_two_bots_on_one_instance():
+    transport = MultiAccountReverseClient()
+    client = make_client([FakePlatformInstance("shared", transport)])
+    assert await client.list_bots() == ["10001", "20002"]
+    for bot in ("10001", "20002"):
+        assert (await client.send_private_msg("30001", "test", bot_self_id=bot))[0]
+    assert [params["self_id"] for params in transport.actions_of("send_private_msg")] == ["10001", "20002"]
+    del transport._wsr_api_clients["20002"]
+    assert await client.list_bots() == ["10001"]
+    assert not (await client.send_private_msg("30001", "test", bot_self_id="20002"))[0]
+    transport._wsr_api_clients["20002"] = object()
+    assert await client.list_bots() == ["10001", "20002"]
+
+
+async def test_reverse_login_must_match_routed_socket_identity():
+    transport = MultiAccountReverseClient()
+    transport.login_mismatch.add("20002")
+    client = make_client([FakePlatformInstance("shared", transport)])
+    assert await client.list_bots() == ["10001"]
+    assert not (await client.send_private_msg("30001", "test", bot_self_id="20002"))[0]

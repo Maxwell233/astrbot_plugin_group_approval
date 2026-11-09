@@ -97,15 +97,15 @@ function statusTag(status) {
   return el("span", { className: "tag", text: key || "-" });
 }
 
-function actionButton(label, className, onClick, requiresBot = false) {
+function actionButton(label, className, onClick, botId = "") {
   const button = el("button", {
-    className: `btn btn-sm ${className}${requiresBot ? " requires-bot" : ""}`,
+    className: `btn btn-sm ${className}`,
     text: label,
     attrs: { type: "button" },
   });
+  if (botId) button.disabled = !state.verifiedBots.includes(String(botId));
   button.addEventListener("click", (event) => {
     event.preventDefault();
-    if (requiresBot && !getWriteBotId()) return;
     onClick(button);
   });
   return button;
@@ -295,8 +295,11 @@ function getWriteBotId() {
   return state.verifiedBots.length === 1 ? state.verifiedBots[0] : "";
 }
 
-function requireWriteBot() {
-  const botId = getWriteBotId();
+function requireWriteBot(botId = getWriteBotId()) {
+  if (botId && !state.verifiedBots.includes(botId)) {
+    toast("此记录所属的 Bot 当前未通过连接验证", "error");
+    return "";
+  }
   if (!botId) {
     toast(
       state.verifiedBots.length === 0
@@ -338,7 +341,7 @@ function syncActionAvailability() {
   });
 
   const groupSave = $("modal-group-save");
-  if (groupSave) groupSave.disabled = !writeBot;
+  if (groupSave) groupSave.disabled = !state.verifiedBots.includes(groupModalBotId);
   const grantOpen = $("btn-open-manual-grant");
   if (grantOpen) grantOpen.disabled = !writeBot;
 }
@@ -349,18 +352,7 @@ async function loadBots() {
   try {
     const res = await apiCall("bots");
     const data = res && res.data && typeof res.data === "object" ? res.data : {};
-    const rawBots = Array.isArray(data.bots) ? data.bots : [];
-    state.verifiedBots = rawBots
-      .map((bot) => {
-        if (typeof bot === "string") return bot.trim();
-        if (bot && typeof bot === "object") {
-          if (bot.verified === false) return "";
-          const id = bot.bot_self_id || bot.id || bot.self_id;
-          return id === undefined || id === null ? "" : String(id).trim();
-        }
-        return "";
-      })
-      .filter((bot) => bot && bot !== "default");
+    state.verifiedBots = Array.isArray(data.verified_bots) ? data.verified_bots : [];
 
     const previous = select.value;
     select.replaceChildren();
@@ -387,7 +379,7 @@ function diagnosticsPrecedence(data) {
   }
   // Legacy shape (older backend): group_guardian_status OPTIMAL/WARNING/NOT_INSTALLED/UNKNOWN.
   const legacy = String(data.group_guardian_status || "UNKNOWN");
-  return { verified: legacy === "OPTIMAL", status: legacy };
+  return { verified: false, status: legacy };
 }
 
 function renderDiagnostics(data) {
@@ -401,10 +393,10 @@ function renderDiagnostics(data) {
   if (badge) {
     if (precedence.verified) {
       badge.className = "status-badge live";
-      badge.textContent = "🛡️ 审核链已验证";
+      badge.textContent = "主审核顺序已验证";
     } else {
       badge.className = "status-badge danger";
-      badge.textContent = "⚠️ 审核链未验证";
+      badge.textContent = "主审核顺序未验证";
     }
     badge.title = message;
   }
@@ -494,10 +486,13 @@ function initFilters() {
   }
 }
 
-let currentAction = null; // { type: "approve" | "reject", id: string }
+let currentAction = null;
+let groupModalBotId = "";
 
-function openApprovalModal(type, applicationId) {
-  currentAction = { type, id: String(applicationId || "") };
+function openApprovalModal(type, application) {
+  const botId = requireWriteBot(String(application.bot_self_id || ""));
+  if (!botId) return;
+  currentAction = { type, id: String(application.id || ""), botId };
   const title = $("modal-title");
   const label = $("modal-input-label");
   const note = $("modal-input-note");
@@ -518,7 +513,7 @@ function initModals() {
   modalCancel?.addEventListener("click", closeActionModal);
 
   modalConfirm?.addEventListener("click", async () => {
-    if (!currentAction) return;
+    if (!currentAction || !requireWriteBot(currentAction.botId)) return;
     const noteInput = $("modal-input-note");
     const note = noteInput ? noteInput.value.trim() : "";
     modalConfirm.disabled = true;
@@ -527,11 +522,13 @@ function initModals() {
       if (currentAction.type === "approve") {
         res = await apiCall("applications/approve", "POST", {
           application_id: currentAction.id,
+          bot_self_id: currentAction.botId,
           note: note || "管理员批准",
         });
       } else {
         res = await apiCall("applications/reject", "POST", {
           application_id: currentAction.id,
+          bot_self_id: currentAction.botId,
           reason: note || "管理员拒绝",
         });
       }
@@ -557,6 +554,8 @@ function initModals() {
   groupCancel?.addEventListener("click", closeGroupModal);
 
   $("btn-open-add-group")?.addEventListener("click", () => {
+    groupModalBotId = requireWriteBot();
+    if (!groupModalBotId) return;
     const idInput = $("group-form-id");
     const levelInput = $("group-form-level");
     if (idInput) idInput.value = "";
@@ -566,7 +565,7 @@ function initModals() {
   });
 
   groupSave?.addEventListener("click", async () => {
-    const botId = requireWriteBot();
+    const botId = requireWriteBot(groupModalBotId);
     if (!botId) return;
 
     const groupId = String($("group-form-id")?.value || "").trim();
@@ -726,9 +725,9 @@ async function loadDashboard() {
       tr.appendChild(cell(statusTag(application.status)));
       const actions = document.createElement("td");
       if (String(application.status || "").toUpperCase() === "PENDING") {
-        actions.appendChild(actionButton("批准", "btn-success", () => openApprovalModal("approve", application.id)));
+        actions.appendChild(actionButton("批准", "btn-success", () => openApprovalModal("approve", application), application.bot_self_id));
         actions.appendChild(document.createTextNode(" "));
-        actions.appendChild(actionButton("拒绝", "btn-danger", () => openApprovalModal("reject", application.id)));
+        actions.appendChild(actionButton("拒绝", "btn-danger", () => openApprovalModal("reject", application), application.bot_self_id));
       } else {
         actions.appendChild(el("span", { className: "text-muted", text: "-" }));
       }
@@ -776,9 +775,9 @@ async function loadApplications() {
       tr.appendChild(cell(application.review_note || "-"));
       const actions = document.createElement("td");
       if (String(application.status || "").toUpperCase() === "PENDING") {
-        actions.appendChild(actionButton("批准", "btn-success", () => openApprovalModal("approve", application.id)));
+        actions.appendChild(actionButton("批准", "btn-success", () => openApprovalModal("approve", application), application.bot_self_id));
         actions.appendChild(document.createTextNode(" "));
-        actions.appendChild(actionButton("拒绝", "btn-danger", () => openApprovalModal("reject", application.id)));
+        actions.appendChild(actionButton("拒绝", "btn-danger", () => openApprovalModal("reject", application), application.bot_self_id));
       } else {
         actions.appendChild(el("span", { className: "text-muted", text: "已处理" }));
       }
@@ -831,12 +830,12 @@ async function loadUsers() {
             "撤销",
             "btn-danger",
             () => revokeGrant(grant),
-            true
+            grant.bot_self_id
           )
         );
         actions.appendChild(document.createTextNode(" "));
       }
-      actions.appendChild(actionButton("拉黑", "btn-secondary requires-bot", () => banUser(grant), true));
+      actions.appendChild(actionButton("拉黑", "btn-secondary", () => banUser(grant), grant.bot_self_id));
       tr.appendChild(actions);
       tbody.appendChild(tr);
     });
@@ -848,7 +847,7 @@ async function loadUsers() {
 }
 
 async function revokeGrant(grant) {
-  const botId = requireWriteBot();
+  const botId = requireWriteBot(String(grant.bot_self_id || ""));
   if (!botId) return;
   const confirmed = window.confirm(`确定撤销 QQ ${grant.user_id} 在群 ${grant.group_id} 的授权吗？`);
   if (!confirmed) return;
@@ -867,7 +866,7 @@ async function revokeGrant(grant) {
 }
 
 async function banUser(grant) {
-  const botId = requireWriteBot();
+  const botId = requireWriteBot(String(grant.bot_self_id || ""));
   if (!botId) return;
   const reason = window.prompt(`输入将 QQ ${grant.user_id} 加入黑名单的原因：`, "违规使用");
   if (reason === null) return;
@@ -917,7 +916,7 @@ async function loadGroups() {
           "编辑",
           "btn-secondary",
           () => openGroupModal(index),
-          true
+          policy.bot_self_id
         )
       );
       tr.appendChild(actions);
@@ -933,7 +932,9 @@ async function loadGroups() {
 function openGroupModal(index) {
   const policy = state.groupPolicies[index];
   if (!policy) return;
-  if (!requireWriteBot()) return;
+  groupModalBotId = requireWriteBot(String(policy.bot_self_id || ""));
+  if (!groupModalBotId) return;
+  syncActionAvailability();
   const set = (id, value) => {
     const node = $(id);
     if (node) node.value = value === undefined || value === null ? "" : String(value);

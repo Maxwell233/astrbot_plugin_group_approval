@@ -4,8 +4,8 @@ Validation contract (v0.1.1 security hardening):
 
 * Dashboard mutations may never operate on a fabricated bot identity.  Every
   mutating handler requires an explicitly supplied, digit-only ``bot_self_id``;
-  missing / blank / ``"default"`` values are rejected with a 400-style error and
-  no database write is attempted.
+  missing / blank / ``"default"`` values produce a 400-style error.
+  A Bot that does not verify on a live OneBot connection produces a 403-style error.
 * QQ / user / group ids are digit-only.  ``"ALL"`` is accepted only for the two
   blacklist endpoints that explicitly support a global ban (``ban``/``unban``).
 * Integers are real integers with explicit bounds; booleans use a strict parser
@@ -390,30 +390,35 @@ class WebApiHandler:
         ``context`` argument is kept for backward compatibility with the route
         layer, but is not used as an identity source.
         """
-        ids = await self._verified_bot_ids_from_client()
-        if ids is None:
-            ids = await self._bot_ids_from_database()
-        ids = {str(i).strip() for i in ids if str(i).strip()}
-        ids = {i for i in ids if i.lower() != BOT_IDENTITY_PLACEHOLDER}
-        return self.ok({"bots": sorted(ids)})
+        verified = await self._verified_bot_ids_from_client()
+        ids = verified if verified is not None else await self._bot_ids_from_database()
+        return self.ok({
+            "bots": sorted(bot for bot in ids if bot.lower() != BOT_IDENTITY_PLACEHOLDER),
+            "verified_bots": sorted(verified or ()),
+        })
 
     # ------------------------------------------------------------------
     # Read-only endpoints
     # ------------------------------------------------------------------
-    async def get_dashboard_stats(self) -> dict[str, Any]:
-        """Summary metrics for the dashboard view."""
-        g_row = await self.db.fetchone("SELECT COUNT(*) FROM group_policies WHERE enabled = 1")
-        p_row = await self.db.fetchone("SELECT COUNT(*) FROM applications WHERE status = 'PENDING'")
-        a_row = await self.db.fetchone("SELECT COUNT(*) FROM grants WHERE status = 'ACTIVE'")
-        s_row = await self.db.fetchone("SELECT COUNT(*) FROM grants WHERE status = 'SUSPENDED'")
-        b_row = await self.db.fetchone("SELECT COUNT(*) FROM blacklist")
+    async def get_dashboard_stats(self, bot_self_id: str | None = None) -> dict[str, Any]:
+        """Summary metrics for a selected Bot, or an explicit all-Bot view."""
+        try:
+            bot = _parse_bot_filter(bot_self_id)
+        except ParamError as exc:
+            return self.err(str(exc))
+        scope = " AND bot_self_id = ?" if bot else ""
+        args = (bot,) if bot else ()
 
+        g_row = await self.db.fetchone("SELECT COUNT(*) FROM group_policies WHERE enabled = 1" + scope, args)
+        p_row = await self.db.fetchone("SELECT COUNT(*) FROM applications WHERE status = 'PENDING'" + scope, args)
+        a_row = await self.db.fetchone("SELECT COUNT(*) FROM grants WHERE status = 'ACTIVE'" + scope, args)
+        s_row = await self.db.fetchone("SELECT COUNT(*) FROM grants WHERE status = 'SUSPENDED'" + scope, args)
+        b_row = await self.db.fetchone("SELECT COUNT(*) FROM blacklist WHERE 1 = 1" + scope, args)
         recent_apps = await self.db.fetchall(
-            """
-            SELECT id, group_id, user_id, level_at_application, status, created_at, reviewed_at, reviewer_id
-            FROM applications
-            ORDER BY created_at DESC LIMIT 5
-            """
+            "SELECT id, bot_self_id, group_id, user_id, level_at_application, status, "
+            "created_at, reviewed_at, reviewer_id FROM applications WHERE 1 = 1"
+            + scope + " ORDER BY created_at DESC, id DESC LIMIT 5",
+            args,
         )
 
         apps_list = []
@@ -421,6 +426,7 @@ class WebApiHandler:
             apps_list.append(
                 {
                     "id": r["id"],
+                    "bot_self_id": r["bot_self_id"],
                     "group_id": r["group_id"],
                     "user_id": r["user_id"],
                     "level": r["level_at_application"],
@@ -652,6 +658,16 @@ class WebApiHandler:
     # ------------------------------------------------------------------
     # Mutating endpoints --- all require an attested bot identity
     # ------------------------------------------------------------------
+    async def _is_verified_bot(self, bot_self_id: str) -> bool:
+        verify = getattr(self.client, "verify_bot", None)
+        if callable(verify):
+            try:
+                return await verify(bot_self_id) is True
+            except Exception:
+                logger.exception("Could not verify Dashboard Bot identity")
+                return False
+        return bot_self_id in (await self._verified_bot_ids_from_client() or ())
+
     async def _verify_application_bot(self, application_id: str, bot_self_id: str) -> str | None:
         """Verify the supplied bot id matches the application's attested identity."""
         row = await self.db.fetchone(
@@ -681,6 +697,9 @@ class WebApiHandler:
         except ParamError as exc:
             return self.err(str(exc))
 
+        if not await self._is_verified_bot(bot_self_id):
+            return self.err("bot_self_id 未通过当前 OneBot 连接验证，已拒绝写操作", 403)
+
         mismatch = await self._verify_application_bot(app_id, bot_self_id)
         if mismatch:
             return self.err(mismatch)
@@ -690,6 +709,7 @@ class WebApiHandler:
             actor_id=act_id,
             actor_role=actor_role,
             application_id=app_id,
+            expected_bot_self_id=bot_self_id,
             note=note,
         )
         if not success:
@@ -710,6 +730,9 @@ class WebApiHandler:
         except ParamError as exc:
             return self.err(str(exc))
 
+        if not await self._is_verified_bot(bot_self_id):
+            return self.err("bot_self_id 未通过当前 OneBot 连接验证，已拒绝写操作", 403)
+
         mismatch = await self._verify_application_bot(app_id, bot_self_id)
         if mismatch:
             return self.err(mismatch)
@@ -719,6 +742,7 @@ class WebApiHandler:
             actor_id=act_id,
             actor_role=actor_role,
             application_id=app_id,
+            expected_bot_self_id=bot_self_id,
             reason=reason,
         )
         if not success:
@@ -750,6 +774,9 @@ class WebApiHandler:
         except ParamError as exc:
             return self.err(str(exc))
 
+        if not await self._is_verified_bot(bot_self_id):
+            return self.err("bot_self_id 未通过当前 OneBot 连接验证，已拒绝写操作", 403)
+
         act_id = actor_id if actor_id and actor_id != "WebUI" else "dashboard_admin"
         success, msg = await self.approval.grant_manually(
             actor_id=act_id,
@@ -779,6 +806,9 @@ class WebApiHandler:
             reason = _parse_note(payload.get("reason"), "reason", default="Dashboard撤销授权")
         except ParamError as exc:
             return self.err(str(exc))
+
+        if not await self._is_verified_bot(bot_self_id):
+            return self.err("bot_self_id 未通过当前 OneBot 连接验证，已拒绝写操作", 403)
 
         act_id = actor_id if actor_id and actor_id != "WebUI" else "dashboard_admin"
         success, msg = await self.approval.revoke_grant(
@@ -817,6 +847,9 @@ class WebApiHandler:
         except ParamError as exc:
             return self.err(str(exc))
 
+        if not await self._is_verified_bot(bot_self_id):
+            return self.err("bot_self_id 未通过当前 OneBot 连接验证，已拒绝写操作", 403)
+
         act_id = actor_id if actor_id and actor_id != "WebUI" else "dashboard_admin"
         success, msg = await self.approval.ban_user(
             actor_id=act_id,
@@ -844,6 +877,9 @@ class WebApiHandler:
             user_id = _parse_digits(payload.get("user_id"), "user_id")
         except ParamError as exc:
             return self.err(str(exc))
+
+        if not await self._is_verified_bot(bot_self_id):
+            return self.err("bot_self_id 未通过当前 OneBot 连接验证，已拒绝写操作", 403)
 
         act_id = actor_id if actor_id and actor_id != "WebUI" else "dashboard_admin"
         success, msg = await self.approval.unban_user(
@@ -902,6 +938,9 @@ class WebApiHandler:
             )
         except ParamError as exc:
             return self.err(str(exc))
+
+        if not await self._is_verified_bot(bot_self_id):
+            return self.err("bot_self_id 未通过当前 OneBot 连接验证，已拒绝写操作", 403)
 
         pol = await self.approval.get_group_policy(bot_self_id, group_id)
         if enabled is not None:

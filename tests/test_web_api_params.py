@@ -58,7 +58,7 @@ class _FakeNapCat:
 
     def __init__(self, level: str = "15") -> None:
         self.level = level
-        self.bot_ids: list[str] = []
+        self.bot_ids: list[str] = [BOT, OTHER_BOT]
         self.sent_private: list[tuple[str, str]] = []
         self.sent_group: list[tuple[str, str]] = []
 
@@ -105,7 +105,7 @@ def web_system(temp_db, test_config):
     notif = NotificationService(temp_db, fake)
     level = LevelService(fake)
     approval = ApprovalService(temp_db, level, audit, notif, test_config)
-    web = WebApiHandler(temp_db, approval, audit, test_config)
+    web = WebApiHandler(temp_db, approval, audit, test_config, client=fake)
     return web, approval, audit, temp_db, test_config, fake
 
 
@@ -551,7 +551,8 @@ async def test_approve_and_reject_require_matching_application_bot_id(web_system
 
 @pytest.mark.asyncio
 async def test_list_bots_db_derived_never_returns_default(web_system):
-    web, _approval, _audit, db, _config, _fake = web_system
+    _, approval, audit, db, config, _fake = web_system
+    web = WebApiHandler(db, approval, audit, config)
     await db.execute(
         "INSERT INTO group_policies (bot_self_id, group_id, enabled, min_level, created_at, updated_at) "
         "VALUES ('10002', '10001', 1, 10, 1, 1)"
@@ -733,3 +734,32 @@ async def test_export_default_format_and_filter_validation(web_system):
     assert (await web.export_audit_logs("json", limit=0))["status"] == "error"
     assert (await web.export_audit_logs("json", limit=5001))["status"] == "error"
     assert (await web.export_audit_logs("json", start_time="x"))["status"] == "error"
+
+
+@pytest.mark.parametrize("method", [
+    "manual_grant", "revoke_grant", "ban_user", "unban_user", "update_group_policy",
+    "approve_application", "reject_application",
+])
+async def test_every_mutation_rejects_numeric_bots_without_live_verification(web_system, method):
+    _, approval, audit, db, config, fake = web_system
+    app = await _pending_app(approval)
+    fake.bot_ids = [OTHER_BOT]
+    web = WebApiHandler(db, approval, audit, config, client=fake)
+    response = await getattr(web, method)(
+        {"bot_self_id": BOT, "group_id": GROUP, "user_id": USER, "application_id": app.id},
+        actor_id="99999", actor_role="OWNER",
+    )
+    assert response["retcode"] == 403, response
+    assert (await db.fetchone("SELECT status FROM applications WHERE id = ?", (app.id,)))[0] == "PENDING"
+    assert await _count(db, "grants") == await _count(db, "blacklist") == 0
+
+
+async def test_dashboard_counts_and_recent_applications_are_scoped(web_system):
+    web, approval, _audit, _db, _config, _fake = web_system
+    first = await _pending_app(approval, bot=BOT)
+    await _pending_app(approval, bot=OTHER_BOT)
+    result = (await web.get_dashboard_stats(BOT))["data"]
+    assert result["stats"]["pending_applications"] == 1
+    assert [row["id"] for row in result["recent_applications"]] == [first.id]
+    assert result["recent_applications"][0]["bot_self_id"] == BOT
+    assert (await web.get_dashboard_stats())["data"]["stats"]["pending_applications"] == 2

@@ -22,7 +22,7 @@ def web_system(temp_db: Database, mock_napcat: MockNapCatClient, test_config: Pl
     notif = NotificationService(temp_db, mock_napcat)
     lvl = LevelService(mock_napcat)
     approval = ApprovalService(temp_db, lvl, audit, notif, test_config)
-    web = WebApiHandler(temp_db, approval, audit, test_config)
+    web = WebApiHandler(temp_db, approval, audit, test_config, client=mock_napcat)
     return web, approval, temp_db, mock_napcat, test_config
 
 

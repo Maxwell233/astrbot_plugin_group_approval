@@ -22,6 +22,7 @@ class MockNapCatClient(NapCatClient):
     def __init__(self) -> None:
         super().__init__()
         # Key: (group_id, user_id) -> dict(level=..., role=..., is_member=..., error=...)
+        self.verified_bot_ids = ["10001"]
         self.members: dict[tuple[str, str], dict[str, Any]] = {}
         self.sent_private_messages: list[tuple[str, str]] = []
         self.sent_group_messages: list[tuple[str, str]] = []
@@ -90,6 +91,12 @@ class MockNapCatClient(NapCatClient):
                 "qq_level": m.get("qq_level", 50),
             },
         }
+
+    async def list_bots(self) -> list[str]:
+        return list(self.verified_bot_ids)
+
+    async def verify_bot(self, bot_self_id: str) -> bool:
+        return bot_self_id in self.verified_bot_ids
 
     async def send_private_msg(
         self,
@@ -210,5 +217,5 @@ def web_system(temp_db: Database, mock_napcat: MockNapCatClient, test_config: Pl
     notif = NotificationService(temp_db, mock_napcat)
     lvl = LevelService(mock_napcat)
     approval = ApprovalService(temp_db, lvl, audit, notif, test_config)
-    web = WebApiHandler(temp_db, approval, audit, test_config)
+    web = WebApiHandler(temp_db, approval, audit, test_config, client=mock_napcat)
     return web, approval, temp_db, mock_napcat, test_config

@@ -14,9 +14,9 @@ targeted action here forwards ``self_id=<verified QQ>`` explicitly.
 
 Identity policy (fail closed):
 
-- A requested ``bot_self_id`` is only served from a *verified* binding
-  (``get_login_info`` succeeded, or the id was learned from an inbound OneBot
-  event whose ``self_id`` is authenticated by the adapter connection).
+- Reverse-WebSocket accounts must match a routed ``get_login_info`` probe.
+- Registry-less transports can temporarily use identity learned from an inbound event.
+  Dashboard writes always require a fresh login probe.
 - Unknown ids never fall back to "the first instance".
 - Untargeted calls are only allowed when exactly one aiocqhttp bot is verified.
 """
@@ -123,10 +123,7 @@ def _normalize_qq(value: Any) -> str | None:
     if value is None or isinstance(value, bool):
         return None
     text = str(value).strip()
-    if not text or not text.isdigit():
-        return None
-    # QQ ids are positive integers; "0" is a placeholder, not a valid account.
-    if int(text) <= 0:
+    if not (text.isascii() and text.isdecimal() and len(text) <= 20 and text[0] != "0"):
         return None
     return text
 
@@ -191,6 +188,7 @@ class _BotIdentity:
     client: Any
     source: str  # "login_info" (verified) or "event" (attested by OneBot connection)
     verified_at: float
+    socket: Any = None
 
 
 class NapCatClient:
@@ -204,10 +202,7 @@ class NapCatClient:
         self._custom_call_action = call_action_fn
         self.timeout = timeout
         self._context: Any = None
-        # platform_id -> identity binding (one live connection per platform instance)
-        self._bindings: dict[str, _BotIdentity] = {}
-        self._last_discovery = 0.0
-        self._discovered = False
+        self._bindings: dict[tuple[str, str], _BotIdentity] = {}
         self._lock = asyncio.Lock()
 
     def set_context(self, context: Any) -> None:
@@ -231,25 +226,12 @@ class NapCatClient:
         Intended for reconnect handling and tests; normal call paths invalidate
         the affected binding automatically when the transport fails.
         """
-        if platform_id is not None:
-            self._bindings.pop(str(platform_id).strip(), None)
-            self._last_discovery = 0.0
-            return
-        if bot_self_id is not None:
-            target = str(bot_self_id).strip()
-            for binding_platform_id, binding in list(self._bindings.items()):
-                if binding.self_id == target:
-                    self._bindings.pop(binding_platform_id, None)
-            self._last_discovery = 0.0
-            return
-        self._bindings.clear()
-        self._discovered = False
-        self._last_discovery = 0.0
-
-    def _invalidate_platform(self, platform_id: str) -> None:
-        self._bindings.pop(platform_id, None)
-        # Force the next resolution to re-run discovery (handles reconnects).
-        self._last_discovery = 0.0
+        for key, binding in list(self._bindings.items()):
+            if platform_id is not None and binding.platform_id != str(platform_id).strip():
+                continue
+            if bot_self_id is not None and binding.self_id != str(bot_self_id).strip():
+                continue
+            self._bindings.pop(key, None)
 
     # -------------------------------------------------------------- discovery
 
@@ -338,83 +320,85 @@ class NapCatClient:
             qq = _normalize_qq(data.get(key))
             if qq is not None:
                 return qq
-        logger.warning("get_login_info response has no usable user_id: %r", data)
+        logger.warning("get_login_info response has no usable user_id")
         return None
 
-    async def _discover(self, *, force: bool = False) -> None:
-        """Lazily enumerate aiocqhttp platform instances and verify their bot QQ.
+    @staticmethod
+    def _reverse_sockets(client: Any) -> dict | None:
+        # aiocqhttp has no public connection enumerator. The registry provides
+        # candidate routing keys only; a matching login response verifies them.
+        sockets = getattr(client, "_wsr_api_clients", None)
+        return sockets if isinstance(sockets, dict) else None
 
-        Never called from ``__init__``/import time.
-        """
+    async def _discover(self) -> None:
+        """Verify each live account independently and evict replaced connections."""
         if self._context is None:
-            return
-        now = time.monotonic()
-        if not force and self._discovered and (now - self._last_discovery) < IDENTITY_TTL_SECONDS:
             return
 
         async with self._lock:
-            now = time.monotonic()
-            if not force and self._discovered and (now - self._last_discovery) < IDENTITY_TTL_SECONDS:
-                return
-
-            instances = self._iter_platform_instances()
-            instance_platform_ids: dict[int, str] = {}
-            for index, inst in enumerate(instances):
-                instance_platform_ids[id(inst)] = self._platform_id(inst, index)
-            for index, inst in enumerate(instances):
-                platform_id = instance_platform_ids[id(inst)]
-                existing = self._bindings.get(platform_id)
-                if (
-                    existing is not None
-                    and existing.instance is inst
-                    and existing.source == "login_info"
-                    and (now - existing.verified_at) < IDENTITY_TTL_SECONDS
-                ):
-                    continue
-
+            current_instances = {}
+            for index, inst in enumerate(self._iter_platform_instances()):
+                platform_id = self._platform_id(inst, index)
                 client = self._get_instance_client(inst)
                 if client is None:
-                    logger.debug("aiocqhttp platform %s has no usable client", platform_id)
-                    if existing is not None and existing.instance is inst and existing.source == "event":
-                        continue  # keep the trusted event-attested binding
-                    self._bindings.pop(platform_id, None)
                     continue
+                current_instances[platform_id] = (inst, client)
+                sockets = self._reverse_sockets(client)
+                known = {
+                    binding.self_id: binding
+                    for binding in self._bindings.values()
+                    if binding.platform_id == platform_id
+                    and binding.instance is inst
+                    and binding.client is client
+                }
+                if sockets is not None:
+                    candidates = {
+                        key: socket for key, socket in sockets.items() if _normalize_qq(key) == key
+                    }
+                else:
+                    candidates = dict.fromkeys(known) or {None: None}
 
-                hint = existing.self_id if existing is not None else None
-                qq = await self._query_login_info(client, self_id_hint=hint)
-                if qq is not None:
-                    self._bindings[platform_id] = _BotIdentity(
-                        self_id=qq,
-                        platform_id=platform_id,
-                        instance=inst,
-                        client=client,
-                        source="login_info",
-                        verified_at=time.monotonic(),
-                    )
-                    continue
+                for hint, socket in candidates.items():
+                    previous = known.get(hint)
+                    now = time.monotonic()
+                    if (
+                        previous is not None
+                        and previous.source == "login_info"
+                        and previous.socket is socket
+                        and now - previous.verified_at < IDENTITY_TTL_SECONDS
+                    ):
+                        continue
 
-                logger.warning("Could not verify bot identity for aiocqhttp platform %s", platform_id)
-                if (
-                    existing is not None
-                    and existing.instance is inst
-                    and existing.source == "event"
-                    and (now - existing.verified_at) < IDENTITY_TTL_SECONDS
-                ):
-                    continue  # event-attested fallback while login_info is unavailable
-                self._bindings.pop(platform_id, None)
+                    qq = await self._query_login_info(client, self_id_hint=hint)
+                    if qq is not None and (hint is None or hint == qq):
+                        if sockets is not None and sockets.get(qq) is not socket:
+                            continue
+                        self._bindings[platform_id, qq] = _BotIdentity(
+                            qq, platform_id, inst, client, "login_info", time.monotonic(), socket
+                        )
+                    elif hint is not None and not (
+                        sockets is None and previous is not None and previous.source == "event"
+                        and now - previous.verified_at < IDENTITY_TTL_SECONDS and qq is None
+                    ):
+                        self._bindings.pop((platform_id, hint), None)
+                        if sockets is None:
+                            # A registry-less single-account transport can reconnect as a new QQ.
+                            replacement = await self._query_login_info(client)
+                            if replacement is not None:
+                                self._bindings[platform_id, replacement] = _BotIdentity(
+                                    replacement, platform_id, inst, client, "login_info", time.monotonic()
+                                )
 
-            # Drop bindings whose platform instance disappeared (disconnect/unload)
-            # or whose platform instance is now exposed under a different id
-            # (config re-key/reconnect); a fresh binding was created above.
-            for platform_id, binding in list(self._bindings.items()):
+            for key, binding in list(self._bindings.items()):
+                sockets = self._reverse_sockets(binding.client)
+                instance = current_instances.get(binding.platform_id)
                 if binding.instance is None:
-                    continue
-                if instance_platform_ids.get(id(binding.instance)) == platform_id:
-                    continue
-                self._bindings.pop(platform_id, None)
-
-            self._discovered = True
-            self._last_discovery = time.monotonic()
+                    if time.monotonic() - binding.verified_at < IDENTITY_TTL_SECONDS:
+                        continue
+                elif instance is not None and instance[0] is binding.instance and instance[1] is binding.client:
+                    if sockets is None or sockets.get(binding.self_id) is binding.socket:
+                        continue
+                self._bindings.pop(key, None)
 
     def _match_binding(
         self,
@@ -457,14 +441,26 @@ class NapCatClient:
             normalized_platform_id = None
 
         await self._discover()
-        binding = self._match_binding(target, normalized_platform_id)
-        if binding is not None:
-            return binding
-        if self._context is None:
-            return None
-        # Second chance: a bot may have just reconnected or a new instance appeared.
-        await self._discover(force=True)
         return self._match_binding(target, normalized_platform_id)
+
+    async def verify_bot(self, bot_self_id: str) -> bool:
+        """Require a fresh routed login probe for a Dashboard mutation."""
+        binding = await self._resolve_verified(bot_self_id, None)
+        if binding is None:
+            return False
+        qq = await self._query_login_info(binding.client, self_id_hint=binding.self_id)
+        sockets = self._reverse_sockets(binding.client)
+        inst = self._find_instance(binding.platform_id)
+        if (
+            qq == bot_self_id
+            and inst is not None
+            and inst is binding.instance
+            and self._get_instance_client(inst) is binding.client
+            and (sockets is None or sockets.get(qq) is binding.socket)
+        ):
+            return True
+        self.invalidate_bot_cache(bot_self_id, binding.platform_id)
+        return False
 
     def _fail_closed(
         self,
@@ -538,7 +534,7 @@ class NapCatClient:
 
         call_action = _resolve_call_action(binding.client)
         if call_action is None:
-            self._invalidate_platform(binding.platform_id)
+            self.invalidate_bot_cache(binding.self_id, binding.platform_id)
             message = f"{ERR_INVALID_BOT_CLIENT}: platform {binding.platform_id!r} has no call_action"
             logger.error(message)
             return False, None, message, -3
@@ -562,17 +558,17 @@ class NapCatClient:
                 timeout=self.timeout,
             )
         except TimeoutError:
-            self._invalidate_platform(binding.platform_id)
+            self.invalidate_bot_cache(binding.self_id, binding.platform_id)
             logger.warning(f"NapCat action '{action}' timed out after {self.timeout}s")
             return False, None, f"Timeout after {self.timeout}s", -1
         except Exception as e:
-            self._invalidate_platform(binding.platform_id)
+            self.invalidate_bot_cache(binding.self_id, binding.platform_id)
             logger.error(f"NapCat action '{action}' call failed: {e}")
             return False, None, str(e), -2
 
         if raw is None:
             # Empty transport response usually means the connection just dropped.
-            self._invalidate_platform(binding.platform_id)
+            self.invalidate_bot_cache(binding.self_id, binding.platform_id)
         return normalize_onebot_response(raw)
 
     async def list_bots(self) -> list[str]:
@@ -587,11 +583,8 @@ class NapCatClient:
     async def remember_event_identity(self, event: Any) -> str | None:
         """Learn a bot QQ from an inbound AstrBot event.
 
-        The OneBot adapter sets ``message_obj.self_id`` from the authenticated
-        event (``event.get_self_id()``), and the event exposes the bound client
-        as ``event.bot`` (``AiocqhttpMessageEvent.bot``) or the platform instance
-        via ``event.get_platform_id()``.  This is cheap (no API call) and is used
-        as an attested fallback while ``get_login_info`` is unavailable.
+        Only registry-less clients need this short-lived compatibility fallback.
+        The payload self_id alone cannot verify a reverse-WebSocket account.
 
         Returns the learned bot QQ, or None when the event carries no usable
         identity/client.
@@ -622,21 +615,11 @@ class NapCatClient:
         if not platform_id:
             platform_id = f"event:{id(client)}"
 
-        existing = self._bindings.get(platform_id)
-        if existing is not None and existing.self_id != bot_self_id:
-            logger.info(
-                "Bot identity changed on platform %s: %s -> %s",
-                platform_id,
-                existing.self_id,
-                bot_self_id,
-            )
-        self._bindings[platform_id] = _BotIdentity(
-            self_id=bot_self_id,
-            platform_id=platform_id,
-            instance=instance,
-            client=client,
-            source="event",
-            verified_at=time.monotonic(),
+        if self._reverse_sockets(client) is not None:
+            return None
+
+        self._bindings[platform_id, bot_self_id] = _BotIdentity(
+            bot_self_id, platform_id, instance, client, "event", time.monotonic()
         )
         return bot_self_id
 
