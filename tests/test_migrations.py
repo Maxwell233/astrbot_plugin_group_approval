@@ -85,8 +85,8 @@ async def test_legacy_v1_database_upgrades_without_data_loss(tmp_path):
     finally:
         await conn.close()
 
-    assert version >= 6
-    assert await _schema_version(db_path) >= 6
+    assert version == 7
+    assert await _schema_version(db_path) == 7
 
     # Original business rows preserved.
     conn = await aiosqlite.connect(db_path)
@@ -100,6 +100,8 @@ async def test_legacy_v1_database_upgrades_without_data_loss(tmp_path):
             assert row["last_verified_level"] == 20
         async with conn.execute("SELECT min_level FROM group_policies WHERE bot_self_id='bot1'") as cur:
             assert (await cur.fetchone())["min_level"] == 15
+        async with conn.execute("SELECT COUNT(*) FROM grants_v2") as cur:
+            assert (await cur.fetchone())[0] == 0
     finally:
         await conn.close()
 

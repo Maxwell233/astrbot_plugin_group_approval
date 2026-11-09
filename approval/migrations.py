@@ -8,6 +8,8 @@ from typing import Any
 
 import aiosqlite
 
+from .scope_schema import apply_v7
+
 MIGRATION_V1_SQL = """
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -288,6 +290,7 @@ MIGRATIONS: list[tuple[int, Callable[[aiosqlite.Connection], Any]]] = [
     (4, apply_v4),
     (5, apply_v5),
     (6, apply_v6),
+    (7, apply_v7),
 ]
 
 
