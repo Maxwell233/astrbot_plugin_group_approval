@@ -468,6 +468,8 @@ class ApprovalService:
                             (app_id,),
                         )
                         failure = "该申请已过期失效，无法批准"
+                    elif not policy.enabled:
+                        failure = "批准失败：该群的准入已禁用"
                     elif blacklisted:
                         failure = "批准失败：用户当前在黑名单中"
                     elif lvl_res.level < policy.min_level:
@@ -754,26 +756,34 @@ class ApprovalService:
         b_id = str(bot_self_id).strip()
         g_id = str(group_id).strip()
         u_id = str(user_id).strip()
-        now = int(time.time())
-
-        # Check blacklist
-        is_banned, ban_reason = await self.is_blacklisted(b_id, g_id, u_id)
-        if is_banned:
-            return False, f"手动授权失败：该用户处于黑名单中（{ban_reason}）"
 
         if is_level_exempt and actor_role != "OWNER":
             return False, "权限不足：仅机器人主人(OWNER)可以授予免等级检查权限"
 
-        # Discontinue fake level 999: default to 0 (or previous verified level if re-granting)
-        existing = await self.get_active_grant(b_id, g_id, u_id)
-        actual_level = existing.last_verified_level if existing else 0
-
-        exp_at = (now + duration_days * 86400) if duration_days > 0 else 0
         grant_id = f"G_MANUAL_{uuid.uuid4().hex[:12]}"
         grant_type = "LEVEL_EXEMPTION" if is_level_exempt else "OWNER_MANUAL"
 
         async with self._action_lock:
+            # Force a live membership check before opening the SQLite write transaction.
+            lvl_res = await self.level_service.get_group_member_level(
+                bot_id=b_id, group_id=g_id, user_id=u_id, force_refresh=True,
+            )
+            if not lvl_res.success or not lvl_res.is_member:
+                return False, "手动授权失败：无法核验用户当前群成员身份或等级"
+            verified_at = int(time.time())
+
             async with self.db.transaction():
+                is_banned, ban_reason = await self.is_blacklisted(b_id, g_id, u_id)
+                if is_banned:
+                    return False, f"手动授权失败：该用户处于黑名单中（{ban_reason}）"
+                policy = await self.get_group_policy(b_id, g_id)
+                if not policy.enabled:
+                    return False, "手动授权失败：该群的准入已禁用"
+                if not is_level_exempt and lvl_res.level < policy.min_level:
+                    return False, f"手动授权失败：当前群等级 LV{lvl_res.level} 低于门槛 LV{policy.min_level}"
+
+                now = int(time.time())
+                exp_at = now + duration_days * 86400 if duration_days > 0 else 0
                 sql = """
                 INSERT INTO grants (
                     id, bot_self_id, group_id, user_id, status, source_application_id,
@@ -806,8 +816,8 @@ class ApprovalService:
                         str(actor_id).strip(),
                         now,
                         exp_at,
-                        actual_level,
-                        now,
+                        lvl_res.level,
+                        verified_at,
                         grant_type,
                         1 if is_level_exempt else 0,
                     ),
@@ -893,35 +903,30 @@ class ApprovalService:
         """Remove user from blacklist. Separate group unban from global unban."""
         b_id = str(bot_self_id).strip()
         g_id = str(group_id).strip()
+        if g_id.upper() == "ALL":
+            g_id = "ALL"
         u_id = str(user_id).strip()
+        scope_desc = "全局" if g_id == "ALL" else f"群 {g_id}"
 
         async with self._action_lock:
-            if g_id.upper() == "ALL":
-                cursor = await self.db.execute(
-                    "DELETE FROM blacklist WHERE bot_self_id = ? AND group_id = 'ALL' AND user_id = ?",
-                    (b_id, u_id),
-                )
-            else:
+            async with self.db.transaction():
                 cursor = await self.db.execute(
                     "DELETE FROM blacklist WHERE bot_self_id = ? AND group_id = ? AND user_id = ?",
                     (b_id, g_id, u_id),
                 )
-            await self.db.commit()
+                if cursor.rowcount == 0:
+                    return False, f"用户 {u_id} 不在{scope_desc}的黑名单中"
 
-        scope_desc = "全局" if g_id.upper() == "ALL" else f"群 {g_id}"
-        if cursor.rowcount == 0:
-            return False, f"用户 {u_id} 不在{scope_desc}的黑名单中"
-
-        await self.audit.log(
-            actor_id=str(actor_id),
-            actor_type=actor_role,
-            bot_self_id=b_id,
-            group_id=g_id,
-            target_user_id=u_id,
-            action="USER_UNBANNED",
-            old_state="BLACKLISTED",
-            new_state=None,
-        )
+                await self.audit.log(
+                    actor_id=str(actor_id),
+                    actor_type=actor_role,
+                    bot_self_id=b_id,
+                    group_id=g_id,
+                    target_user_id=u_id,
+                    action="USER_UNBANNED",
+                    old_state="BLACKLISTED",
+                    new_state=None,
+                )
         return True, f"已将用户 {u_id} 从{scope_desc}黑名单中移除"
 
     async def check_and_increment_rate_limit(

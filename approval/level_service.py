@@ -32,7 +32,7 @@ class LevelService:
         self._cache: dict[tuple[str, str, str], tuple[GroupMemberLevelResult, float]] = {}
 
         # Request coalescing (single-flight): key -> Future[GroupMemberLevelResult]
-        self._in_flight: dict[tuple[str, str, str], asyncio.Future[GroupMemberLevelResult]] = {}
+        self._in_flight: dict[tuple[str, str, str, bool], asyncio.Future[GroupMemberLevelResult]] = {}
         self._lock = asyncio.Lock()
 
     def parse_level(self, raw_level: Any) -> int | None:
@@ -72,6 +72,7 @@ class LevelService:
         g_id = str(group_id).strip()
         u_id = str(user_id).strip()
         key = (b_id, g_id, u_id)
+        request_key = (*key, force_refresh)
         now = time.time()
 
         # 1. Check cache if not forcing refresh
@@ -92,14 +93,15 @@ class LevelService:
                     if now < expire_at:
                         return res
 
-            future = self._in_flight.get(key)
+            # A forced lookup must not join a request that allowed NapCat caching.
+            future = self._in_flight.get(request_key)
             if future is not None:
                 # Another task is currently fetching the exact same user info
                 need_wait = True
             else:
                 loop = asyncio.get_running_loop()
                 future = loop.create_future()
-                self._in_flight[key] = future
+                self._in_flight[request_key] = future
                 need_wait = False
 
         if need_wait:
@@ -109,8 +111,10 @@ class LevelService:
         try:
             result = await self._fetch_from_napcat(b_id, g_id, u_id, force_refresh)
             # Store in cache only on successful member lookup
-            if result.success and result.is_member:
-                self._cache[key] = (result, now + self.cache_ttl)
+            expires_at = now + self.cache_ttl
+            cached = self._cache.get(key)
+            if result.success and result.is_member and (cached is None or cached[1] <= expires_at):
+                self._cache[key] = (result, expires_at)
 
             if not future.done():
                 future.set_result(result)
@@ -129,7 +133,7 @@ class LevelService:
             return err_res
         finally:
             async with self._lock:
-                self._in_flight.pop(key, None)
+                self._in_flight.pop(request_key, None)
 
     async def _fetch_from_napcat(
         self,
@@ -192,7 +196,7 @@ class LevelService:
         # Validate that returned group_id and user_id match
         resp_gid = str(data.get("group_id", "")).strip()
         resp_uid = str(data.get("user_id", "")).strip()
-        if resp_gid and resp_gid != group_id:
+        if resp_gid != group_id:
             logger.error(f"Identity mismatch: expected group {group_id}, got {resp_gid}")
             return GroupMemberLevelResult(
                 success=False,
@@ -204,7 +208,7 @@ class LevelService:
                 raw_data=data,
             )
 
-        if resp_uid and resp_uid != user_id:
+        if resp_uid != user_id:
             logger.error(f"Identity mismatch: expected user {user_id}, got {resp_uid}")
             return GroupMemberLevelResult(
                 success=False,
@@ -214,6 +218,16 @@ class LevelService:
                 user_id=user_id,
                 error_code="USER_ID_MISMATCH",
                 raw_data=data,
+            )
+
+        if data.get("is_member") is False:
+            return GroupMemberLevelResult(
+                success=False,
+                level=0,
+                is_member=False,
+                group_id=group_id,
+                user_id=user_id,
+                error_code="NOT_MEMBER",
             )
 
         # Extract group level (CRITICAL: 'level', NEVER 'qq_level')

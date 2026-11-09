@@ -119,7 +119,8 @@ async def test_level_exemption_lifecycle(access_system):
     assert ok_non_owner is False
     assert "仅机器人主人" in msg_non_owner
 
-    # Owner grants level exemption
+    # Owner grants level exemption to a verified member below the threshold.
+    napcat.set_member("10001", "20005", level="5")
     ok_owner, msg_owner = await approval.grant_manually(
         actor_id="99999",
         actor_role="OWNER",
@@ -140,9 +141,6 @@ async def test_level_exemption_lifecycle(access_system):
         (past,),
     )
     await db.commit()
-
-    # User level is below threshold (LV5 < LV10)
-    napcat.set_member("10001", "20005", level="5")
 
     # Access is ALLOWED because grant is level-exempt!
     dec = await access.check_access("bot1", "10001", "20005")

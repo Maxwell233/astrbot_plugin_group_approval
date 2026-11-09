@@ -175,6 +175,7 @@ async def test_fail_closed_on_napcat_disconnect(gate_system):
     )
     await db.commit()
 
+    access.level_service.invalidate_cache("bot1", "10001", "20001")
     napcat.network_error_on_next = True
     dec = await access.check_access("bot1", "10001", "20001")
     assert dec.allowed is False

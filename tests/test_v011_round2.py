@@ -193,7 +193,8 @@ async def test_manual_grant_uuid_uniqueness(access_system):
     # Concurrently grant access to 50 users
     tasks = []
     for i in range(50):
-        uid = f"user_{i}"
+        uid = str(40000 + i)
+        napcat.set_member("10001", uid, level="15")
         tasks.append(
             approval.grant_manually(
                 actor_id="99999",

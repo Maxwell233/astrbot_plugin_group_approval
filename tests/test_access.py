@@ -149,6 +149,7 @@ async def test_level_drop_suspends_and_recovery_restores(access_system):
 
     # User level drops to LV7 (below minimum LV10)
     napcat.set_member("10001", "20001", level="7")
+    access.level_service.invalidate_cache("bot1", "10001", "20001")
 
     dec_drop = await access.check_access("bot1", "10001", "20001")
     assert dec_drop.allowed is False
