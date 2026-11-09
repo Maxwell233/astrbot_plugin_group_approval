@@ -1,64 +1,31 @@
-# GroupGuardian 兼容补丁（内容审核优先级）
+# 第三方兼容补丁
 
-## 为什么需要这个补丁
+这些补丁在目标插件目录中手动应用。先暂停受管 Bot 的群消息接入，备份目标文件，再核对上游提交和补丁。AstrBot 的插件更新可能覆盖补丁，更新后需要重新检查。
 
-本插件的准入闸门以 `priority=50` 注册，用于在普通业务插件（默认 `priority=0`）之前拦截
-未授权用户。AstrBot 的调度顺序是 **priority 数值越大越先执行**，优先级存放在
-`handler.extras_configs["priority"]`（默认 0），相同优先级按注册/加载顺序稳定排序。
+## GroupGuardian 主审核优先级
 
-上游 [GroupGuardian](https://github.com/zcj-ui/astrbot_plugin_group_guardian) 的主审核
-Handler `_handle_message` **没有声明 `priority`**，即默认 0。因此在未打补丁的部署中：
+已核对 [GroupGuardian v2.8.11](https://github.com/zcj-ui/astrbot_plugin_group_guardian/tree/569f6bb1a0dd0bc77f2085ba8be9bdac72be3de5)。上游主审核入口是 `main.py` 的 `_handle_message`，默认优先级 0。AstrBot 4.29.4 用最靠近函数的装饰器完成首次注册。补丁调整装饰器顺序，让带 `priority=100` 的事件装饰器先注册，同时保留 AIOCQHTTP 过滤器。
 
-```text
-未授权用户违规消息
-  → Group Approval 闸门 (priority=50) 先执行 → stop_event()
-  → GroupGuardian 审核 (priority=0) 根本不会运行
+在 GroupGuardian 插件目录执行，替换补丁路径。
+
+```sh
+git apply --check "/path/to/group-approval/patches/group_guardian_priority.patch"
+git apply "/path/to/group-approval/patches/group_guardian_priority.patch"
 ```
 
-这会让未授权用户的色情 / 诈骗 / 广告 / 违法推广内容逃过审核，属于本插件 v0.1.1 的
-P0 缺陷（BUG-001）。AstrBot 没有“审核槽位”或强制顺序的官方机制，也不允许一个插件安全地
-在运行时修改另一个插件的 Handler 状态，因此正确的修复是**给 GroupGuardian 的主审核 Handler
-显式提高优先级**。
+重载两插件或重启 AstrBot，再打开 Group Approval 的诊断。确认主审核入口为 100、准入为 50，且主审核在前。早期补丁把优先级写在外层装饰器。若装过早期补丁，先恢复上游 `_handle_message` 的原始装饰器，再应用当前补丁并复核注册表。
 
-## 补丁内容
+GroupGuardian © 2025 zhaisir，采用 MIT 许可。补丁涉及的上游文件保留原许可证。 [上游源码与许可](https://github.com/zcj-ui/astrbot_plugin_group_guardian/tree/569f6bb1a0dd0bc77f2085ba8be9bdac72be3de5)
 
-`group_guardian_priority.patch` 只修改上游 `main.py` 中**主审核 Handler** 的装饰器：
+## LivingMemory 被动采集
 
-```diff
--    @filter.event_message_type(filter.EventMessageType.ALL)
-+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
-     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-     async def _handle_message(self, event: AiocqhttpMessageEvent):
+若无需全群采集，把 LivingMemory 的 `session_manager.enable_full_group_capture` 设为 `false`。若需要保留受管 QQ 群中已准入消息的被动采集，先在测试环境验证 [LivingMemory 2.10.0](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/tree/1a216d78083af9fd80d72223ca7ead7e7100642d) 的兼容补丁。
+
+```sh
+git apply --check "/path/to/group-approval/patches/livingmemory_admission.patch"
+git apply "/path/to/group-approval/patches/livingmemory_admission.patch"
 ```
 
-`100 > 50`，因此审核先于准入闸门执行；其它 Handler（入群请求、名片、禁言、35 个命令、
-22 个 LLM 工具、`on_llm_request`）均不变。
+补丁把 AIOCQHTTP 的采集调度延后到 Group Approval 的群消息准入通过时。准入未运行、禁用、拒绝或处理准入专用指令时，采集保持关闭。其他平台沿用 LivingMemory 原路径。补丁覆盖该版本的被动采集入口。历史记录、主动记忆工具、其他来源和按会话共享的记忆另行检查。完整插件和实际落库仍待联调。
 
-## 部署方式
-
-```bash
-# 在 GroupGuardian 插件目录内执行（备份 main.py 后）
-git apply --check /path/to/astrbot_plugin_group_approval/patches/group_guardian_priority.patch
-git apply         /path/to/astrbot_plugin_group_approval/patches/group_guardian_priority.patch
-```
-
-或手动把主审核 Handler 的装饰器改为 `priority=100`。
-
-补丁基于 GroupGuardian v2.8.11（commit `569f6bb1a0dd0bc77f2085ba8be9bdac72be3de5`）。
-上游升级后若上下文变化，`git apply` 会失败而不会错误修改，请按当前源码手动调整。
-
-## 验证
-
-- 插件启动时会读取 AstrBot 真实 Handler 注册表并在日志中报告：
-  `VERIFIED` / `CONFLICT` / `NOT_INSTALLED` / `UNVERIFIED`。
-- WebUI Dashboard 的 `diagnostics` 接口返回同样结论（只读）。
-- `CONFLICT` 表示补丁未生效，此时**不保证**未授权用户内容被审核；插件不会谎报安全。
-
-## 许可证与维护
-
-GroupGuardian 使用 **MIT License**（Copyright (c) 2025 zhaisir，
-<https://github.com/zcj-ui/astrbot_plugin_group_guardian>）。本补丁仅包含对其源码的最小
-修改，遵守 MIT 许可并保留上游版权声明。本补丁维护在本仓库 `patches/` 下，不修改上游仓库；
-建议向上游提交同等补丁或在部署说明中要求使用打过补丁的版本。
-
-LivingMemory 使用 AGPL-3.0，本仓库**不包含**对其源码的任何修改或衍生代码。
+LivingMemory 衍生补丁 `livingmemory_admission.patch` 按上游 AGPL-3.0 许可提供。 [对应上游源码与许可](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/tree/1a216d78083af9fd80d72223ca7ead7e7100642d)

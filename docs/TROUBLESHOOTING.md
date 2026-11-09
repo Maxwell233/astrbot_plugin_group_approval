@@ -67,22 +67,13 @@ git apply --check /path/to/astrbot_plugin_group_approval/patches/group_guardian_
 git apply         /path/to/astrbot_plugin_group_approval/patches/group_guardian_priority.patch
 ```
 
-补丁只把 `_handle_message` 的装饰器改为 `priority=100`。重启后 diagnostics 应为 `VERIFIED`。
-**未打补丁时插件会如实报告 CONFLICT，不保证未授权用户消息被审核。**
-（`NOT_INSTALLED` = 没装 GroupGuardian；`UNVERIFIED` = 无法导入真实 AstrBot 注册表。）
+修订补丁使带 `priority=100` 的事件装饰器先注册。重启后检查 `VERIFIED`、主审核位置和每群配置。若顺序仍冲突，先暂停群消息接入，检查是否遗留早期补丁。 [补丁说明](../patches/README.md)
 
 ---
 
 ## 5. LivingMemory 仍记录了未授权用户的发言
 
-这是 **已知且无法由本插件修复** 的限制：
-
-- LivingMemory 在 AstrBot `WakingCheckStage` 中通过自定义 filter 调度独立采集任务，早于任何消息 Handler，
-  且**不检查** `is_stopped()`；`event.stop_event()` 无法阻止其落库。
-- 已存储消息可能在后续 LLM 回合或管理员 `/lmem summarize` 时被汇总进长期记忆。
-- 缓解只能在其配置侧：`session_manager.enable_full_group_capture=false`、
-  `access_control.whitelist_enabled + allowed_ids` 等。没有官方“禁止某用户被采集”的插件 API。
-- 本插件**不**宣称“记忆隔离”；详见 `COMPATIBILITY.md` §6。
+LivingMemory 原版在 `WakingCheckStage` 启动采集，早于准入 Handler。关闭 `session_manager.enable_full_group_capture`，或应用兼容补丁后重载并在测试群检查落库。旧数据可能继续出现在总结和召回中，需要按部署的数据保留要求处理。 [补丁说明](../patches/README.md)
 
 ---
 

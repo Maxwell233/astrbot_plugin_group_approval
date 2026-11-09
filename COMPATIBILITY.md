@@ -10,8 +10,8 @@
 | 证据源 | 说明 |
 |---|---|
 | `upstream/AstrBot`（tag **v4.29.4**，commit `6133541`） | AstrBot 框架源码只读核对（优先级、`stop_event`、注册表、Plugin Web API） |
-| `.venv-astrbot`（PyPI **AstrBot 4.29.4** 实际安装） | **真实框架**导入与注册表探测，由 `tests/test_framework_handler_order.py` 覆盖（本机实测 9 passed） |
-| `tests/test_framework_handler_order.py` | 真实 AstrBot 4.29.4 下的注册表/优先级/事件对象测试（9 项，见集成测试报告） |
+| `.venv-astrbot`（PyPI **AstrBot 4.29.4** 实际安装） | **真实框架**导入与注册表探测，由 `tests/test_framework_handler_order.py` 覆盖 |
+| `tests/test_framework_handler_order.py` | 真实 AstrBot 4.29.4 下的注册表、处理阶段和 OneBot SDK 路由测试（见集成测试报告） |
 | `upstream/group_guardian`（v2.8.11，`569f6bb`） | 上游 GroupGuardian 源码核对（无 `priority=`，默认 0） |
 | `upstream/livingmemory`（2.10.0，`1a216d7`） | 上游 LivingMemory 源码核对（`WakingCheckStage` 旁路采集） |
 
@@ -28,7 +28,7 @@
 | **NapCatQQ** | OneBot v11 反向 WebSocket 协议 | 提供 `get_group_member_info` / `send_private_msg` / `send_group_msg` / `get_login_info` | 代码调用点 `approval/napcat_client.py`；真实 NapCat **未实测** |
 | **Python** | 3.13.17（本机）；CI 目标 3.12 / 3.13 | 3.12+ | AstrBot 4.29.4 要求 `Requires-Python >=3.12` |
 | **GroupGuardian** | 上游 v2.8.11（MIT） | **必须应用 `patches/group_guardian_priority.patch`** 后才保证“审核先于准入” | 见第 5 节；未打补丁时为 CONFLICT，**不保证**审核未授权用户消息 |
-| **LivingMemory** | 上游 2.10.0（AGPL-3.0） | 本插件**无法**在事件层阻止其采集；需按其配置项缓解 | 见第 6 节 |
+| **LivingMemory** | 上游 2.10.0（AGPL-3.0） | 关闭原版被动采集，或应用兼容补丁后按准入调度 | 见第 6 节 |
 
 **结论：** 旧文档中的 `AstrBot >= 4.16.0` 是错误声明，已删除；`>= 4.26.0` 是代码路径决定的硬下限，
 不是保守估计。
@@ -73,7 +73,7 @@
 
 **证据：** 真实注册表测试 `tests/test_framework_handler_order.py:139-200` 断言
 `extras_configs["priority"]` 实际值、降序顺序、以及“补丁 100 → 闸门 50 → 业务 0”的 dispatch 顺序；
-该顺序由真实 AstrBot 4.29.4 测试 `tests/test_framework_handler_order.py` 断言（本机实测 9 passed）。
+该顺序由真实 AstrBot 4.29.4 测试 `tests/test_framework_handler_order.py` 断言。
 
 > 注意：接入真实框架测试时，若只 import 插件模块而未经过 StarManager 加载，默认
 > `get_handlers_by_event_type(only_activated=True)` 不返回未激活 Star 的 Handler；
@@ -115,85 +115,23 @@ def is_stopped(self) -> bool:
 
 ---
 
-## 5. GroupGuardian 兼容性：补丁是**必须的部署步骤**
+## 5. GroupGuardian 主审核顺序
 
-**上游现状（`upstream/group_guardian` v2.8.11，`569f6bb`）：** 所有 Handler 都没有显式 `priority=`，
-即默认 **0**。主审核入口为 `_handle_message`（`main.py:644-648` → `moderation.py:2003`），
-内部所有审核动作（含 LLM 调用、撤回/禁言）都是 **inline await**，没有独立的审核后台任务。
+对 [GroupGuardian v2.8.11](https://github.com/zcj-ui/astrbot_plugin_group_guardian/tree/569f6bb1a0dd0bc77f2085ba8be9bdac72be3de5) 验证了补丁的适用性。AstrBot 4.29.4 在最靠近函数的装饰器首次登记优先级。旧补丁写在外层，实际仍为 0。当前补丁把带 `priority=100` 的事件装饰器放到内层，平台过滤器照常注册。详见 [应用步骤](patches/README.md)。
 
-**因此，未打补丁时：**
+诊断读取启用的 AdapterMessageEvent 顺序，按所属插件、完整注册名与平台/事件过滤器定位主审核与准入闸门。`VERIFIED` 仅说明主审核入口的真实注册位置和优先级均在准入前。`CONFLICT` 表示阻断级顺序冲突。入口禁用、未安装或无法确认分别报告 `DISABLED`、`NOT_INSTALLED` 或 `UNVERIFIED`。热重载后重新打开诊断以读取当前注册表，并检查 `other_handlers_before_gate` 中可能提前运行的处理器。
 
-```text
-未授权用户违规消息
-  → 本插件闸门 priority=50 先执行 → stop_event()
-  → GroupGuardian 审核 priority=0 根本不会运行
-  → 未授权用户的违规内容不会被审核
-```
+若部署要求全群审核，先暂停接入，完成补丁、重载和测试群复核后恢复。AstrBot 配置和会话过滤可能移除任一入口，GroupGuardian 自身也可按群、用户豁免或缺少 QQ 群管理权限而跳过审核。
 
-这是 v0.1.1 的 **P0 缺陷（BUG-001）**。AstrBot 没有“审核槽位”，也不支持一个插件在运行时安全地修改
-另一个插件的 Handler 状态，所以本插件**绝不**做运行时 monkey-patch，而是要求部署方给 GroupGuardian
-应用补丁。
+## 6. LivingMemory 被动采集边界
 
-**受支持部署（必须执行）：**
+[LivingMemory 2.10.0](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/tree/1a216d78083af9fd80d72223ca7ead7e7100642d) 的 `PassiveGroupCaptureFilter.filter()` 在 `WakingCheckStage` 调度后台任务。它返回 `False`，所以即使对应 Handler 从未执行，采集仍可能开始。准入 Handler 的 `stop_event()` 无法撤销已调度任务。
 
-```bash
-# 在 GroupGuardian 插件目录内（先备份 main.py）
-git apply --check /path/to/astrbot_plugin_group_approval/patches/group_guardian_priority.patch
-git apply         /path/to/astrbot_plugin_group_approval/patches/group_guardian_priority.patch
-```
+- 禁用方式：`session_manager.enable_full_group_capture=false`。按群限制可使用 LivingMemory 的 `access_control.whitelist_enabled` 与 `allowed_ids`。同群用户需要逐人授权时，单靠群白名单无法隔离。
+- 兼容方式：[LivingMemory 补丁](patches/README.md#livingmemory-被动采集)在 AIOCQHTTP 上将采集交给准入通过后的回调。未运行准入、被拒绝、仅处理准入命令及 GroupGuardian 提前停止的事件均不会由此入口采集。若在一个适配器实例上接入多个 QQ 账号，LivingMemory 的会话与历史库隔离仍须单独检查。
+- 独立任务、主动记忆工具、历史库、总结和 LLM 召回各有独立路径。应用补丁后应按权限需求核查这些路径和过去已入库的数据。
 
-`patches/group_guardian_priority.patch` **只改一行装饰器**：把 `_handle_message` 的
-`@filter.event_message_type(filter.EventMessageType.ALL)` 改为
-`@filter.event_message_type(filter.EventMessageType.ALL, priority=100)`；不动其它 Handler。
-GroupGuardian 为 **MIT** 许可（Copyright (c) 2025 zhaisir），补丁保留其版权声明，说明见
-`patches/README.md`。
-
-**运行期只做“读取真实注册表并报告”，不修改任何 Handler：**
-
-- `HandlerDiagnostics` 导入 `star_handlers_registry`，读取每个 Handler 的真实
-  `handler_module_path` / `handler_name` / `extras_configs["priority"]`
-  （`approval/diagnostics.py:31-144`），返回 `moderation_precedence` 四态：
-
-| 状态 | 含义 |
-|---|---|
-| `VERIFIED` | 发现 GroupGuardian Handler，且其优先级 **>** 闸门优先级（50）→ 审核先于准入 |
-| `CONFLICT` | 发现 GroupGuardian，但优先级 **<=** 50 → 闸门会抢先请求处理，**不保证**内容审核 |
-| `NOT_INSTALLED` | 真实注册表中没有 GroupGuardian Handler |
-| `UNVERIFIED` | 无法导入真实 AstrBot 注册表（框架过旧/导入失败）→ 不假设安全 |
-
-- 启动时在日志中输出上述结论（`main.py:309-323`）；只读 HTTP 接口
-  `GET /api/v1/plugins/extensions/astrbot_plugin_group_approval/diagnostics`（经 AstrBot 插件 Web 路由）返回同样数据。
-- **不要**把 `VERIFIED` 理解为“已在真实 QQ 环境验证”；它仅表示**当前进程真实注册表**中的顺序符合预期。
-
----
-
-## 6. LivingMemory：`stop_event()` 不能阻止其采集（重要更正）
-
-**旧文档错误：**“未授权消息被 stop_event 拦截 ⇒ LLM 请求不发起 ⇒ 不会生成画像”。这是**错误**的。
-
-**上游实际机制（LivingMemory 2.10.0）：**
-
-1. 被动采集不是普通消息 Handler，而是注册为 **`@filter.custom_filter(PassiveGroupCaptureFilter, False)`**
-   的过滤器（`livingmemory/main.py:451-456`）；`filter()` 在 AstrBot 的
-   **`WakingCheckStage`**（任何消息 Handler 执行之前）被同步调用。
-2. 该过滤器在返回 `False` 之前就**调度了一个 detached asyncio task** 去写会话库
-   （`core/passive_group_capture.py:120-144`；`main.py:334-361`）。
-3. 采集任务**不检查 `event.is_stopped()`**；`enable_full_group_capture` 默认 `true`，即所有群消息
-   （含未 @Bot 的）都会被写入 `conversations.db`。
-4. 所以：**本插件在 priority=50 调用 `stop_event()` 时，LivingMemory 的采集任务早已被调度**，
-   未授权用户的发言仍会被存储。LLM 相关的 recall/reflection 钩子对“已停止”的事件不会运行，
-   但这些已存储的消息**可以在之后同一会话的 LLM 回合（或管理员 `/lmem summarize`）里被汇总进长期记忆**。
-
-**缓解（没有官方“禁止某用户/某群”的插件 API）：**
-
-| 选项（LivingMemory 配置） | 默认 | 作用 |
-|---|---|---|
-| `session_manager.enable_full_group_capture` | `true` | 设为 `false` 可全局关闭群消息被动采集 |
-| `access_control.whitelist_enabled` + `access_control.allowed_ids` | `false` / 空 | 仅允许清单内的身份进入采集/召回 |
-| `profile_settings.enabled` | `true` | 关闭画像读写（**不**停止原始消息采集） |
-
-**结论：** 本插件**无法**保证未授权用户的发言不被 LivingMemory 存储；只能通过上述配置在
-LivingMemory 侧缓解，或接受该残留风险。**未在真实运行环境验证**（见第 10 节）。
+AstrBot 4.29.4 的 `ProcessStage.process()` 可在 `StarRequestSubStage` 之前调用 `SessionWaiter.trigger()` 并消费消息。对受管会话，停用依赖该路径的第三方功能，或在其回调内部执行同等准入检查。其他自定义过滤器也可能在闸门前产生副作用。
 
 ---
 
@@ -223,43 +161,12 @@ LivingMemory 侧缓解，或接受该残留风险。**未在真实运行环境�
 
 ---
 
-## 8. Bot 身份与多 Bot 路由
+## 8. Bot 身份与多账号路由
 
-- **平台实例的 `self_id` 不是 Bot QQ 号**（aiocqhttp 的 client/instance id 是 UUID 一类的连接标识）。
-  Bot QQ 必须通过以下方式获得/验证：
-  1. 入站事件的 **`event.get_self_id()`**（适配器从已认证连接写入）；和/或
-  2. OneBot API **`get_login_info`** 的返回。
-- 所有需要指定 Bot 的 OneBot 动作都显式传 `self_id=<已核验 QQ>` 进行路由
-  （`approval/napcat_client.py:499-575`）。
-- **未知 Bot 标识 fail closed**：没有“第一个客户端兜底”，业务路径不写 `"default"` 占位
-  （`napcat_client.py:469-497`；`web_api.py` 对缺失身份返回错误）。
-- 仪表盘 `/bots` 返回**已核验/已知**的 Bot 标识集合（优先来自 NapCatClient 的已核验缓存，
-  否则来自数据库），并过滤 `"default"` 占位（`approval/web_api.py:380-398`）；它不是“当前在线实例列表”的承诺。
+- 同一个 AstrBot AIOCQHTTP 实例可以有多个反向 WebSocket 账号。插件用 aiocqhttp 1.4.4 的连接表枚举候选 QQ，然后逐账号用 `get_login_info(self_id=QQ)` 核验。缓存按实例 ID 和 QQ 分开，断线或 socket 替换时失效。
+- OneBot 事件的 `self_id` 源自协议端负载。反向连接身份由定向探测验证。仅对不公开连接表的旧客户端保留短时事件候选。所有 Dashboard 写操作都要通过新探测。
+- `/bots` 的 `verified_bots` 用于写操作。历史记录和聚合读取是独立的。应用列表与概览均携带记录所属 Bot。
 
----
+## 9. 实测范围
 
-## 9. 环境验证状态表（已实测 / 未实测 / 无法验证）
-
-| 环境项 | 状态 | 说明 |
-|---|---|---|
-| 单元/服务级测试（真实 SQLite + 假 NapCat/事件） | **已实测** | 见 `INTEGRATION_TEST_REPORT.md` 实际计数 |
-| AstrBot 4.29.4 真实导入 / 真实 Handler 注册表 / 真实 `AstrMessageEvent` | **已实测** | `.venv-astrbot`（PyPI AstrBot 4.29.4）；`tests/test_framework_handler_order.py` 9 项通过 |
-| AstrBot 真实 StarManager 加载/热重载/卸载插件 | **未实测** | 仅 import + 实例化 + `initialize()/terminate()`；未跑 StarManager 全流程 |
-| 真实 NapCat 连接 / 真实 QQ 群 | **未实测** | 全部使用假传输层；无真实 QQ 号/群 |
-| Windows 10/11 + AstrBot Launcher 生产部署 | **未实测** | 本机为 macOS |
-| GroupGuardian 真实联动（安装+打补丁+真实消息） | **未实测** | 仅源码核对 + 真实注册表顺序用代理 Handler 断言；补丁内容有单元测试 |
-| LivingMemory 真实联动（真实采集/画像） | **未实测 / 无法验证** | 仅上游源码静态阅读；无运行时追踪 |
-| WebUI 在真实 Dashboard iframe 中的桥接 | **未实测** | 前端代码按 4.26+ 桥契约编写；无浏览器实测 |
-| GitHub Actions CI | **已实测通过** | commit `e296b25`：3 个 job（3.12 / 3.13 单元测试 + 真实 AstrBot 4.29.4 框架测试）均 success；[run](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/runs/42675991825) |
-
----
-
-## 10. 明确未验证（UNVERIFIED）事项
-
-1. 真实 GroupGuardian 插件的加载/排序/执行（仅用真实 AstrBot 注册表 + 代理 Handler 复现顺序）。
-2. LivingMemory 在真实 AstrBot 中的采集与画像生成（仅源码阅读）。
-3. 真实 NapCat/QQ 的 API 行为、超时、风控对审批通知到达率的影响。
-4. AstrBot StarManager 对插件的真实加载、热重载、并发消息分发。
-5. WebUI 桥接在真实浏览器/Dashboard 中的表现。
-6. GitHub Actions 已实际运行并通过（commit `e296b25`；[run](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/runs/42675991825)）；仍不代表真实 NapCat/QQ 环境已验证。
-7. 真实 Windows 生产环境与 AstrBot Launcher 常驻行为。
+已在 macOS 验证 Python 3.12/3.13、AstrBot 4.29.4、aiocqhttp 1.4.4 和两个上游补丁。Windows CI 仅覆盖单元/服务测试，Windows Launcher 常驻、真实 NapCat、QQ 群内容处置及第三方插件完整联动仍需部署验收。 [测试报告](INTEGRATION_TEST_REPORT.md)

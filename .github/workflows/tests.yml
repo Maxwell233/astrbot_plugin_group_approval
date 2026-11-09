@@ -12,13 +12,16 @@ jobs:
   # tests/test_framework_handler_order.py is collected and skipped automatically
   # (pytest.importorskip("astrbot") at module level).
   test:
-    name: Unit tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Unit tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ "3.12", "3.13" ]
+        include:
+          - { os: ubuntu-latest, python-version: "3.12" }
+          - { os: ubuntu-latest, python-version: "3.13" }
+          - { os: windows-latest, python-version: "3.12" }
 
     steps:
       - name: Checkout code
@@ -77,5 +80,13 @@ jobs:
           python -c "import astrbot; print('AstrBot', astrbot.__version__)"
           python -c "from astrbot.core.star.star_handler import star_handlers_registry; print(type(star_handlers_registry))"
 
-      - name: Run real-framework handler order tests
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test Dashboard Bot targeting
+        run: node --test tests/dashboard_bot_scope.test.cjs
+
+      - name: Run real-framework component tests
         run: python -m pytest tests/test_framework_handler_order.py -q -p no:cacheprovider

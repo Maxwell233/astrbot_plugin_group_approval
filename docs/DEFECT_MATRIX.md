@@ -1,6 +1,6 @@
 # 缺陷矩阵（Defect Matrix）— v0.1.1 审计与修复记录
 
-审计基线：PR #1 head `eba75d8feda2c4513ec7b12136f471ec059d6218`（无更新提交）。
+以下为历史审计记录，基线为 PR #1 head `eba75d8feda2c4513ec7b12136f471ec059d6218`。当前修复和验证见 [本轮测试报告](../INTEGRATION_TEST_REPORT.md)。
 修复分支：`fix/0.1.1-security-integration`。版本保持 `0.1.1`，Development / 开发调试版。
 
 图例：

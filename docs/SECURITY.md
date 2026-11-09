@@ -37,34 +37,13 @@ fail-closed 是固定行为）。
 
 ---
 
-## 3. GroupGuardian：审核优先级是**部署要求**，不是运行时补丁
+## 3. GroupGuardian 主审核顺序
 
-**事实（AstrBot 4.29.4 / 上游 GroupGuardian v2.8.11）：**
+AstrBot 4.29.4 通过最内层装饰器建立 Handler 优先级。使用修订版 [补丁](../patches/README.md)，让 GroupGuardian 主审核注册为 100，先于 Group Approval 的 50。两个入口都必须在目标会话启用。
 
-- Handler 执行顺序由 `extras_configs["priority"]` **降序**决定；优先级 50 的准入闸门先于优先级 0 的
-  GroupGuardian 主审核 Handler 执行（`astrbot/core/star/star_handler.py:19-26`）。
-- 因此上游 GroupGuardian **默认会被本插件闸门抢先**：闸门 `stop_event()` 后，GroupGuardian 审核
-  **不会运行**（`star_request.py:39-41,88-89` 的 break 行为）。
+`VERIFIED` 表示启用的群消息入口具备正确的平台过滤、优先级和实际注册顺序。它无法证明审核规则生效、消息类型覆盖或 QQ 撤回成功。若需要审核先行，收到 `CONFLICT`、`DISABLED`、`NOT_INSTALLED` 或 `UNVERIFIED` 应暂停受管 Bot 群消息接入，修复配置并复核。插件继续执行准入，避免配置检查失败时所有业务直接放行。
 
-**本插件的做法：**
-
-1. **不修改**任何第三方 Handler（不做运行时 monkey-patch；AstrBot 也不支持安全地这样做）。
-2. 要求部署方应用兼容补丁 `patches/group_guardian_priority.patch`：仅把 GroupGuardian 主审核
-   Handler 的装饰器改为 `priority=100`。补丁说明、许可证（上游 MIT）见 `patches/README.md`。
-3. 启动时**只读**真实注册表并报告（`approval/diagnostics.py`，`main.py:309-323`）：
-
-| `moderation_precedence` | 含义 | 安全含义 |
-|---|---|---|
-| `VERIFIED` | GroupGuardian Handler 实际优先级 > 闸门（50） | 当前进程注册表中审核先于准入 |
-| `CONFLICT` | 发现 GroupGuardian 但优先级 <= 50 | **不保证**未授权用户消息被审核，需立即打补丁 |
-| `NOT_INSTALLED` | 注册表没有 GroupGuardian Handler | 无内容审核联动 |
-| `UNVERIFIED` | 无法导入真实 AstrBot 注册表 | 不假设安全，不虚报 |
-
-- 只读接口：`GET /api/v1/plugins/extensions/astrbot_plugin_group_approval/diagnostics`。
-- **明确声明**：`VERIFIED` 只代表**当前进程真实注册表**的快照符合预期，不代表已在真实 QQ 环境验证；
-  **未打补丁的部署属于不安全部署**，本插件不会谎报为安全。
-
-实现：`approval/diagnostics.py`、`approval/gate.py:15-20`、`patcher` 文件 `patches/`。
+诊断列出闸门前的其他 Handler 供部署时核对。更早的过滤器、`SessionWaiter`、独立任务和其他来源调用需各自执行权限控制。 [兼容性说明](../COMPATIBILITY.md)
 
 ---
 
@@ -78,25 +57,19 @@ fail-closed 是固定行为）。
   这两套身份系统不交叉（`approval/auth_service.py:50-161`）。
 - **API Key**：以 `api_key:` 开头的机器身份可读，但**不能**执行变更操作。
 - **未知/无法证明身份**：拒绝所有管理操作。
-- **变更操作**：approve/reject/grant/revoke/ban/unban/update_group 等必须携带**纯数字、已核验**的
-  `bot_self_id`；缺失、非数字或 `"default"` → 返回 400 且**不写库**（`approval/web_api.py` 参数校验层）。
+- **变更操作**：七个写接口均检查 `bot_self_id` 的数字格式和当前 OneBot 连接上的定向登录验证。缺失或格式非法返回 400，无法验证当前连接返回 403。批准与拒绝另外核对申请所属 Bot。
+- 概览、列表与审计查询支持按 Bot 筛选。Dashboard 管理员可以查看全部 Bot。客户端写入操作绑定记录所属 Bot，并由服务端再次验证。
 - **HTTP 语义说明**：AstrBot 网关会在 Handler 之前拒绝未认证请求；插件对“已认证但无权限”的响应是
   **HTTP 200 + body `retcode`（401/403）**，请以 `retcode` 判断，不要仅看 HTTP 状态码。
 - 响应中不回显服务器内部异常堆栈；参数校验错误返回结构化错误信息。
 
 ---
 
-## 5. Bot 身份与多 Bot 路由
+## 5. Bot 身份与多账号路由
 
-- **平台实例的 `self_id` 不是 Bot QQ 号**（aiocqhttp 的实例/client 标识是连接级 UUID 等）。
-- Bot QQ 的合法来源仅两种：
-  1. 入站事件 `event.get_self_id()`（由适配器从已认证的 OneBot 连接写入）；
-  2. OneBot `get_login_info` 的返回（`approval/napcat_client.py:307-343`）。
-- `NapCatClient` 为每个 platform 实例建立“实例 → 已核验 QQ”的绑定；所有 OneBot API 调用显式传
-  `self_id=<已核验 QQ>`（`napcat_client.py:499-575`），实现多 Bot 精确路由。
-- **未知/歧义身份 → fail closed**（`napcat_client.py:469-497`）：不回退“第一个客户端”，不写
-  `"default"` 占位；连接断开时使缓存失效并重新核验。
-- 仪表盘 `/bots` 只返回已核验/数据库已知的 Bot 标识，并过滤 `"default"`（`web_api.py:380-398`）。
+反向 WebSocket 连接表仅提供候选账号。每个账号通过定向 `get_login_info` 验证，缓存按平台实例和 QQ 组合保存，实时检查断线、客户端替换和 socket 替换。所有业务调用按已核验 QQ 显式路由。旧客户端的短时事件候选只用于兼容业务调用，Dashboard 写入仍要求新探测。
+
+OneBot 消息里的 `self_id` 由协议端提供。应对反向 WebSocket 端口启用认证并仅允许可信 NapCat 接入。SDK 的连接表为内部接口，升级后应复跑多账号测试。
 
 ---
 
@@ -107,7 +80,8 @@ fail-closed 是固定行为）。
   才向申请人来源群发送 **`fallback_payload` 短文案**（不含审批理由/备注）；文案由
   `user_group_fallback_text` 配置，缺省为不含敏感内容的最小提示。
 - **管理员通知**：优先私聊 Owner/Reviewer；私聊失败仅允许回退到**显式配置的专用审核群**
-  （`notifications.fallback_group_id`），**绝不**使用申请来源群。
+  （`notifications.fallback_group_id`）。新通知拒绝把申请来源群作为专用审核群。历史 outbox 若配置过该群，部署前检查仍待发送的旧记录。
+- 缺少 Bot 身份的历史 outbox 行标记 `FAILED`，由操作员处理。审核详情、批准、拒绝、手动授权和审核员管理移到当前 Bot 私聊。群内申请回复不包含审核备注或封禁原因。
 - **事件去重**：`event_key` 使用稳定业务标识（申请编号 / 用户结果类型+申请编号），入队
   `ON CONFLICT DO NOTHING`；因此重试不会重复入队。
 - **投递语义**：outbox 为 **at-least-once**（QQ/OneBot 无 exactly-once 原语）；worker 以事务原子
@@ -121,8 +95,8 @@ fail-closed 是固定行为）。
 ## 7. 数据库事务与并发安全
 
 - **协程隔离的事务**：每个 `transaction()` 使用**独立 SQLite 连接** + `BEGIN IMMEDIATE`，并在
-  `contextvars` 中登记事务连接，使同一 Task 内的数据库调用自动路由到该连接；其他协程使用共享的
-  autocommit 连接（`isolation_level=None`），不会混入他人事务（`approval/database.py:1-238`）。
+  `contextvars` 中登记事务连接，使同一 Task 内的数据库调用自动路由到该连接；没有继承该上下文的其他协程使用共享
+  autocommit 连接（`isolation_level=None`）；继承上下文的子任务不能使用父任务事务，各数据库实例的上下文独立（`approval/database.py:1-238`）。
   旧的“单一共享连接 + 进程级 `_in_transaction` 布尔值”实现已删除。
 - **WAL + `busy_timeout` + 外键**：连接统一设置 `journal_mode=WAL`、`synchronous=NORMAL`、
   `foreign_keys=ON`、`busy_timeout=5000`。
@@ -139,29 +113,8 @@ fail-closed 是固定行为）。
 
 ---
 
-## 8. LivingMemory 限制（如实记录，不宣称“记忆隔离”）
+## 8. LivingMemory 与验证范围
 
-- LivingMemory 通过自定义 filter 在 AstrBot **`WakingCheckStage`**（任何消息 Handler 执行之前）调度
-  detached task 落库，且**不检查** `event.stop_event()/is_stopped()`。
-- 因此：`event.stop_event()` **不能**阻止 LivingMemory 存储未授权用户消息；LLM 相关的 recall/reflection
-  对已停止事件不运行，但已存储消息可能在后续 LLM 回合（或管理员 `/lmem summarize`）被汇总进长期记忆。
-- 本插件**没有**官方插件 API 可阻止某用户被采集；缓解只能在其配置侧：
-  `session_manager.enable_full_group_capture=false`、`access_control.whitelist_enabled + allowed_ids`
-  等（详见 `COMPATIBILITY.md` §6；结论来自上游 LivingMemory 2.10.0 源码静态分析）。
-- **未实测**：上述为上游源码静态分析结论，未在真实 LivingMemory 运行环境中验证。
+原版 LivingMemory 的被动过滤器在 `WakingCheckStage` 安排任务。部署时关闭 `session_manager.enable_full_group_capture`，或应用 [兼容补丁](../patches/README.md) 将 AIOCQHTTP 被动采集延后到群消息准入通过。历史数据、主动工具、总结、召回及共享记忆策略分别核对。
 
----
-
-## 9. 状态与未验证项
-
-| 项目 | 状态 |
-|---|---|
-| 单元/服务级安全回归（事务、授权状态机、通知隐私、参数校验、身份 fail-closed、迁移） | **已实测**（117 passed, 1 skipped） |
-| 真实 AstrBot 4.29.4 注册表/优先级/事件对象 | **已实测**（框架测试 9 passed） |
-| 真实 NapCat / 真实 QQ 群 / Windows 生产环境 | **未实测** |
-| GroupGuardian 真实安装+补丁联调 | **未实测**（补丁契约测试 + 真实注册表顺序验证） |
-| LivingMemory 真实运行行为 | **未实测 / 无法验证** |
-| WebUI 真实浏览器桥接 | **未实测**（仅 `node --check` 语法检查） |
-| GitHub Actions CI | **已实测通过**（commit `e296b25`，3 个 job 均 success；[run](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/runs/42675991825)） |
-
-> 任何“已在真实环境验证”的表述都必须等真实 Windows + NapCat + QQ 群联调完成后才能使用。
+本轮已运行真实 AstrBot 4.29.4 处理阶段和 aiocqhttp 1.4.4 路由组件测试。Windows CI 覆盖单元/服务测试。Windows Launcher、真实 NapCat、QQ 群及两个第三方插件完整部署待联调。 [测试报告](../INTEGRATION_TEST_REPORT.md)
