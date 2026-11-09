@@ -17,49 +17,51 @@ from approval.notification_service import NotificationService
 from main import GroupApprovalPlugin
 
 
-# 1. WebUI 401 Unauthenticated & 403 Forbidden
+# 1. Dashboard authentication & authorization (identity separation)
 @pytest.mark.asyncio
 async def test_webui_auth_enforcement(access_system):
     access, approval, db, napcat, config = access_system
-    auth = AuthorizationService(config, is_reviewer_fn=approval.is_reviewer)
+    # The AstrBot dashboard username is the only dashboard identity we trust.
+    auth = AuthorizationService(config, dashboard_username_getter=lambda: "astrbot")
 
-    # 1. Unauthenticated request -> None
     class UnauthReq:
         pass
 
-    assert auth.get_authenticated_user(UnauthReq()) is None
-
-    # Header spoofing must return None
     class HeaderSpoofReq:
-        headers = {"X-AstrBot-User": "admin"}
+        headers = {"X-AstrBot-User": "astrbot"}
 
-    assert auth.get_authenticated_user(HeaderSpoofReq()) is None
+    class ApiKeyReq:
+        username = "api_key:abc123"
 
-    # Authentic user in session
-    class SessionReq:
-        username = "reviewer_bob"
+    class DashboardReq:
+        username = "astrbot"
 
-    assert auth.get_authenticated_user(SessionReq()) == "reviewer_bob"
+    assert auth.get_authenticated_user(UnauthReq()) is None
+    assert auth.get_authenticated_user(HeaderSpoofReq()) is None  # headers are not identity
+    assert auth.get_authenticated_user(ApiKeyReq()) is None  # machine credential
+    assert auth.get_authenticated_user(DashboardReq()) == "astrbot"
 
-    # 2. Authorization checks
-    # Non-reviewer cannot approve
-    ok_appr, role_appr, reason_appr = await auth.authorize_action("stranger_123", "approve")
+    # Only the configured dashboard username is OWNER. QQ ids and the old hardcoded
+    # 'admin'/'root'/'owner' usernames are NEVER dashboard owners.
+    assert await auth.get_user_role("astrbot") == "OWNER"
+    for name in ("admin", "root", "owner", "99999", "88888", "reviewer_bob"):
+        assert await auth.get_user_role(name) == "DASHBOARD_USER", name
+
+    # A non-owner authenticated dashboard identity is read-only.
+    ok_appr, role_appr, reason_appr = await auth.authorize_action("reviewer_bob", "approve")
     assert ok_appr is False
-    assert "不是审核员或主人" in reason_appr
+    assert role_appr == "DASHBOARD_USER"
+    ok_read, _, _ = await auth.authorize_action("reviewer_bob", "list_applications")
+    assert ok_read is True
 
-    # Add as reviewer
+    # QQ Reviewer status does not leak into dashboard privileges.
     await approval.add_reviewer("reviewer_bob")
     ok_rev, role_rev, _ = await auth.authorize_action("reviewer_bob", "approve")
-    assert ok_rev is True
-    assert role_rev == "REVIEWER"
+    assert ok_rev is False
+    assert role_rev == "DASHBOARD_USER"
 
-    # Reviewer cannot do level-exempt manual grant
-    ok_grant_ex, _, reason_ex = await auth.authorize_action("reviewer_bob", "grant", is_level_exempt=True)
-    assert ok_grant_ex is False
-    assert "仅机器人主人" in reason_ex
-
-    # Owner can do level-exempt grant
-    ok_owner, role_owner, _ = await auth.authorize_action("99999", "grant", is_level_exempt=True)
+    # Dashboard owner can perform mutations, including level-exempt grant.
+    ok_owner, role_owner, _ = await auth.authorize_action("astrbot", "grant", is_level_exempt=True)
     assert ok_owner is True
     assert role_owner == "OWNER"
 
@@ -226,7 +228,9 @@ async def test_outbox_multi_bot_and_group_fallback(temp_db):
         retry_interval_seconds=1,
     )
 
-    # Enqueue a private notification with fallback group
+    # Enqueue a private notification with an explicitly supplied *minimal* fallback
+    # payload. A fallback group alone must NOT re-send the full private payload to a
+    # group (that was the old privacy leak; see SECURITY.md "Notification privacy").
     outbox_id = await notif_svc.enqueue(
         event_key="EVT_FALLBACK_TEST_1",
         recipient_id="40001",
@@ -234,6 +238,7 @@ async def test_outbox_multi_bot_and_group_fallback(temp_db):
         payload="Test approval notification",
         bot_self_id="bot_qq_999",
         fallback_group="group_8888",
+        fallback_payload="【权限通知】请私聊查看结果。",
     )
     assert outbox_id > 0
 
@@ -256,9 +261,10 @@ async def test_outbox_multi_bot_and_group_fallback(temp_db):
     assert row2["attempts"] == 2
     assert "Delivered via fallback group group_8888" in row2["last_error"]
 
-    # Verify mock_client called send_group_msg with correct bot_self_id
+    # Verify mock_client called send_group_msg with the minimal fallback payload only
+    # (never the full private payload) and the correct bot_self_id.
     mock_client.send_group_msg.assert_called_with(
         group_id="group_8888",
-        message="【Bot 权限通知（私聊受阻转群通知）】\nTest approval notification",
+        message="【权限通知】请私聊查看结果。",
         bot_self_id="bot_qq_999",
     )

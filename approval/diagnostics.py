@@ -1,4 +1,16 @@
-"""Read-only handler diagnostics service for AstrBot event priority inspection."""
+"""Read-only handler diagnostics: verify real AstrBot handler precedence.
+
+Verified AstrBot 4.29.4 facts used here (see COMPATIBILITY.md):
+* The global registry is ``astrbot.core.star.star_handler.star_handlers_registry``.
+  (There is no ``astrbot.core.star.star_handlers_registry`` module.)
+* Priority is stored in ``handler.extras_configs["priority"]`` (default 0); there is no
+  ``handler.priority`` attribute.
+* The registry iterates handlers in real dispatch order (descending priority, stable
+  registration order for ties), because ``StarHandlerRegistry.append`` sorts with
+  ``key=lambda h: -h.extras_configs["priority"]``.
+
+This service only *reports* reality. It never mutates another plugin's handler state.
+"""
 
 from __future__ import annotations
 
@@ -7,122 +19,126 @@ from typing import Any
 
 logger = logging.getLogger("astrbot_plugin_group_approval.diagnostics")
 
+GATE_PRIORITY = 50
+MODERATION_MIN_PRIORITY = GATE_PRIORITY + 1
+MODERATION_RECOMMENDED_PRIORITY = 100
+
+_PLUGIN_MODULE_HINT = "astrbot_plugin_group_approval"
+_MODERATION_MODULE_HINT = "group_guardian"
+_MODERATION_HANDLER_NAMES = ("_handle_message",)
+
+
+def _load_registry() -> Any | None:
+    """Import the real AstrBot registry, or return None when unavailable."""
+    try:
+        from astrbot.core.star.star_handler import star_handlers_registry
+
+        return star_handlers_registry
+    except Exception:  # noqa: BLE001 - older AstrBot or import failure
+        return None
+
 
 class HandlerDiagnostics:
-    """Inspects StarHandler registration metadata and audits execution precedence."""
+    """Inspects the real StarHandler registry and reports moderation precedence."""
 
     def __init__(self, context: Any = None):
         self.context = context
 
+    def _iter_handlers(self) -> list[Any] | None:
+        registry = _load_registry()
+        if registry is None:
+            return None
+        try:
+            handlers = list(registry)
+        except TypeError:
+            handlers = list(getattr(registry, "_handlers", []) or [])
+        return handlers
+
+    @staticmethod
+    def _priority_of(handler: Any) -> int:
+        extras = getattr(handler, "extras_configs", None) or {}
+        try:
+            return int(extras.get("priority", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def diagnose_handlers(self) -> dict[str, Any]:
-        """Scan AstrBot context for registered handlers and verify GroupGuardian precedence.
+        """Return a factual report about handler precedence.
 
-        AstrBot stores handler priority in handler.extras_configs['priority'] at registration.
+        ``moderation_precedence`` values:
+          - ``VERIFIED``: a GroupGuardian message handler runs before this gate.
+          - ``CONFLICT``: GroupGuardian is installed but would be pre-empted by the gate.
+          - ``NOT_INSTALLED``: no GroupGuardian handlers found.
+          - ``UNVERIFIED``: the real registry could not be imported (framework too old).
         """
-        if self.context is None:
+        handlers = self._iter_handlers()
+        if handlers is None:
             return {
-                "group_guardian_status": "UNKNOWN",
-                "group_guardian_priority": None,
-                "group_approval_priority": 50,
-                "message": "AstrBot context not available for runtime handler inspection.",
+                "moderation_precedence": "UNVERIFIED",
+                "gate_priority": GATE_PRIORITY,
+                "moderation_priority": None,
+                "message": "无法导入 AstrBot 真实 Handler 注册表，无法验证内容审核与准入闸门的执行顺序。",
+                "recommendations": "确认 AstrBot 版本 >= 4.26.0（本插件的最低支持版本）。",
                 "handlers": [],
-                "recommendations": "Ensure AstrBot context is initialized before running diagnostics.",
             }
 
-        candidates = []
-        for attr in ("star_manager", "star_handlers", "handlers", "event_manager"):
-            obj = getattr(self.context, attr, None)
-            if obj is not None:
-                candidates.append(obj)
+        records: list[dict[str, Any]] = []
+        gate_priority: int | None = None
+        moderation: list[dict[str, Any]] = []
 
-        raw_handlers: list[Any] = []
-        for target in candidates:
-            h_list = getattr(target, "star_handlers", None) or getattr(target, "handlers", None)
-            if isinstance(h_list, (list, tuple)):
-                raw_handlers.extend(h_list)
-            elif isinstance(h_list, dict):
-                raw_handlers.extend(h_list.values())
-            elif isinstance(target, (list, tuple)):
-                raw_handlers.extend(target)
-
-        # Deduplicate
-        seen_ids = set()
-        unique_handlers = []
-        for h in raw_handlers:
-            h_id = id(h)
-            if h_id not in seen_ids:
-                seen_ids.add(h_id)
-                unique_handlers.append(h)
-
-        handler_records = []
-        gg_found = False
-        gg_max_priority = -999
-
-        for h in unique_handlers:
-            # Extract priority from official extras_configs first, then getattr fallback
-            extras = getattr(h, "extras_configs", {}) or {}
-            priority = extras.get("priority")
-            if priority is None:
-                priority = getattr(h, "priority", 0)
-            try:
-                priority = int(priority)
-            except (ValueError, TypeError):
-                priority = 0
-
-            # Extract name and plugin name
-            name = str(getattr(h, "name", "") or getattr(h, "__name__", "") or str(h))
-            plugin_name = str(
-                getattr(h, "plugin_name", "")
-                or getattr(h, "star_name", "")
-                or getattr(h, "plugin", "")
-                or ""
+        for handler in handlers:
+            module = str(getattr(handler, "handler_module_path", "") or "")
+            name = str(getattr(handler, "handler_name", "") or "")
+            priority = self._priority_of(handler)
+            records.append(
+                {
+                    "name": name,
+                    "module": module,
+                    "priority": priority,
+                }
             )
-            event_type = str(getattr(h, "event_type", "") or getattr(h, "event_message_type", ""))
+            if _PLUGIN_MODULE_HINT in module and name == "on_message_gate":
+                gate_priority = priority
+            if _MODERATION_MODULE_HINT in module.lower():
+                moderation.append({"name": name, "priority": priority})
 
-            rec = {
-                "name": name,
-                "plugin_name": plugin_name,
-                "priority": priority,
-                "event_type": event_type,
-            }
-            handler_records.append(rec)
+        effective_gate_priority = gate_priority if gate_priority is not None else GATE_PRIORITY
 
-            combined_str = f"{name} {plugin_name}".lower()
-            if "group_guardian" in combined_str or "groupguardian" in combined_str or "guardian" in combined_str:
-                gg_found = True
-                if priority > gg_max_priority:
-                    gg_max_priority = priority
-
-        # Sort handlers by priority descending (AstrBot dispatch order)
-        handler_records.sort(key=lambda x: x["priority"], reverse=True)
-
-        if not gg_found:
+        if not moderation:
             status = "NOT_INSTALLED"
-            msg = "GroupGuardian 未安装或未注册Handler。内容审核需依赖其他独立机制。"
-            recs = "如需群聊内容安全审核，请安装并配置 astrbot_plugin_group_guardian (建议 priority=100)。"
-            gg_prio = None
-        elif gg_max_priority >= 100:
-            status = "OPTIMAL"
-            msg = f"GroupGuardian 审核 Handler 优先级 ({gg_max_priority}) >= 100，优先于准入闸门 (50)。内容审核先于准入拦截，执行顺序安全。"
-            recs = "当前 Handler 排序安全，无需额外配置。"
-            gg_prio = gg_max_priority
+            moderation_priority = None
+            message = "未在真实注册表中发现 GroupGuardian 审核 Handler。"
+            recommendations = (
+                "若需要群内容安全审核，请安装 GroupGuardian 并应用兼容补丁 "
+                "(patches/group_guardian_priority.patch)。"
+            )
         else:
-            status = "WARNING"
-            msg = (
-                f"安全风险：GroupGuardian 审核 Handler 优先级 ({gg_max_priority}) <= 准入闸门 (50)！"
-                "未获授权群员的违规消息可能在到达 GroupGuardian 审核前被准入闸门拦截。"
-            )
-            recs = (
-                "请为 GroupGuardian 应用补丁：在 GroupGuardian 的主审核 Handler 装饰器中显式指定 priority=100："
-                "\n@filter.event_message_type(filter.EventMessageType.ALL, priority=100)"
-            )
-            gg_prio = gg_max_priority
+            moderation_priority = max(item["priority"] for item in moderation)
+            if moderation_priority > effective_gate_priority:
+                status = "VERIFIED"
+                message = (
+                    f"已验证：GroupGuardian 审核 Handler 实际优先级 {moderation_priority} "
+                    f"> 准入闸门 {effective_gate_priority}，未授权用户的违规消息会先被审核。"
+                )
+                recommendations = "当前 Handler 顺序符合安全要求，无需额外配置。"
+            else:
+                status = "CONFLICT"
+                message = (
+                    f"安全冲突：GroupGuardian 审核 Handler 实际优先级 {moderation_priority} "
+                    f"<= 准入闸门 {effective_gate_priority}。"
+                    "未授权用户的违规消息会在被审核前遭到拦截。"
+                )
+                recommendations = (
+                    "请对 GroupGuardian 应用 patches/group_guardian_priority.patch"
+                    f"（将主审核 Handler 提升至 priority={MODERATION_RECOMMENDED_PRIORITY}）。"
+                )
 
         return {
-            "group_guardian_status": status,
-            "group_guardian_priority": gg_prio,
-            "group_approval_priority": 50,
-            "message": msg,
-            "handlers": handler_records,
-            "recommendations": recs,
+            "moderation_precedence": status,
+            "gate_priority": effective_gate_priority,
+            "moderation_priority": moderation_priority,
+            "recommended_moderation_priority": MODERATION_RECOMMENDED_PRIORITY,
+            "message": message,
+            "recommendations": recommendations,
+            "handlers": records,
         }

@@ -1,75 +1,117 @@
-"""Authentication and server-side authorization service for WebUI operations."""
+"""Authentication and server-side authorization for WebUI (dashboard) operations.
+
+Identity model (verified against AstrBot 4.29.4 source):
+
+* AstrBot authenticates the request **before** calling a plugin web handler: the JWT (or an
+  API key with the ``plugin`` scope) is validated by the route dependency, and the resulting
+  identity is exposed as ``request.username`` on the contextvar request proxy. It is the only
+  identity signal a plugin gets - there is no ``request.session``, ``request.user`` or role
+  table (upstream has a single dashboard account: ``dashboard.username``).
+* Therefore dashboard authorization is based on exactly two facts: (1) the request is
+  authenticated by AstrBot, and (2) the authenticated username equals the configured
+  AstrBot dashboard username. Nothing else.
+* QQ identities (plugin Owner/Reviewer QQ ids) are a **separate** identity system and are
+  never consulted here: a dashboard username is not a QQ number and must never be mapped to
+  QQ privileges. Deleted/unknown identities are denied management operations.
+* API-key callers appear as ``api_key:<id>``; they are authenticated but are not a verified
+  human dashboard operator, so they are rejected as operators (they cannot be mapped to the
+  single dashboard account).
+"""
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from .config import PluginConfig
 
 logger = logging.getLogger("astrbot_plugin_group_approval.auth")
 
+# Read-only actions: any authenticated dashboard identity may perform them.
+READ_ACTIONS: frozenset[str] = frozenset(
+    {
+        "view_dashboard",
+        "list_bots",
+        "list_applications",
+        "list_users",
+        "list_groups",
+        "list_audit_logs",
+        "diagnostics",
+    }
+)
+
+# Every mutating/export action requires the verified dashboard administrator.
+OWNER_ACTIONS: frozenset[str] = frozenset(
+    {"approve", "reject", "revoke", "grant", "ban", "unban", "update_group", "export_logs"}
+)
+
 
 class AuthorizationService:
-    """Authenticates dashboard requests and enforces role-based permissions server-side."""
+    """Authenticates dashboard requests and authorizes actions server-side."""
 
-    def __init__(self, config: PluginConfig, is_reviewer_fn: Any = None):
+    def __init__(
+        self,
+        config: PluginConfig,
+        dashboard_username_getter: Callable[[], str | None] | None = None,
+    ):
         self.config = config
-        self._is_reviewer_fn = is_reviewer_fn
+        self._dashboard_username_getter = dashboard_username_getter
+
+    # ------------------------------------------------------------------
+    # Identity
+    # ------------------------------------------------------------------
+    def get_dashboard_username(self) -> str | None:
+        """Resolve the configured AstrBot dashboard username, if available."""
+        if not callable(self._dashboard_username_getter):
+            return None
+        try:
+            value = self._dashboard_username_getter()
+        except Exception as e:  # noqa: BLE001 - config unavailable => fail closed
+            logger.warning("Could not read AstrBot dashboard username: %s", e)
+            return None
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
 
     def get_authenticated_user(self, req: Any) -> str | None:
-        """Extract authenticated username strictly from official dashboard session/context.
+        """Return the AstrBot-authenticated dashboard username, or None.
 
-        Rejects spoofable client HTTP headers (e.g. X-AstrBot-User, Authorization-User).
-        Returns username string if authenticated, or None if unauthenticated.
+        Only ``request.username`` is used. It is injected by AstrBot from the validated
+        JWT/API-key identity *after* authentication, so it cannot be spoofed by a client
+        header. Quart-era attributes (``session``/``user``) do not exist upstream and are
+        deliberately not trusted.
         """
         if req is None:
             return None
-
-        # 1. AstrBot / Quart request authenticated username attribute
         username = getattr(req, "username", None)
-        if username and str(username).strip():
-            return str(username).strip()
-
-        # 2. Quart session user
-        session = getattr(req, "session", None)
-        if isinstance(session, dict):
-            s_user = session.get("user") or session.get("username")
-            if s_user and str(s_user).strip():
-                return str(s_user).strip()
-
-        # 3. Direct request.user object (e.g., Starlette / Quart Auth)
-        user_obj = getattr(req, "user", None)
-        if user_obj is not None:
-            identity = getattr(user_obj, "identity", None) or getattr(user_obj, "username", None) or getattr(user_obj, "name", None)
-            if identity and str(identity).strip():
-                return str(identity).strip()
-
-        return None
-
-    async def get_user_role(self, username: str) -> str:
-        """Determine operator role from system configuration and persistent reviewers."""
+        if not username:
+            return None
         u = str(username).strip()
         if not u:
+            return None
+        if u.startswith("api_key:"):
+            # Authenticated machine credential, not a verified dashboard operator.
+            return None
+        return u
+
+    async def get_user_role(self, username: str) -> str:
+        """Resolve the dashboard role of an authenticated username."""
+        u = str(username or "").strip()
+        if not u:
             return "UNAUTHENTICATED"
-
-        # Check Owner
-        if self.config.is_owner(u) or u.lower() in ("admin", "root", "owner"):
+        dashboard_user = self.get_dashboard_username()
+        if dashboard_user is None:
+            # Cannot prove who the dashboard administrator is => no operator privileges.
+            return "DASHBOARD_USER"
+        if u == dashboard_user:
             return "OWNER"
-
-        # Check Reviewer (memory config or database)
-        if self.config.is_reviewer(u):
-            return "REVIEWER"
-
-        if callable(self._is_reviewer_fn):
-            try:
-                if await self._is_reviewer_fn(u):
-                    return "REVIEWER"
-            except Exception:
-                pass
-
         return "DASHBOARD_USER"
 
+    # ------------------------------------------------------------------
+    # Authorization
+    # ------------------------------------------------------------------
     async def authorize_action(
         self,
         username: str,
@@ -78,48 +120,42 @@ class AuthorizationService:
         group_id: str | None = None,
         is_level_exempt: bool = False,
     ) -> tuple[bool, str, str]:
-        """Verify if authenticated user has permission to perform the requested action.
-
-        Returns:
-            (authorized: bool, role: str, reason: str)
-        """
-        u = str(username).strip()
+        """Authorize a dashboard action. Returns ``(allowed, role, reason)``."""
+        u = str(username or "").strip()
         if not u:
             return False, "UNAUTHENTICATED", "未登录或登录凭证已失效"
 
+        action = str(action or "").strip()
         role = await self.get_user_role(u)
 
-        # Read-only actions permitted for any authenticated dashboard user
-        read_actions = {
-            "view_dashboard",
-            "list_bots",
-            "list_applications",
-            "list_users",
-            "list_groups",
-            "list_audit_logs",
-            "diagnostics",
-        }
-        if action in read_actions:
+        if role == "OWNER":
             return True, role, ""
 
-        # Level exemption grant is strictly reserved for OWNER
-        if action == "grant" and is_level_exempt:
-            if role == "OWNER":
-                return True, role, ""
-            return False, role, "仅机器人主人(OWNER)可以授予免群等级检查特权"
+        if action in READ_ACTIONS:
+            return True, role, ""
 
-        # Reviewer actions (approve/reject application, revoke standard grant)
-        reviewer_actions = {"approve", "reject", "revoke"}
-        if action in reviewer_actions:
-            if role in ("OWNER", "REVIEWER"):
-                return True, role, ""
-            return False, role, f"用户 {u} 不是审核员或主人，无权执行 {action} 操作"
+        if role == "DASHBOARD_USER":
+            return (
+                False,
+                role,
+                "仅 AstrBot Dashboard 管理员可执行该操作（QQ Owner/Reviewer 身份不影响 Dashboard 权限）",
+            )
+        return False, role, "身份未通过验证，已拒绝管理操作"
 
-        # Owner-exclusive actions (manual grant, blacklist ban/unban, policy updates, log export)
-        owner_actions = {"grant", "ban", "unban", "update_group", "export_logs"}
-        if action in owner_actions:
-            if role == "OWNER":
-                return True, role, ""
-            return False, role, f"该操作 ({action}) 仅限机器人主人(OWNER)执行"
 
-        return False, role, f"未知或受限操作: {action}"
+def build_dashboard_username_getter(context: Any) -> Callable[[], str | None]:
+    """Build a getter for ``dashboard.username`` from the official ``Context.get_config()``."""
+
+    def _get() -> str | None:
+        if context is None or not hasattr(context, "get_config"):
+            return None
+        cfg = context.get_config()
+        if not isinstance(cfg, dict):
+            return None
+        dashboard = cfg.get("dashboard")
+        if not isinstance(dashboard, dict):
+            return None
+        username = dashboard.get("username")
+        return str(username).strip() if username else None
+
+    return _get

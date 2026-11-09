@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from approval.approval_service import ApprovalService
+from approval.auth_service import AuthorizationService
 from approval.config import PluginConfig
 from approval.database import Database
 from approval.models import GrantStatus
@@ -19,7 +20,6 @@ from main import (
     GroupApprovalPlugin,
     _get_query_param,
     _get_request_json,
-    _get_request_operator,
 )
 from tests.conftest import MockNapCatClient
 
@@ -53,35 +53,23 @@ def test_napcat_normalization_formats():
 
 
 @pytest.mark.asyncio
-async def test_napcat_multi_bot_resolution():
-    # Simulate AstrBot platform manager with two bot instances
-    mock_context = MagicMock()
-    mock_context.get_platform = None
-    pm = MagicMock()
-    inst1 = MagicMock()
-    inst1.adapter_type = "aiocqhttp"
-    inst1.self_id = "11111"
-    inst1.get_client.return_value = inst1
-    inst1.bot = inst1
+async def test_napcat_identity_requires_verified_mapping():
+    """No context / no verified get_login_info => fail closed (no first-client fallback).
 
-    inst2 = MagicMock()
-    inst2.adapter_type = "aiocqhttp"
-    inst2.self_id = "22222"
-    inst2.get_client.return_value = inst2
-    inst2.bot = inst2
-
-    pm.get_insts.return_value = [inst1, inst2]
-    mock_context.platform_manager = pm
+    The old mock-based test asserted a synchronous `_resolve_bot_client` selection based on
+    a nonexistent ``.self_id`` attribute; that was exactly the broken design. Real verified
+    multi-bot routing is covered by tests/test_bot_identity.py.
+    """
+    from approval.napcat_client import ERR_UNKNOWN_BOT_SELF_ID
 
     client = NapCatClient()
-    client.set_context(mock_context)
+    assert await client.list_bots() == []
 
-    # Resolve specific bot
-    c1 = client._resolve_bot_client("11111")
-    assert c1.self_id == "11111"
-
-    c2 = client._resolve_bot_client("22222")
-    assert c2.self_id == "22222"
+    ok, data, err, code = await client.send_private_msg("123", "hi", bot_self_id="99999")
+    assert ok is False
+    assert data is None
+    assert code == -3, (err, code)
+    assert err.startswith(ERR_UNKNOWN_BOT_SELF_ID), err
 
 
 # 2. Database Transactions and Rollback
@@ -262,77 +250,85 @@ async def test_web_api_v011_features(web_system):
         async def json(self, default=None):
             return self._json
 
-    # Spoofed header without authentic session must be rejected (returns None)
+    # Dashboard authorization uses ONLY AstrBot's authenticated request.username.
+    auth = AuthorizationService(config, dashboard_username_getter=lambda: "astrbot")
+
+    # Spoofed header without an authenticated session must be rejected.
     req_spoofed = MockRequest(
         query={"group_id": "10001"},
         headers={"X-AstrBot-User": "attacker_spoof"},
         json_body={"application_id": "A1000", "note": "Approve via test"},
     )
     assert _get_query_param(req_spoofed, "group_id") == "10001"
-    assert _get_request_operator(req_spoofed) is None
+    assert auth.get_authenticated_user(req_spoofed) is None
 
-    # Authentic session user accepted
+    # Authenticated dashboard operator is accepted.
     req_auth = MockRequest(
         query={"group_id": "10001"},
-        username="admin_alice",
+        username="astrbot",
         json_body={"application_id": "A1000", "note": "Approve via test"},
     )
-    assert _get_request_operator(req_auth) == "admin_alice"
+    assert auth.get_authenticated_user(req_auth) == "astrbot"
     body = await _get_request_json(req_auth)
     assert body["application_id"] == "A1000"
 
+    # API-key machine identities are not verified human dashboard operators.
+    assert auth.get_authenticated_user(MockRequest(username="api_key:abc123")) is None
 
-# 7. Handler Diagnostics Service & Static Priority Precedence
-@pytest.mark.asyncio
-async def test_handler_diagnostics_service():
+    # Dashboard role: only the configured dashboard username is OWNER. The old hardcoded
+    # 'admin'/'root'/'owner' name mapping is gone, and QQ owner IDs are a separate identity
+    # system that must NOT grant dashboard privileges.
+    assert await auth.get_user_role("astrbot") == "OWNER"
+    for name in ("admin", "root", "owner", "99999", "88888"):
+        assert await auth.get_user_role(name) == "DASHBOARD_USER", name
+
+    # Unknown dashboard identity (getter unavailable) must fail closed for mutations.
+    auth_unknown = AuthorizationService(config, dashboard_username_getter=lambda: None)
+    ok_unknown, role_unknown, _ = await auth_unknown.authorize_action("astrbot", "approve")
+    assert ok_unknown is False
+    assert role_unknown == "DASHBOARD_USER"
+
+
+# 7. Handler Diagnostics Service reads the REAL registry shape
+def test_handler_diagnostics_service():
+    from unittest.mock import patch
+
+    from approval import diagnostics as diag_mod
     from approval.diagnostics import HandlerDiagnostics
 
-    # Case A: GroupGuardian registered with priority 0 -> WARNING
-    mock_context_warning = MagicMock()
-    gg_warning = MagicMock()
-    gg_warning.name = "group_guardian_filter"
-    gg_warning.plugin_name = "astrbot_plugin_group_guardian"
-    gg_warning.extras_configs = {"priority": 0}
-    gg_warning.event_type = "ALL"
+    def handler(name, module, priority):
+        h = MagicMock()
+        h.handler_name = name
+        h.handler_module_path = module
+        h.extras_configs = {"priority": priority}
+        return h
 
-    jrys_handler = MagicMock()
-    jrys_handler.name = "jrys_handler"
-    jrys_handler.plugin_name = "astrbot_plugin_jrys"
-    jrys_handler.extras_configs = {"priority": 0}
-    jrys_handler.event_type = "ALL"
+    gg_module = "astrbot_plugin_group_guardian.main"
 
-    mock_context_warning.handlers = [gg_warning, jrys_handler]
+    # Stock upstream GroupGuardian (no priority=) -> default 0 -> CONFLICT with the gate.
+    with patch.object(diag_mod, "_load_registry", lambda: [handler("_handle_message", gg_module, 0)]):
+        res = HandlerDiagnostics().diagnose_handlers()
+    assert res["moderation_precedence"] == "CONFLICT"
+    assert res["moderation_priority"] == 0
+    assert "patches/group_guardian_priority.patch" in res["recommendations"]
 
-    diag_warn = HandlerDiagnostics(mock_context_warning)
-    res_warn = diag_warn.diagnose_handlers()
-    assert res_warn["group_guardian_status"] == "WARNING"
-    assert res_warn["group_guardian_priority"] == 0
-    assert "安全风险" in res_warn["message"]
+    # Patched GroupGuardian (priority=100) -> VERIFIED.
+    with patch.object(diag_mod, "_load_registry", lambda: [handler("_handle_message", gg_module, 100)]):
+        res = HandlerDiagnostics().diagnose_handlers()
+    assert res["moderation_precedence"] == "VERIFIED"
+    assert res["moderation_priority"] == 100
 
-    # Case B: GroupGuardian patched with priority 100 -> OPTIMAL
-    mock_context_optimal = MagicMock()
-    gg_optimal = MagicMock()
-    gg_optimal.name = "group_guardian_filter"
-    gg_optimal.plugin_name = "astrbot_plugin_group_guardian"
-    gg_optimal.extras_configs = {"priority": 100}
-    gg_optimal.event_type = "ALL"
+    # GroupGuardian not installed.
+    with patch.object(diag_mod, "_load_registry", lambda: []):
+        res = HandlerDiagnostics().diagnose_handlers()
+    assert res["moderation_precedence"] == "NOT_INSTALLED"
 
-    mock_context_optimal.handlers = [gg_optimal, jrys_handler]
+    # Real registry unavailable (old AstrBot) -> UNVERIFIED, never a false "safe".
+    with patch.object(diag_mod, "_load_registry", lambda: None):
+        res = HandlerDiagnostics().diagnose_handlers()
+    assert res["moderation_precedence"] == "UNVERIFIED"
 
-    diag_opt = HandlerDiagnostics(mock_context_optimal)
-    res_opt = diag_opt.diagnose_handlers()
-    assert res_opt["group_guardian_status"] == "OPTIMAL"
-    assert res_opt["group_guardian_priority"] == 100
-    assert "执行顺序安全" in res_opt["message"]
-
-    # Case C: GroupGuardian not installed -> NOT_INSTALLED
-    mock_context_none = MagicMock()
-    mock_context_none.handlers = [jrys_handler]
-    diag_none = HandlerDiagnostics(mock_context_none)
-    res_none = diag_none.diagnose_handlers()
-    assert res_none["group_guardian_status"] == "NOT_INSTALLED"
-
-    # Verify runtime monkey-patch method is removed from GroupApprovalPlugin
-    plugin = GroupApprovalPlugin(context=mock_context_optimal)
+    # Verify runtime monkey-patch method stays removed from GroupApprovalPlugin.
+    plugin = GroupApprovalPlugin(context=MagicMock())
     assert not hasattr(plugin, "_promote_group_guardian_priority")
-    await plugin.terminate()
+    assert not hasattr(plugin, "on_message_gate_priority_mutation")
