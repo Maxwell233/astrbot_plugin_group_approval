@@ -161,3 +161,48 @@ async def test_expired_application_cannot_be_approved(approval_system):
     success, msg = await approval.approve_application("88888", "REVIEWER", app.id)
     assert success is False
     assert "该申请已被处理" in msg
+
+
+async def test_approval_expires_during_live_level_lookup(approval_system, monkeypatch):
+    from types import SimpleNamespace
+
+    from approval import approval_service
+
+    approval, db, _napcat, _config = approval_system
+    now = int(time.time())
+    clock = SimpleNamespace(time=lambda: now)
+    _, _, app = await approval.apply_for_access("bot1", "10001", "20001")
+    await db.execute("UPDATE applications SET expires_at = ? WHERE id = ?", (now + 1, app.id))
+    lookup = approval.level_service.get_group_member_level
+
+    async def slow_lookup(**kwargs):
+        nonlocal now
+        result = await lookup(**kwargs)
+        now += 1
+        return result
+
+    monkeypatch.setattr(approval_service, "time", clock)
+    monkeypatch.setattr(approval.level_service, "get_group_member_level", slow_lookup)
+    ok, message = await approval.approve_application("88888", "REVIEWER", app.id)
+    assert not ok and "过期" in message
+    assert (await db.fetchone("SELECT status FROM applications WHERE id = ?", (app.id,)))[0] == "EXPIRED"
+    assert await db.fetchone("SELECT id FROM grants") is None
+
+
+async def test_global_ban_revokes_grants_in_all_groups_for_that_bot(approval_system):
+    approval, db, _napcat, _config = approval_system
+    for bot, group in [("bot1", "10001"), ("bot1", "10002"), ("bot2", "10001")]:
+        assert (await approval.grant_manually("99999", "OWNER", bot, group, "20001", is_level_exempt=True))[0]
+    assert (await approval.ban_user("99999", "OWNER", "bot1", "ALL", "20001"))[0]
+    assert (await approval.unban_user("99999", "OWNER", "bot1", "ALL", "20001"))[0]
+    rows = await db.fetchall("SELECT bot_self_id, status FROM grants ORDER BY bot_self_id, group_id")
+    assert [tuple(row) for row in rows] == [("bot1", "REVOKED"), ("bot1", "REVOKED"), ("bot2", "ACTIVE")]
+
+
+async def test_blacklisted_applicant_cannot_be_approved(approval_system):
+    approval, db, _napcat, _config = approval_system
+    _, _, app = await approval.apply_for_access("bot1", "10001", "20001")
+    assert (await approval.ban_user("99999", "OWNER", "bot1", "ALL", "20001"))[0]
+    ok, message = await approval.approve_application("88888", "REVIEWER", app.id)
+    assert not ok and "黑名单" in message
+    assert await db.fetchone("SELECT id FROM grants") is None

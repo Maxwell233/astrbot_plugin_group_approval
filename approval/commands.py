@@ -87,8 +87,8 @@ class CommandDispatcher:
 
         status_zh = {
             GrantStatus.ACTIVE: "正常使用中",
-            GrantStatus.SUSPENDED: f"已暂停（{grant.suspend_reason or '等级未达标'}）",
-            GrantStatus.REVOKED: f"已撤销（{grant.suspend_reason or '管理员撤销'}）",
+            GrantStatus.SUSPENDED: "已暂停",
+            GrantStatus.REVOKED: "已撤销",
             GrantStatus.EXPIRED: "已过期",
         }.get(grant.status, grant.status.value)
 
@@ -118,7 +118,7 @@ class CommandDispatcher:
             # Look for most recent non-pending application
             recent = await self.db.fetchone(
                 """
-                SELECT id, status, level_at_application, created_at, reviewed_at, review_note
+                SELECT id, status, level_at_application, created_at, reviewed_at
                 FROM applications
                 WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
                 ORDER BY created_at DESC LIMIT 1
@@ -128,7 +128,7 @@ class CommandDispatcher:
             if recent:
                 status_name = {
                     "APPROVED": "已批准",
-                    "REJECTED": f"已拒绝（原因：{recent['review_note'] or '未说明'}）",
+                    "REJECTED": "已拒绝",
                     "CANCELLED": "已主动取消",
                     "EXPIRED": "已过期",
                 }.get(recent["status"], recent["status"])
@@ -227,6 +227,10 @@ class CommandDispatcher:
         if not is_reviewer:
             return "权限不足：您不是 Group Approval 审核员或 Owner。"
 
+        private_commands = {"history", "user", "pending", "list", "approve", "reject", "grant", "reviewer"}
+        if group_id and subcmd in private_commands:
+            return "请私聊当前 Bot 处理审核与授权详情。"
+
         actor_role = "OWNER" if is_owner else "REVIEWER"
 
         # Reviewer & Owner Commands
@@ -243,6 +247,7 @@ class CommandDispatcher:
                 actor_id=sender_id,
                 actor_role=actor_role,
                 application_id=app_id,
+                expected_bot_self_id=bot_self_id,
                 note=note,
             )
             return msg
@@ -256,6 +261,7 @@ class CommandDispatcher:
                 actor_id=sender_id,
                 actor_role=actor_role,
                 application_id=app_id,
+                expected_bot_self_id=bot_self_id,
                 reason=reason,
             )
             return msg
@@ -290,7 +296,7 @@ class CommandDispatcher:
         elif subcmd == "history":
             if not subargs:
                 return "用法：/ga history <申请编号>"
-            return await self._cmd_history(subargs[0])
+            return await self._cmd_history(bot_self_id, subargs[0])
 
         # Owner Exclusive Commands
         if not is_owner:
@@ -406,8 +412,8 @@ class CommandDispatcher:
         return f"未知管理指令：{subcmd}。发送 /ga 查看帮助。"
 
     async def _cmd_pending(self, bot_self_id: str, group_id: str | None) -> str:
-        sql = "SELECT id, group_id, user_id, level_at_application, created_at FROM applications WHERE status = 'PENDING'"
-        params: list[Any] = []
+        sql = "SELECT id, group_id, user_id, level_at_application, created_at FROM applications WHERE status = 'PENDING' AND bot_self_id = ?"
+        params: list[Any] = [bot_self_id]
         if group_id:
             sql += " AND group_id = ?"
             params.append(group_id)
@@ -449,8 +455,8 @@ class CommandDispatcher:
 
         # Recent applications
         apps = await self.db.fetchall(
-            "SELECT id, status, level_at_application, created_at FROM applications WHERE group_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 3",
-            (group_id, user_id),
+            "SELECT id, status, level_at_application, created_at FROM applications WHERE bot_self_id = ? AND group_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 3",
+            (bot_self_id, group_id, user_id),
         )
         if apps:
             lines.append("\n最近申请：")
@@ -461,8 +467,8 @@ class CommandDispatcher:
 
     async def _cmd_list(self, bot_self_id: str, group_id: str) -> str:
         rows = await self.db.fetchall(
-            "SELECT user_id, status, last_verified_level, expires_at FROM grants WHERE group_id = ? AND status = 'ACTIVE' LIMIT 20",
-            (group_id,),
+            "SELECT user_id, status, last_verified_level, expires_at FROM grants WHERE bot_self_id = ? AND group_id = ? AND status = 'ACTIVE' LIMIT 20",
+            (bot_self_id, group_id),
         )
         if not rows:
             return f"群 {group_id} 暂无已激活的授权用户。"
@@ -472,8 +478,10 @@ class CommandDispatcher:
             lines.append(f"• QQ: {r['user_id']} | LV{r['last_verified_level']}")
         return "\n".join(lines)
 
-    async def _cmd_history(self, app_id: str) -> str:
-        row = await self.db.fetchone("SELECT * FROM applications WHERE id = ?", (app_id,))
+    async def _cmd_history(self, bot_self_id: str, app_id: str) -> str:
+        row = await self.db.fetchone(
+            "SELECT * FROM applications WHERE id = ? AND bot_self_id = ?", (app_id, bot_self_id)
+        )
         if row is None:
             return f"未找到申请编号 {app_id}。"
 
@@ -490,11 +498,11 @@ class CommandDispatcher:
         )
 
     async def _cmd_status(self, bot_self_id: str) -> str:
-        groups_cnt = (await self.db.fetchone("SELECT COUNT(*) FROM group_policies WHERE enabled = 1"))[0]
-        pending_cnt = (await self.db.fetchone("SELECT COUNT(*) FROM applications WHERE status = 'PENDING'"))[0]
-        grants_cnt = (await self.db.fetchone("SELECT COUNT(*) FROM grants WHERE status = 'ACTIVE'"))[0]
-        suspended_cnt = (await self.db.fetchone("SELECT COUNT(*) FROM grants WHERE status = 'SUSPENDED'"))[0]
-        blacklist_cnt = (await self.db.fetchone("SELECT COUNT(*) FROM blacklist"))[0]
+        groups_cnt = (await self.db.fetchone("SELECT COUNT(*) FROM group_policies WHERE enabled = 1 AND bot_self_id = ?", (bot_self_id,)))[0]
+        pending_cnt = (await self.db.fetchone("SELECT COUNT(*) FROM applications WHERE status = 'PENDING' AND bot_self_id = ?", (bot_self_id,)))[0]
+        grants_cnt = (await self.db.fetchone("SELECT COUNT(*) FROM grants WHERE status = 'ACTIVE' AND bot_self_id = ?", (bot_self_id,)))[0]
+        suspended_cnt = (await self.db.fetchone("SELECT COUNT(*) FROM grants WHERE status = 'SUSPENDED' AND bot_self_id = ?", (bot_self_id,)))[0]
+        blacklist_cnt = (await self.db.fetchone("SELECT COUNT(*) FROM blacklist WHERE bot_self_id = ?", (bot_self_id,)))[0]
 
         return (
             "【Group Approval 插件运行状态】\n"

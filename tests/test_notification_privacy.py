@@ -169,3 +169,24 @@ async def test_private_success_sends_exactly_one_message_with_note(outbox):
     assert len(client.private_calls) == 1
     assert "审批备注A" in client.private_calls[0][1]
     assert client.group_calls == []
+
+
+async def test_legacy_outbox_without_bot_never_sends_via_an_arbitrary_bot(outbox):
+    client = RecordingClient(private_ok=True)
+    svc = NotificationService(outbox, client, max_retries=1)
+    await svc.enqueue("legacy", "30005", "private", SECRET_NOTE)
+    await svc.process_outbox_once()
+    assert client.private_calls == client.group_calls == []
+    assert (await outbox.fetchone("SELECT status FROM notification_outbox"))[0] == "FAILED"
+
+
+async def test_review_fallback_must_never_be_the_applicants_group(outbox):
+    client = RecordingClient(private_ok=False)
+    svc = NotificationService(outbox, client, max_retries=1)
+    for app, recipients in (("A1001", []), ("A1002", ["20001"])):
+        await svc.notify_admins_of_application(
+            app, "30005", "10001", 20, 10, recipients,
+            bot_self_id="10002", fallback_group="10001",
+        )
+    await svc.process_outbox_once()
+    assert client.group_calls == []

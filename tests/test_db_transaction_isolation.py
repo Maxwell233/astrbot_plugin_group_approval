@@ -154,3 +154,23 @@ async def test_failed_statement_rolls_back_whole_transaction(db):
 
     rows = await db.fetchall("SELECT id FROM t")
     assert rows == []
+
+
+async def test_child_task_cannot_join_parent_transaction(db):
+    async with db.transaction():
+        with pytest.raises(RuntimeError, match="owner"):
+            await asyncio.create_task(db.execute("INSERT INTO t VALUES ('child', 'unexpected')"))
+    assert await db.fetchone("SELECT id FROM t") is None
+
+
+async def test_database_instance_cannot_inherit_another_databases_transaction(db, tmp_path):
+    other = Database(tmp_path / "other.db")
+    await other.init()
+    try:
+        await other.execute(SCHEMA)
+        async with db.transaction():
+            await other.execute("INSERT INTO t VALUES ('other', 'separate')")
+            assert await db.fetchone("SELECT id FROM t") is None
+        assert (await other.fetchone("SELECT id FROM t"))[0] == "other"
+    finally:
+        await other.close()

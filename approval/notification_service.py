@@ -113,6 +113,9 @@ class NotificationService:
         ``fallback_group`` must be the dedicated administrator review group configured by
         the owner; it is never automatically set to the application's source group.
         """
+        fallback_group = str(fallback_group).strip()
+        if fallback_group == str(group_id).strip():
+            fallback_group = ""
         msg = (
             f"【Bot 使用权限申请】\n\n"
             f"申请编号：{app_id}\n"
@@ -268,18 +271,25 @@ class NotificationService:
             payload = r["payload"]
             attempts = r["attempts"] + 1
 
+            if not bot_self_id or bot_self_id.lower() == "default":
+                await self.db.execute(
+                    "UPDATE notification_outbox SET status = 'FAILED', last_error = ? WHERE id = ?",
+                    ("Missing verified Bot identity on outbox row", outbox_id),
+                )
+                processed += 1
+                continue
+
             success = False
             last_error = ""
-            target_bot = bot_self_id if bot_self_id else None
 
             try:
                 if channel == "private":
                     ok, _data, err_msg, retcode = await self.client.send_private_msg(
-                        recipient, payload, bot_self_id=target_bot
+                        recipient, payload, bot_self_id=bot_self_id
                     )
                 else:
                     ok, _data, err_msg, retcode = await self.client.send_group_msg(
-                        recipient, payload, bot_self_id=target_bot
+                        recipient, payload, bot_self_id=bot_self_id
                     )
                 if ok:
                     success = True
@@ -304,7 +314,7 @@ class NotificationService:
                         fb_ok, _fb_data, fb_err, _ = await self.client.send_group_msg(
                             group_id=fallback_group,
                             message=fallback_payload,
-                            bot_self_id=target_bot,
+                            bot_self_id=bot_self_id,
                         )
                         if fb_ok:
                             success = True

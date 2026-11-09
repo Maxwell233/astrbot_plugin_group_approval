@@ -243,9 +243,9 @@ class ApprovalService:
             return False, "当前群尚未开启 Bot 使用准入机制", None
 
         # 2. Check blacklist
-        is_banned, ban_reason = await self.is_blacklisted(b_id, g_id, u_id)
+        is_banned, _ = await self.is_blacklisted(b_id, g_id, u_id)
         if is_banned:
-            return False, f"申请被拒绝：{ban_reason}", None
+            return False, "申请被拒绝：您当前在黑名单中", None
 
         # 3. Check existing active grant
         grant = await self.get_active_grant(b_id, g_id, u_id)
@@ -265,7 +265,7 @@ class ApprovalService:
         cooldown_sec = self.config.application.reject_cooldown_hours * 3600
         recent_reject = await self.db.fetchone(
             """
-            SELECT reviewed_at, review_note FROM applications
+            SELECT reviewed_at FROM applications
             WHERE bot_self_id = ? AND group_id = ? AND user_id = ? AND status = 'REJECTED'
             ORDER BY reviewed_at DESC LIMIT 1
             """,
@@ -277,7 +277,7 @@ class ApprovalService:
                 hours_left = max(1, int((cooldown_sec - passed) / 3600))
                 return (
                     False,
-                    f"申请冷却中：您最近的申请曾被拒绝（原因：{recent_reject['review_note'] or '未说明'}），请在 {hours_left} 小时后再试",
+                    f"申请冷却中：您最近的申请曾被拒绝，请在 {hours_left} 小时后再试",
                     None,
                 )
 
@@ -390,6 +390,8 @@ class ApprovalService:
         actor_role: str,
         application_id: str,
         note: str = "",
+        *,
+        expected_bot_self_id: str | None = None,
     ) -> tuple[bool, str]:
         """Approve an application atomically.
 
@@ -402,18 +404,18 @@ class ApprovalService:
         transaction opens, so a slow NapCat API call never holds the SQLite write lock.
         """
         app_id = str(application_id).strip()
-        now = int(time.time())
 
         async with self._action_lock:
             # 1. Read-only snapshot for validation and for the network level lookup.
             row = await self.db.fetchone("SELECT * FROM applications WHERE id = ?", (app_id,))
-            if row is None:
-                return False, f"申请编号 {app_id} 不存在"
+            if row is None or (expected_bot_self_id is not None and row["bot_self_id"] != expected_bot_self_id):
+                return False, f"未找到申请编号 {app_id}。"
 
             current_status = row["status"]
             if current_status != "PENDING":
                 return False, f"该申请已被处理（当前状态：{current_status}）"
 
+            now = int(time.time())
             exp_at = int(row["expires_at"])
             if exp_at > 0 and exp_at <= now:
                 await self._mark_application_expired(app_id)
@@ -422,8 +424,6 @@ class ApprovalService:
             bot_self_id = row["bot_self_id"]
             group_id = row["group_id"]
             user_id = row["user_id"]
-
-            policy = await self.get_group_policy(bot_self_id, group_id)
 
             # 2. Force re-check current member level and group membership before granting.
             #    This is network I/O and must stay outside the write transaction.
@@ -440,17 +440,6 @@ class ApprovalService:
                     f"批准失败：无法获取用户当前群成员信息（可能已退群，错误码：{lvl_res.error_code}）",
                 )
 
-            if lvl_res.level < policy.min_level:
-                return (
-                    False,
-                    f"批准失败：用户当前群等级 (LV{lvl_res.level}) 低于本群门槛 (LV{policy.min_level})",
-                )
-
-            # 3. Calculate grant expiration
-            grant_exp = 0
-            if policy.grant_duration_seconds > 0:
-                grant_exp = now + policy.grant_duration_seconds
-
             grant_id = f"G{app_id.removeprefix('A')}"
 
             # 4. Single atomic transaction: Application + Grant + Audit + Outbox.
@@ -463,8 +452,12 @@ class ApprovalService:
                     # Re-validate under the write lock: the row may have changed while the
                     # network level lookup above was in flight.
                     fresh = await self.db.fetchone(
-                        "SELECT status, expires_at FROM applications WHERE id = ?", (app_id,)
+                        "SELECT status, expires_at FROM applications WHERE id = ? AND bot_self_id = ?",
+                        (app_id, bot_self_id),
                     )
+                    policy = await self.get_group_policy(bot_self_id, group_id)
+                    blacklisted, _ = await self.is_blacklisted(bot_self_id, group_id, user_id)
+                    now = int(time.time())
                     if fresh is None:
                         failure = f"申请编号 {app_id} 不存在"
                     elif fresh["status"] != "PENDING":
@@ -475,7 +468,14 @@ class ApprovalService:
                             (app_id,),
                         )
                         failure = "该申请已过期失效，无法批准"
+                    elif blacklisted:
+                        failure = "批准失败：用户当前在黑名单中"
+                    elif lvl_res.level < policy.min_level:
+                        failure = (
+                            f"批准失败：用户当前群等级 (LV{lvl_res.level}) 低于本群门槛 (LV{policy.min_level})"
+                        )
                     else:
+                        grant_exp = now + policy.grant_duration_seconds if policy.grant_duration_seconds > 0 else 0
                         cursor = await self.db.execute(
                             """
                             UPDATE applications
@@ -569,21 +569,23 @@ class ApprovalService:
         actor_role: str,
         application_id: str,
         reason: str = "",
+        *,
+        expected_bot_self_id: str | None = None,
     ) -> tuple[bool, str]:
         """Reject an application."""
         app_id = str(application_id).strip()
-        now = int(time.time())
 
         async with self._action_lock:
             row = await self.db.fetchone("SELECT * FROM applications WHERE id = ?", (app_id,))
-            if row is None:
-                return False, f"申请编号 {app_id} 不存在"
+            if row is None or (expected_bot_self_id is not None and row["bot_self_id"] != expected_bot_self_id):
+                return False, f"未找到申请编号 {app_id}。"
 
             current_status = row["status"]
             if current_status != "PENDING":
                 return False, f"该申请已被处理（当前状态：{current_status}）"
 
             # Real-time expiration check (expires_at <= now)
+            now = int(time.time())
             exp_at = int(row["expires_at"])
             if exp_at > 0 and exp_at <= now:
                 await self._mark_application_expired(app_id)
@@ -596,8 +598,10 @@ class ApprovalService:
             failure: str | None = None
             async with self.db.transaction():
                 fresh = await self.db.fetchone(
-                    "SELECT status, expires_at FROM applications WHERE id = ?", (app_id,)
+                    "SELECT status, expires_at FROM applications WHERE id = ? AND bot_self_id = ?",
+                        (app_id, bot_self_id),
                 )
+                now = int(time.time())
                 if fresh is None:
                     failure = f"申请编号 {app_id} 不存在"
                 elif fresh["status"] != "PENDING":
@@ -860,10 +864,10 @@ class ApprovalService:
                     UPDATE grants
                     SET status = 'REVOKED', revoked_by = ?, revoked_at = ?, suspend_reason = 'BLACKLISTED',
                         revision = revision + 1
-                    WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
+                    WHERE bot_self_id = ? AND (group_id = ? OR ? = 'ALL') AND user_id = ?
                       AND status IN ('ACTIVE', 'SUSPENDED')
                     """,
-                    (str(actor_id).strip(), now, b_id, g_id, u_id),
+                    (str(actor_id).strip(), now, b_id, g_id, g_id, u_id),
                 )
                 await self.audit.log(
                     actor_id=str(actor_id),

@@ -10,7 +10,7 @@ from .audit_service import AuditService
 from .config import PluginConfig
 from .database import Database
 from .level_service import LevelService
-from .models import AccessDecision, GrantStatus, RestorePolicy
+from .models import AccessDecision, Grant, GrantStatus, RestorePolicy
 
 logger = logging.getLogger("astrbot_plugin_group_approval.access")
 
@@ -43,7 +43,6 @@ class AccessService:
         b_id = str(bot_id).strip()
         g_id = str(group_id).strip()
         u_id = str(user_id).strip()
-        now = int(time.time())
 
         # 1. Validate platform & identity parameters
         if not b_id or not g_id or not u_id:
@@ -96,6 +95,10 @@ class AccessService:
                 minimum_level=policy.min_level,
             )
 
+        now = int(time.time())
+        if grant.status in {GrantStatus.ACTIVE, GrantStatus.SUSPENDED} and 0 < grant.expires_at <= now:
+            return await self._expire_grant(grant, policy.min_level)
+
         # Handle suspended status with automatic recovery policy
         if grant.status == GrantStatus.SUSPENDED:
             if policy.restore_policy == RestorePolicy.AUTOMATIC.value:
@@ -112,6 +115,9 @@ class AccessService:
                     # transition cannot overwrite an administrator revoke/ban that committed
                     # after we read the grant.
                     async with self.db.transaction():
+                        now = int(time.time())
+                        if 0 < grant.expires_at <= now:
+                            return await self._expire_grant(grant, policy.min_level)
                         cursor = await self.db.execute(
                             """
                             UPDATE grants
@@ -172,40 +178,6 @@ class AccessService:
                 last_verified_at=grant.last_verified_at,
             )
 
-        # 8. Check grant expiration (expires_at <= now)
-        if grant.expires_at > 0 and now >= grant.expires_at:
-            async with self.db.transaction():
-                cursor = await self.db.execute(
-                    """
-                    UPDATE grants
-                    SET status = 'EXPIRED', revision = revision + 1
-                    WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
-                      AND status = 'ACTIVE' AND revision = ?
-                    """,
-                    (b_id, g_id, u_id, grant.revision),
-                )
-                if cursor.rowcount > 0:
-                    await self.audit.log(
-                        actor_id="SYSTEM",
-                        actor_type="SYSTEM",
-                        bot_self_id=b_id,
-                        group_id=g_id,
-                        target_user_id=u_id,
-                        action="GRANT_EXPIRED",
-                        old_state="ACTIVE",
-                        new_state="EXPIRED",
-                    )
-            if cursor.rowcount == 0:
-                # Concurrent transition won; report the real current state, never allow.
-                return await self._deny_changed_state(b_id, g_id, u_id, policy.min_level)
-            return AccessDecision(
-                allowed=False,
-                reason="GRANT_EXPIRED",
-                grant_status=GrantStatus.EXPIRED.value,
-                minimum_level=policy.min_level,
-                last_verified_at=grant.last_verified_at,
-            )
-
         # 9. Re-verify membership/level if the recheck interval elapsed.
         #    Level exemption only exempts the *minimum level threshold*; it must NOT exempt
         #    QQ group membership, otherwise a user who left the group keeps access forever.
@@ -234,6 +206,9 @@ class AccessService:
                 # with an administrator revoke would downgrade REVOKED to SUSPENDED, which
                 # a later automatic restore could then revive.
                 async with self.db.transaction():
+                    now = int(time.time())
+                    if 0 < grant.expires_at <= now:
+                        return await self._expire_grant(grant, policy.min_level)
                     cursor = await self.db.execute(
                         """
                         UPDATE grants
@@ -272,6 +247,9 @@ class AccessService:
             # Conditional on the grant still being ACTIVE at the revision we read so a
             # concurrent revoke is never overwritten by a routine re-check.
             async with self.db.transaction():
+                now = int(time.time())
+                if 0 < grant.expires_at <= now:
+                    return await self._expire_grant(grant, policy.min_level)
                 cursor = await self.db.execute(
                     """
                     UPDATE grants
@@ -294,6 +272,39 @@ class AccessService:
             grant_status=GrantStatus.ACTIVE.value,
             current_level=grant.last_verified_level,
             minimum_level=policy.min_level,
+            last_verified_at=grant.last_verified_at,
+        )
+
+    async def _expire_grant(self, grant: Grant, minimum_level: int) -> AccessDecision:
+        bot_id, group_id, user_id = grant.bot_self_id, grant.group_id, grant.user_id
+        async with self.db.transaction():
+            cursor = await self.db.execute(
+                """
+                UPDATE grants
+                SET status = 'EXPIRED', revision = revision + 1
+                WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
+                  AND status = ? AND revision = ?
+                """,
+                (bot_id, group_id, user_id, grant.status.value, grant.revision),
+            )
+            if cursor.rowcount:
+                await self.audit.log(
+                    actor_id="SYSTEM",
+                    actor_type="SYSTEM",
+                    bot_self_id=bot_id,
+                    group_id=group_id,
+                    target_user_id=user_id,
+                    action="GRANT_EXPIRED",
+                    old_state=grant.status.value,
+                    new_state="EXPIRED",
+                )
+        if not cursor.rowcount:
+            return await self._deny_changed_state(bot_id, group_id, user_id, minimum_level)
+        return AccessDecision(
+            allowed=False,
+            reason="GRANT_EXPIRED",
+            grant_status=GrantStatus.EXPIRED.value,
+            minimum_level=minimum_level,
             last_verified_at=grant.last_verified_at,
         )
 

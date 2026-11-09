@@ -55,12 +55,6 @@ from .migrations import run_migrations
 
 logger = logging.getLogger("astrbot_plugin_group_approval.database")
 
-# Task-local (not process-global) handle of the connection owned by the currently
-# active explicit transaction. ``None`` means "this task is not inside a transaction".
-_tx_connection: contextvars.ContextVar[aiosqlite.Connection | None] = contextvars.ContextVar(
-    "group_approval_tx_connection", default=None
-)
-
 _CONNECTION_PRAGMAS = (
     "PRAGMA journal_mode = WAL;",
     "PRAGMA synchronous = NORMAL;",
@@ -77,6 +71,9 @@ class Database:
         self._shared_conn: aiosqlite.Connection | None = None
         self._init_lock = asyncio.Lock()
         self._tx_lock = asyncio.Lock()
+        self._transaction_state: contextvars.ContextVar[
+            tuple[asyncio.Task[Any] | None, aiosqlite.Connection] | None
+        ] = contextvars.ContextVar("group_approval_transaction", default=None)
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -117,14 +114,18 @@ class Database:
 
     def _resolve(self, conn: aiosqlite.Connection | None) -> aiosqlite.Connection | None:
         """Resolve an explicit connection or the active transaction's connection."""
-        if conn is not None:
+        state = self._transaction_state.get()
+        if state is None:
             return conn
-        return _tx_connection.get()
+        owner, connection = state
+        if owner is not asyncio.current_task():
+            raise RuntimeError("SQLite transaction connection is restricted to its owner task")
+        return conn if conn is not None else connection
 
     @property
     def in_transaction(self) -> bool:
         """Whether the *current task* is inside an explicit transaction."""
-        return _tx_connection.get() is not None
+        return self._resolve(None) is not None
 
     # ------------------------------------------------------------------
     # Transactions
@@ -137,7 +138,7 @@ class Database:
         the returned connection. Nested calls from the same task join the outer
         transaction. Concurrent tasks are isolated: they use their own connection.
         """
-        existing = _tx_connection.get()
+        existing = self._resolve(None)
         if existing is not None:
             # Re-entrant use from the same task: join the transaction already owned by
             # this task. The outermost context manager owns commit/rollback/close.
@@ -151,7 +152,7 @@ class Database:
         async with self._tx_lock:
             await self.get_connection()  # guarantees migrations ran first
             conn = await self._open(pooled=False)
-            token = _tx_connection.set(conn)
+            token = self._transaction_state.set((asyncio.current_task(), conn))
             try:
                 await conn.execute("BEGIN IMMEDIATE;")
                 try:
@@ -165,7 +166,7 @@ class Database:
                     await conn.rollback()
                     raise
             finally:
-                _tx_connection.reset(token)
+                self._transaction_state.reset(token)
                 await conn.close()
 
     # ------------------------------------------------------------------

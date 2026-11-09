@@ -216,3 +216,29 @@ async def test_concurrent_rate_limit_check_is_atomic(system):
         *(approval.check_and_increment_rate_limit("rate:test:key", 3, window_seconds=3600) for _ in range(10))
     )
     assert sum(1 for r in results if r) == 3, f"rate limit allowed {sum(results)}/10 (limit 3)"
+
+
+@pytest.mark.parametrize("status", ["ACTIVE", "SUSPENDED"])
+async def test_grant_expiring_during_level_lookup_cannot_authorize(system, monkeypatch, status):
+    from types import SimpleNamespace
+
+    from approval import access_service
+
+    db, _approval, access, level, _config = system
+    await _insert_active_grant(db)
+    now = int(time.time())
+    await db.execute("UPDATE grants SET status = ?, expires_at = ?", (status, now + 1))
+    level.level = 20
+    lookup = level.get_group_member_level
+
+    async def slow_lookup(**kwargs):
+        nonlocal now
+        result = await lookup(**kwargs)
+        now += 1
+        return result
+
+    monkeypatch.setattr(access_service, "time", SimpleNamespace(time=lambda: now))
+    monkeypatch.setattr(level, "get_group_member_level", slow_lookup)
+    decision = await access.check_access("bot1", "10001", "30005")
+    assert not decision.allowed and decision.reason == "GRANT_EXPIRED"
+    assert (await db.fetchone("SELECT status FROM grants"))[0] == "EXPIRED"
