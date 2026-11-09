@@ -54,9 +54,9 @@
 
 ---
 
-## 三、自动化测试执行清单 (43 / 43 PASSED)
+## 三、自动化测试执行清单 (49 / 49 PASSED)
 
-所有 43 项测试在本地测试沙箱中全部通过（0.22 秒）：
+所有 49 项测试在本地测试沙箱中全部通过（0.25 秒）：
 
 ### 1. 群等级解析与服务 (`test_level_service.py`)
 - [x] `test_level_parsing_formats`: 支持整数、"18"、"LV18"、"等级20" 等多种格式严格提取。
@@ -104,7 +104,7 @@
 - [x] `test_web_api_group_policy_update`: 群准入策略动态编辑 API。
 - [x] `test_web_api_audit_export`: 审计日志检索与 JSON/CSV 格式导出。
 
-### 7. v0.1.1 安全修复与扩展测试 (`test_v011_features.py`)
+### 7. v0.1.1 第一轮安全修复验证 (`test_v011_features.py`)
 - [x] `test_napcat_normalization_formats`: 兼容完整 OneBot 包裹响应与已解包字典格式；准确识别网络错误与超时状态码。
 - [x] `test_napcat_multi_bot_resolution`: 多 Bot 环境下按 `bot_self_id` 精准寻址目标 NapCat 实例，无串号串群风险。
 - [x] `test_transaction_rollback_on_error`: `BEGIN IMMEDIATE` 显式事务，在写入中途发生异常时完整回滚，无残留脏数据。
@@ -112,8 +112,16 @@
 - [x] `test_application_rate_limiting`: 滑动窗口申请频次限制，超频自动拦截并友好提示。
 - [x] `test_reviewer_persistence_in_db`: 审核员数据持久化落盘至 SQLite `reviewers` 表，重启与重载后不丢失。
 - [x] `test_group_unban_does_not_clear_global_ban`: 单群解黑名单绝不误清全局黑名单；全局解黑名单与群黑名单权限隔离。
-- [x] `test_web_api_v011_features`: 支持 `/bots` 多实例查询，兼容 `request.query.get` 与 `await request.json(default={})`，提取真实管理员凭证。
-- [x] `test_group_guardian_priority_promotion`: 插件初始化时动态扫描并提升 GroupGuardian 至 priority=100，确保全群安全审核优先执行。
+- [x] `test_web_api_v011_features`: 支持 `/bots` 多实例查询，杜绝 default 占位符，拒绝伪造请求头，只认可合法会话。
+- [x] `test_handler_diagnostics_service`: Handler 优先级只读诊断服务准确审计注册表 `extras_configs['priority']`，区分 OPTIMAL、WARNING 与 NOT_INSTALLED。
+
+### 8. v0.1.1 第二轮安全加固与协议实测 (`test_v011_round2.py`)
+- [x] `test_webui_auth_enforcement`: 杜绝伪造 Header 越权；未登录返回 HTTP 401；无权限操作返回 HTTP 403；Owner/Reviewer 服务端强制角色校验。
+- [x] `test_gate_post_type_filtering`: 准入闸门严格限定于 QQ 聊天消息 (`post_type=message`)；入群/退群通知 (`notice`) 与加群请求 (`request`) 全程畅通不被拦截。
+- [x] `test_strict_level_pattern_matching`: 等级解析严格正则匹配 `^(?:LV|lv|Lv|等级)?\s*(\d+)$`，严防 `rank_999_user` 等脏文本注入。
+- [x] `test_atomic_approval_rollback_on_failure`: 申请审批、授权签发、审计日志及出件箱通知原子捆绑在单个事务中；出件箱写入异常时全流程回滚。
+- [x] `test_manual_grant_uuid_uniqueness`: 手动授权采用 UUID4 生成防碰撞授权编号，50 线程并发高压下 100% 唯一无冲突。
+- [x] `test_outbox_multi_bot_and_group_fallback`: 出件箱持久化关联 `bot_self_id`；私聊风控超时重试达上限后，自动无缝触发备选群通知。
 
 ---
 

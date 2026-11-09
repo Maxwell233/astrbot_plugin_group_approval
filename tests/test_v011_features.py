@@ -231,63 +231,108 @@ async def test_group_unban_does_not_clear_global_ban(access_system):
     assert banned_cleared is False
 
 
-# 6. Web API Modern Request Parsing and Bots Endpoint
+# 6. Web API Modern Request Parsing, Bot Routing, and Auth Verification
 @pytest.mark.asyncio
 async def test_web_api_v011_features(web_system):
     web, approval, db, napcat, config = web_system
 
-    # Test /bots endpoint
+    # Initially no bots connected -> empty list, NO "default" placeholder
     bots_res = await web.list_bots()
     assert bots_res["status"] == "ok"
     assert "bots" in bots_res["data"]
-    assert len(bots_res["data"]["bots"]) >= 1
+    assert bots_res["data"]["bots"] == []
+
+    # Insert a policy with bot1
+    await db.execute(
+        "INSERT INTO group_policies (bot_self_id, group_id, enabled, min_level, created_at, updated_at) VALUES ('bot1', '10001', 1, 10, 100, 100)"
+    )
+    await db.commit()
+    bots_res2 = await web.list_bots()
+    assert bots_res2["data"]["bots"] == ["bot1"]
 
     # Test modern query parameter helper
     class MockRequest:
-        def __init__(self, query=None, args=None, headers=None, json_body=None):
+        def __init__(self, query=None, args=None, headers=None, username=None, json_body=None):
             self.query = query or {}
             self.args = args or {}
             self.headers = headers or {}
+            self.username = username
             self._json = json_body or {}
 
         async def json(self, default=None):
             return self._json
 
-    req = MockRequest(
+    # Spoofed header without authentic session must be rejected (returns None)
+    req_spoofed = MockRequest(
         query={"group_id": "10001"},
-        headers={"X-AstrBot-User": "admin_alice"},
+        headers={"X-AstrBot-User": "attacker_spoof"},
         json_body={"application_id": "A1000", "note": "Approve via test"},
     )
+    assert _get_query_param(req_spoofed, "group_id") == "10001"
+    assert _get_request_operator(req_spoofed) is None
 
-    gid = _get_query_param(req, "group_id")
-    assert gid == "10001"
-
-    operator = _get_request_operator(req)
-    assert operator == "admin_alice"
-
-    body = await _get_request_json(req)
+    # Authentic session user accepted
+    req_auth = MockRequest(
+        query={"group_id": "10001"},
+        username="admin_alice",
+        json_body={"application_id": "A1000", "note": "Approve via test"},
+    )
+    assert _get_request_operator(req_auth) == "admin_alice"
+    body = await _get_request_json(req_auth)
     assert body["application_id"] == "A1000"
 
 
-# 7. GroupGuardian Dynamic Promotion and Stop Event
+# 7. Handler Diagnostics Service & Static Priority Precedence
 @pytest.mark.asyncio
-async def test_group_guardian_priority_promotion():
-    mock_context = MagicMock()
-    gg_handler = MagicMock()
-    gg_handler.name = "group_guardian_filter"
-    gg_handler.priority = 0
+async def test_handler_diagnostics_service():
+    from approval.diagnostics import HandlerDiagnostics
 
-    other_handler = MagicMock()
-    other_handler.name = "jrys_handler"
-    other_handler.priority = 0
+    # Case A: GroupGuardian registered with priority 0 -> WARNING
+    mock_context_warning = MagicMock()
+    gg_warning = MagicMock()
+    gg_warning.name = "group_guardian_filter"
+    gg_warning.plugin_name = "astrbot_plugin_group_guardian"
+    gg_warning.extras_configs = {"priority": 0}
+    gg_warning.event_type = "ALL"
 
-    mock_context.handlers = [gg_handler, other_handler]
+    jrys_handler = MagicMock()
+    jrys_handler.name = "jrys_handler"
+    jrys_handler.plugin_name = "astrbot_plugin_jrys"
+    jrys_handler.extras_configs = {"priority": 0}
+    jrys_handler.event_type = "ALL"
 
-    plugin = GroupApprovalPlugin(context=mock_context)
-    plugin._promote_group_guardian_priority()
+    mock_context_warning.handlers = [gg_warning, jrys_handler]
 
-    # GroupGuardian handler must be promoted to priority 100!
-    assert gg_handler.priority == 100
-    # Other plugin handler unchanged
-    assert other_handler.priority == 0
+    diag_warn = HandlerDiagnostics(mock_context_warning)
+    res_warn = diag_warn.diagnose_handlers()
+    assert res_warn["group_guardian_status"] == "WARNING"
+    assert res_warn["group_guardian_priority"] == 0
+    assert "安全风险" in res_warn["message"]
+
+    # Case B: GroupGuardian patched with priority 100 -> OPTIMAL
+    mock_context_optimal = MagicMock()
+    gg_optimal = MagicMock()
+    gg_optimal.name = "group_guardian_filter"
+    gg_optimal.plugin_name = "astrbot_plugin_group_guardian"
+    gg_optimal.extras_configs = {"priority": 100}
+    gg_optimal.event_type = "ALL"
+
+    mock_context_optimal.handlers = [gg_optimal, jrys_handler]
+
+    diag_opt = HandlerDiagnostics(mock_context_optimal)
+    res_opt = diag_opt.diagnose_handlers()
+    assert res_opt["group_guardian_status"] == "OPTIMAL"
+    assert res_opt["group_guardian_priority"] == 100
+    assert "执行顺序安全" in res_opt["message"]
+
+    # Case C: GroupGuardian not installed -> NOT_INSTALLED
+    mock_context_none = MagicMock()
+    mock_context_none.handlers = [jrys_handler]
+    diag_none = HandlerDiagnostics(mock_context_none)
+    res_none = diag_none.diagnose_handlers()
+    assert res_none["group_guardian_status"] == "NOT_INSTALLED"
+
+    # Verify runtime monkey-patch method is removed from GroupApprovalPlugin
+    plugin = GroupApprovalPlugin(context=mock_context_optimal)
+    assert not hasattr(plugin, "_promote_group_guardian_priority")
     await plugin.terminate()
