@@ -9,7 +9,7 @@
 - **操作系统**：Windows 10 / 11 64位
 - **Python 版本**：Python 3.12+
 - **协议端**：[NapCatQQ](https://github.com/NapNeko/NapCatQQ) 或基于 OneBot v11 标准协议的反向 WebSocket 端
-- **主程序**：AstrBot v4.16.0+（由 AstrBot Launcher 启动管理）
+- **主程序**：AstrBot **v4.26.0+**（由 AstrBot Launcher 启动管理）。`astrbot.api.web` 在 4.26.0 之前不存在，且 `stop_event()` 在 4.25.0 之前不会终止后续插件 Handler，因此 4.16–4.25.x 不受支持。
 
 ---
 

@@ -1,146 +1,202 @@
 # 集成测试与验证报告 (INTEGRATION_TEST_REPORT.md)
 
-**当前版本：** `0.1.1`（早期开发与调试阶段，非生产正式版）  
-**测试时间：** 2026-11-09  
-**测试环境：** macOS / Python 3.12.16 / pytest 9.2.0 / pytest-asyncio 1.4.1 / ruff 0.17.4  
-**目标部署平台：** Windows 10/11, AstrBot Launcher, NapCat OneBot v11, SQLite WAL  
+**当前版本：** `0.1.1`（开发调试版，非生产稳定版）
+**报告时间：** 2026-11-09 19:37（Europe/Berlin）
+**被测提交：** `ec016a2`（`fix/0.1.1-security-integration`，在 `eba75d8` 之上 5 个修复提交）
+**测试环境：** macOS（Apple Silicon）/ Python 3.13.17 / pytest 9.2.0 / pytest-asyncio 1.4.1.post1 / ruff 0.17.4 / aiosqlite 0.22.1
+**真实框架环境：** `.venv-astrbot`，PyPI **AstrBot 4.29.4**（独立于单元测试 `.venv`）
 
 > [!WARNING]
-> **版本与调试阶段说明**：本项目目前仍处于**早期开发与调试阶段**，尚未达到生产环境的全面稳定运行标准。本报告记录代码在模拟协议端与自动化测试套件下的验证结果。所有未在真实 Windows + NapCatQQ + 真实 QQ 群中实操的功能均标注为「待实测」，代码推送 GitHub 供持续集成与开发调试，**暂不发布正式稳定版 Release**。  
+> **版本与验证范围说明**：本项目仍处于早期开发与调试阶段，**不发布正式稳定版 Release**。
+> 本报告严格区分四类测试与真实环境验收（见第 1 节）。**真实 Windows + NapCat + QQ 群联调未执行**；
+> GitHub Actions 工作流已配置，但**尚未在 GitHub 实际运行**，因此在它真正跑通前不得声称“CI 已通过”。
 
 ---
 
-## 一、参照与实测系统版本
+## 1. 测试分级（Test Taxonomy）——真实 vs 模拟
 
-| 组件 | 参照与测试版本 / Commit | 状态 | 说明 |
-|---|---|---|---|
-| **AstrBot** | v4.16.0+ (Star v2 规范) | 模拟协议与适配层测试通过 | 原生事件、Star 插件生命周期及 Web API 适配完毕 |
-| **NapCatQQ** | OneBot v11 标准反向 WebSocket | 适配层接口测试通过 | `get_group_member_info`、`no_cache`、`send_private_msg` |
-| **GroupGuardian** | 最新版 (`zcj-ui/astrbot_plugin_group_guardian`) | 时序与管道拦截验证通过 | priority=100 先行完成内容安全审核 |
-| **LivingMemory** | v2.9.1+ (`lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory`) | 记忆隔离机制验证通过 | priority=50 阻断 LLM 管道，防止未授权向量化 |
-| **Jrys / Rollpig / Cyber Divination** | 标准 Star 插件 | 准入阻断测试通过 | 无论是命令前缀还是无前缀短语均无法越权穿透 |
+| 级别 | 定义 | 运行环境 | 真实组件 | 仍为模拟/替代的组件 |
+|---|---|---|---|---|
+| **(a) 单元/服务级** | 直接调用服务类函数，断言业务规则 | `.venv`（无 AstrBot） | 真实 Python 服务代码；多数使用真实 SQLite | NapCat 传输层、AstrBot 事件对象、框架装饰器 |
+| **(b) 服务级集成（真实 SQLite）** | 真实 `Database`/迁移/事务 + 真实服务栈 | `.venv` | **真实 SQLite（aiosqlite）**、真实迁移 SQL、真实事务/并发 | NapCat 客户端与 `AstrMessageEvent` 为假；AstrBot 框架不存在 |
+| **(c) 真实 AstrBot 框架级** | 安装真实 AstrBot 4.29.4，导入真实框架对象 | **`.venv-astrbot`**（AstrBot 4.29.4） | 真实 `filter` 装饰器、真实全局 `star_handlers_registry`、真实 `extras_configs["priority"]`、真实 `AstrMessageEvent` 与 `stop_event()/is_stopped()`、真实插件 `on_message_gate` 注册 | 仅“分发循环”按上游源码复刻（见第 4 节）；不启动 AstrBot 主进程/StarManager |
+| **(d) 真实 QQ / NapCat / Windows** | 真实 NapCat + 真实 QQ 群 + Windows 生产机 | 无 | — | **完全未执行（未实测）** |
+
+### 1.1 文件清单与计数（本次实际收集）
+
+| 级别 | 文件 | 收集数 |
+|---|---|---|
+| a/b | `tests/test_access.py` | 7 |
+| a/b | `tests/test_applications.py` | 6 |
+| a/b | `tests/test_bot_identity.py` | 22 |
+| a/b | `tests/test_commands.py` | 2 |
+| a/b | `tests/test_concurrency.py` | 2 |
+| b | `tests/test_db_transaction_isolation.py` | 6 |
+| b | `tests/test_grant_state_race.py` | 4 |
+| a | `tests/test_group_guardian_patch.py` | 3 |
+| b | `tests/test_integration.py` | 6 |
+| a | `tests/test_level_service.py` | 9 |
+| b | `tests/test_migrations.py` | 3 |
+| b | `tests/test_notification_privacy.py` | 6 |
+| a/b | `tests/test_v011_features.py` | 9 |
+| a/b | `tests/test_v011_round2.py` | 6 |
+| a/b | `tests/test_web_api.py` | 3 |
+| b | `tests/test_web_api_params.py` | 23 |
+| c | `tests/test_framework_handler_order.py` | 9（`.venv` 中整体跳过） |
+
+合计：`.venv` 收集 **117 passed + 1 skipped**；`.venv-astrbot` 中框架文件单独运行 9 passed。
+
+### 1.2 关键“真实 vs 模拟”说明
+
+- **真实**：所有 SQLite 数据库（文件级、WAL、迁移 V1–V6、事务隔离、并发）、服务层业务规则、
+  阈值/状态机、AstrBot 4.29.4 的注册表与事件对象（c 级）。
+- **模拟**：NapCat OneBot 传输（`MockNapCatClient` / `_FakeNapCat` / `AsyncMock`）、AstrBot 事件对象
+  （a/b 级中的 `DummyEvent`/`MockAstrEvent`/`MagicMock`）、`AstrBotPluginView` 前端桥（无浏览器）。
+- **不存在**：真实 QQ 号、真实群、真实 NapCat 进程、真实 GroupGuardian/LivingMemory 插件运行。
 
 ---
 
-## 二、消息 Handler 实际执行时序验证
+## 2. 本次实际执行结果（可复现）
 
-通过集成模拟流水线（`tests/test_integration.py`）对消息流经顺序进行严格断言：
+执行时间 2026-11-09 19:36-19:37（Europe/Berlin），工作树已包含全部修复提交 `ec016a2`。
 
-```text
-[QQ 平台下发群消息]
-         ↓
-1. GroupGuardian (priority=100)
-   • 执行正则过滤、词库匹配、违规图片 OCR
-   • 无论消息发送者是否为已获批成员，内容审核均无差别触发
-   • 违规行为立即执行撤回、警告或禁言
-         ↓ (未违规消息继续传递)
-2. Group Approval Gate (priority=50)
-   • 10 步准入决策引擎校验
-   • 排除 Bot 自身、检查黑名单、Owner/群管豁免
-   • 校验授权状态、有效期与等级复核
-   • 未通过用户：执行 event.stop_event()，并根据场景发送友好提示或静默阻断
-         ↓ (仅允许已获批用户通过)
-3. 业务插件与 AstrBot Agent (priority <= 0)
-   • 今日运势 (Jrys)
-   • 抽小猪 (Rollpig)
-   • 赛博占卜 (Cyber Divination)
-   • AstrBot LLM Agent 对话
-   • LivingMemory (on_llm_request 记忆召回与反思)
+### 2.1 单元/服务级（`aiosqlite` + pytest，无 AstrBot）
+
+```bash
+cd <repo>
+.venv/bin/python -m pytest -q -p no:cacheprovider
 ```
 
-**断言结论：**
-1. 未授权用户的违规消息会被 GroupGuardian 正常审核处置，Group Approval 不会阻断安全审核。
-2. 未授权用户的普通消息在 priority=50 被完全截断，绝不会到达 priority=0 的第三方插件或 LLM 管道。
+逐字结果：
+
+```text
+117 passed, 1 skipped in 0.62s
+```
+
+- **通过 117 / 失败 0 / 错误 0 / 跳过 1**（exit code 0）。
+- 唯一 skip 原因（`-rs` 输出）：
+  `SKIPPED [1] tests/test_framework_handler_order.py:26: could not import 'astrbot': No module named 'astrbot'`
+  ——即 c 级真实框架测试在无 AstrBot 的 `.venv` 中整体跳过，属于设计内行为。
+- 本次运行**无 warning**；历史上偶发 `PytestUnhandledThreadExceptionWarning`（`aiosqlite` 线程在测试收尾
+  时向已关闭事件循环回投结果）。该 warning **不会使测试失败**，属于测试收尾竞态，非功能/安全缺陷。
+
+### 2.2 静态检查
+
+```bash
+.venv/bin/ruff check .
+```
+
+逐字结果：
+
+```text
+All checks passed!
+```
+
+### 2.3 真实 AstrBot 框架级（c 级，`AstrBot 4.29.4`）
+
+```bash
+.venv-astrbot/bin/python -m pytest tests/test_framework_handler_order.py -q -p no:cacheprovider
+```
+
+逐字结果：
+
+```text
+9 passed in 1.49s
+```
+
+### 2.4 前端语法检查
+
+```bash
+node --check views/dashboard/app.js
+# -> app.js OK（exit 0）
+```
+
+仅语法级检查；**真实浏览器/Dashboard iframe 行为未实测**。
 
 ---
 
-## 三、自动化测试执行清单 (49 / 49 PASSED)
+## 3. 环境验证状态表（已实测 / 未实测 / 无法验证）
 
-所有 49 项测试在本地测试沙箱中全部通过（0.25 秒）：
-
-### 1. 群等级解析与服务 (`test_level_service.py`)
-- [x] `test_level_parsing_formats`: 支持整数、"18"、"LV18"、"等级20" 等多种格式严格提取。
-- [x] `test_member_level_comparison`: 验证 LV9 申请 LV10 拒绝、LV10 允许、LV25 允许。
-- [x] `test_qq_level_vs_group_level`: 严格核验群等级 `level`，绝不混淆 QQ 账号等级 `qq_level`。
-- [x] `test_missing_or_invalid_level`: 等级缺失或非法文本判定为 INVALID_LEVEL。
-- [x] `test_timeout_handling`: NapCat API 查询超时优雅处理。
-- [x] `test_left_group_member`: 成员退群返回 is_member=False。
-- [x] `test_identity_mismatch_check`: 返回群号或 QQ 号不匹配时严格拒绝（GROUP_ID_MISMATCH）。
-- [x] `test_caching_and_force_refresh`: 验证 300 秒 TTL 缓存命中与 force_refresh=True 穿透。
-- [x] `test_concurrent_request_coalescing`: 单飞防抖机制，并发相同用户查询仅向远程发起 1 次真实调用。
-
-### 2. 申请审批流与状态机 (`test_applications.py`)
-- [x] `test_apply_qualifying_level_creates_pending`: 达到门槛用户生成 PENDING 申请单。
-- [x] `test_apply_under_level_rejected`: 等级未达标者不建立申请记录。
-- [x] `test_duplicate_pending_prevented`: 同一用户禁止重复提交未审批申请。
-- [x] `test_reviewer_can_approve`: 审核员批准申请，生成 ACTIVE 授权并记录批准人。
-- [x] `test_reviewer_can_reject`: 审核员拒绝申请，记录拒绝原因并进入冷却期。
-- [x] `test_expired_application_cannot_be_approved`: 过期申请自动标记 EXPIRED，无法被批准。
-
-### 3. 并发安全与事务 (`test_concurrency.py`)
-- [x] `test_concurrent_approval_atomic`: 两个管理员并发审批同一申请，SQLite 事务保障只有 1 个成功，第 2 个收到明确已被处理提示，无脏数据。
-- [x] `test_concurrent_application_submission`: 并发申请提交去重，保证数据库只有 1 条待审记录。
-
-### 4. 权限决策引擎 (`test_access.py`)
-- [x] `test_access_requires_active_grant`: 必须拥有 ACTIVE 授权方可放行。
-- [x] `test_revocation_immediately_blocks_access`: 授权撤销后立即阻断访问。
-- [x] `test_blacklist_overrides_active_grant`: 黑名单优先级高于活跃授权。
-- [x] `test_cross_group_authorization_isolation`: 群 A 获批在群 B 严格无权限，跨群隔离。
-- [x] `test_cross_bot_id_isolation`: 不同 Bot QQ 间授权独立不交叉。
-- [x] `test_persistence_across_restart`: 重建服务后 SQLite 数据保持有效，重启不丢失状态。
-- [x] `test_level_drop_suspends_and_recovery_restores`: 授权成员等级掉出要求自动挂起为 SUSPENDED；等级回升自动恢复 ACTIVE。
-
-### 5. 准入拦截闸门与多插件集成 (`test_integration.py`)
-- [x] `test_unauthorized_user_blocked_from_ai_and_plugins`: 未授权用户无法触发 AI 对话、运势、塔罗、小猪等功能。
-- [x] `test_group_guardian_audit_precedence`: GroupGuardian (priority=100) 审核领先于 Group Approval (priority=50)。
-- [x] `test_living_memory_isolation`: 未授权用户在消息入口被拦截，下游 LLM 不被唤起，无法生成个人长期记忆画像。
-- [x] `test_private_chat_and_admin_commands`: 普通用户私聊受限，管理员私聊管理指令正常响应。
-- [x] `test_fail_closed_on_napcat_disconnect`: NapCat 网络异常时严格阻断，不会意外放行。
-
-### 6. 控制指令与 WebUI API (`test_commands.py`, `test_web_api.py`)
-- [x] `test_user_commands_flow`: 用户指令 `/申请使用`、`/我的权限`、`/申请状态`、`/取消申请`、`/使用规则` 全流程正常。
-- [x] `test_admin_commands_permissions`: 普通用户无权执行 `/ga`；Reviewer 无法执行 Owner 专属指令；Owner 指令全功能覆盖。
-- [x] `test_web_api_dashboard_and_applications`: WebUI 看板指标、申请分页列表、审批/拒绝 API。
-- [x] `test_web_api_group_policy_update`: 群准入策略动态编辑 API。
-- [x] `test_web_api_audit_export`: 审计日志检索与 JSON/CSV 格式导出。
-
-### 7. v0.1.1 第一轮安全修复验证 (`test_v011_features.py`)
-- [x] `test_napcat_normalization_formats`: 兼容完整 OneBot 包裹响应与已解包字典格式；准确识别网络错误与超时状态码。
-- [x] `test_napcat_multi_bot_resolution`: 多 Bot 环境下按 `bot_self_id` 精准寻址目标 NapCat 实例，无串号串群风险。
-- [x] `test_transaction_rollback_on_error`: `BEGIN IMMEDIATE` 显式事务，在写入中途发生异常时完整回滚，无残留脏数据。
-- [x] `test_level_exemption_lifecycle`: 仅 Owner 可授予 `is_level_exempt=True`；免等级核验用户等级下滑时不被挂起。
-- [x] `test_application_rate_limiting`: 滑动窗口申请频次限制，超频自动拦截并友好提示。
-- [x] `test_reviewer_persistence_in_db`: 审核员数据持久化落盘至 SQLite `reviewers` 表，重启与重载后不丢失。
-- [x] `test_group_unban_does_not_clear_global_ban`: 单群解黑名单绝不误清全局黑名单；全局解黑名单与群黑名单权限隔离。
-- [x] `test_web_api_v011_features`: 支持 `/bots` 多实例查询，杜绝 default 占位符，拒绝伪造请求头，只认可合法会话。
-- [x] `test_handler_diagnostics_service`: Handler 优先级只读诊断服务准确审计注册表 `extras_configs['priority']`，区分 OPTIMAL、WARNING 与 NOT_INSTALLED。
-
-### 8. v0.1.1 第二轮安全加固与协议实测 (`test_v011_round2.py`)
-- [x] `test_webui_auth_enforcement`: 杜绝伪造 Header 越权；未登录返回 HTTP 401；无权限操作返回 HTTP 403；Owner/Reviewer 服务端强制角色校验。
-- [x] `test_gate_post_type_filtering`: 准入闸门严格限定于 QQ 聊天消息 (`post_type=message`)；入群/退群通知 (`notice`) 与加群请求 (`request`) 全程畅通不被拦截。
-- [x] `test_strict_level_pattern_matching`: 等级解析严格正则匹配 `^(?:LV|lv|Lv|等级)?\s*(\d+)$`，严防 `rank_999_user` 等脏文本注入。
-- [x] `test_atomic_approval_rollback_on_failure`: 申请审批、授权签发、审计日志及出件箱通知原子捆绑在单个事务中；出件箱写入异常时全流程回滚。
-- [x] `test_manual_grant_uuid_uniqueness`: 手动授权采用 UUID4 生成防碰撞授权编号，50 线程并发高压下 100% 唯一无冲突。
-- [x] `test_outbox_multi_bot_and_group_fallback`: 出件箱持久化关联 `bot_self_id`；私聊风控超时重试达上限后，自动无缝触发备选群通知。
+| 环境项 | 状态 | 证据 / 说明 |
+|---|---|---|
+| 单元/服务级（含真实 SQLite） | **已实测** | 117 passed（本次运行，提交 `ec016a2`） |
+| AstrBot 4.29.4 真实导入、真实 Handler 注册表、真实 `AstrMessageEvent`/`stop_event()` | **已实测** | `.venv-astrbot`（PyPI AstrBot 4.29.4）；`tests/test_framework_handler_order.py` 9 passed |
+| AstrBot StarManager 真实加载/热重载/卸载插件 | **未实测** | 未启动 AstrBot 主进程；只在测试中导入/实例化/`initialize()/terminate()` |
+| 真实 NapCatQQ 连接 | **未实测** | 全部使用假传输层；无真实 OneBot 连接 |
+| 真实 QQ 测试群 | **未实测** | 无真实 QQ 号/群 |
+| Windows 10/11 + AstrBot Launcher 生产部署 | **未实测** | 本机为 macOS |
+| GroupGuardian 真实联动（安装 + 补丁 + 真实消息） | **未实测** | 补丁内容有契约测试；真实注册表顺序用代理 Handler 验证（c 级）；未运行真实 GroupGuardian |
+| LivingMemory 真实联动/画像 | **未实测 / 无法验证** | 仅上游 LivingMemory 2.10.0 源码静态核对；`stop_event()` 无法阻止其采集 |
+| WebUI 真实 Dashboard iframe 桥接 | **未实测** | 前端仅 `node --check` 语法检查 |
+| GitHub Actions CI | **未实测** | 工作流已配置；未在 GitHub 运行，**不得声称 CI 已通过** |
 
 ---
 
-## 四、真实环境验收状态与待实测说明
+## 4. 真实 AstrBot 框架级测试（c 级）说明
 
-按照任务书验收原则，严格区分**自动化测试**与**真实环境验收**：
+文件：`tests/test_framework_handler_order.py`（仅 `.venv-astrbot` 运行；`.venv` 中整体 skip）。
 
-1. **已完全通过自动化验证项目**：
-   - 全套 Python 3.12 单元与集成测试套件（43/43 测试通过）。
-   - Ruff 严格静态类型与代码质量检查（0 报错）。
-   - SQLite 事务原子性、WAL 模式、外键约束与 Migration V2 迁移。
-   - OneBot v11 协议适配与双响应格式标准化处理。
-   - WebUI XSS 安全防护与多 Bot 切换 API。
-   - GitHub Actions CI 自动化构建配置。
+**真实的部分：**
 
-2. **待实机验证清单（Pending Live Verification）**：
-   > [!NOTE]
-   > 下列项目在模拟端测试通过，但尚未在真实物理生产环境中完成实测验收，使用前需在测试群逐步确认：
-   - 真实的 Windows 10/11 生产机上的 AstrBot Launcher 守护进程常驻。
-   - 真实的 NapCatQQ 实际二进制在百人以上活跃群中读取 `memberRealLevel` 的延迟与网络抖动。
-   - 真实 QQ 客户端私聊防骚扰风控策略对审批通知到达率的实际影响。
-   - AstrBot 官方 Web 控制台多用户鉴权 Header (`X-AstrBot-User`) 在真实跨域反向代理下的传递表现。
+- 真实 `@filter.event_message_type(..., priority=...)` 装饰器与真实注册表
+  `astrbot.core.star.star_handler.star_handlers_registry`；
+- 真实 `handler.extras_configs["priority"]`（降序：100 → 50 → 0）与真实 `get_handlers_by_event_type` 顺序；
+- 真实 `AstrMessageEvent` 实例与真实 `stop_event()/is_stopped()`；
+- 真实插件 `main.GroupApprovalPlugin` 导入后注册的 `on_message_gate`（真实 `priority=50`）；
+- 真实插件在 `initialize()/terminate()` 下的 gate 端到端行为（未授权拦截、准入指令本地执行并 stop、
+  已授权放行、他人仍被拦）。
+
+**仍为模拟的部分（已在文件头声明）：** 分发循环本身。测试按上游源码
+`astrbot/core/pipeline/process_stage/method/star_request.py:39-41,88-89` 复刻“调用前/后检查
+`is_stopped()` 即 break”的循环；这不是 AstrBot 主流水线的完整运行。
+
+---
+
+## 5. 修复回归证据（旧代码失败 / 新代码通过）
+
+来自 [docs/DEFECT_MATRIX.md](DEFECT_MATRIX.md)（详细矩阵见该文件）：
+
+| 缺陷 | 旧代码复现 | 新代码 |
+|---|---|---|
+| BUG-001 GroupGuardian 审核被闸门抢占 | 真实注册表：gate(50) 先于 stock GG(0)，GG 完全不运行 | 补丁 GG(100)→gate(50)→business(0)，业务永不运行（c 级测试） |
+| BUG-002 事务协程隔离 | `tests/test_db_transaction_isolation.py`：3 项失败 + 嵌套事务死锁 | 6 passed |
+| BUG-004 授权状态竞态 | `tests/test_grant_state_race.py`：4 项全部失败（REVOKED 被改成 SUSPENDED 等） | 4 passed |
+| BUG-011 Reviewer 持久化 | 删除后重启从旧配置复现 | V5 `reviewer_overrides` + 回归测试 |
+| BUG-013 迁移升级 | 旧库重复 `event_key` 导致 V2 唯一索引失败 | V2 先去重再建索引；V1–V3 数据保留（`tests/test_migrations.py`） |
+| BUG-014 版本下限 | 声明 `>=4.16.0` 与代码不符 | `>=4.26.0`（`metadata.yaml`） |
+
+> 这些是**代码级/框架注册表级**回归证据，不等于真实 QQ 环境验收。
+
+---
+
+## 6. 真实环境待实测清单（Pending Live Verification）
+
+> [!NOTE]
+> 下列项目**未**在真实物理环境验收；使用前请在测试群逐步确认：
+
+1. 真实 Windows 10/11 生产机的 AstrBot Launcher 常驻、插件热重载。
+2. 真实 NapCatQQ 二进制读取 `get_group_member_info.level` 的延迟、风控与 `no_cache` 行为。
+3. 真实 QQ 私聊风控对审批通知到达率的影响。
+4. 真实 GroupGuardian 安装 + 应用 `patches/group_guardian_priority.patch` 后的实际执行顺序与审核效果。
+5. 真实 LivingMemory 运行时的消息采集与长期记忆生成（本插件不宣称能阻止，仅记录限制）。
+6. 真实 WebUI Dashboard 中 Plugin View Bridge 的调用与导出下载。
+7. GitHub Actions 两个 job 的实际运行结果（在 GitHub 跑过之前不得声明“CI 已通过”）。
+
+---
+
+## 7. 复现命令（本地）
+
+```bash
+# 单元/服务级 + 静态检查（无 AstrBot）
+.venv/bin/python -m pytest -q -p no:cacheprovider
+.venv/bin/ruff check .
+
+# 真实 AstrBot 4.29.4 框架级（框架测试会自动跳过 a/b 级之外的环境）
+.venv-astrbot/bin/python -m pytest tests/test_framework_handler_order.py -q -p no:cacheprovider
+
+# 可选：前端语法
+node --check views/dashboard/app.js
+```
+
+环境搭建：`.venv` 使用 `python3 -m venv .venv && .venv/bin/pip install "aiosqlite>=0.20.0" pytest pytest-asyncio ruff`；
+`.venv-astrbot` 使用 `python3 -m venv .venv-astrbot && .venv-astrbot/bin/pip install "AstrBot==4.29.4" pytest pytest-asyncio`。
