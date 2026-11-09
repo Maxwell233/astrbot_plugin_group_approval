@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>群等级准入与管理员审批 - 管理后台</title>
+  <link rel="stylesheet" href="./style.css" />
+  <!-- Injected bridge script fallback -->
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+</head>
+<body>
+  <div class="app-container">
+    <header class="app-header">
+      <div class="header-title">
+        <span class="icon">🛡️</span>
+        <div>
+          <h1>群等级准入与管理员审批</h1>
+          <p class="subtitle">AstrBot Group Approval Control Center</p>
+        </div>
+      </div>
+      <div class="header-status">
+        <span class="status-badge live" id="system-status">系统运行中</span>
+        <button class="btn btn-secondary" id="btn-refresh">🔄 刷新数据</button>
+      </div>
+    </header>
+
+    <nav class="app-nav">
+      <button class="nav-tab active" data-tab="tab-overview">📊 运行概览</button>
+      <button class="nav-tab" data-tab="tab-applications">📝 申请审批 <span class="badge" id="nav-pending-badge">0</span></button>
+      <button class="nav-tab" data-tab="tab-users">👥 用户与授权</button>
+      <button class="nav-tab" data-tab="tab-groups">⚙️ 群组策略</button>
+      <button class="nav-tab" data-tab="tab-audit">📜 审计日志</button>
+    </nav>
+
+    <main class="app-content">
+      <!-- 1. Overview Tab -->
+      <section id="tab-overview" class="tab-pane active">
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <div class="metric-icon">🏢</div>
+            <div class="metric-data">
+              <span class="metric-label">受管启用群</span>
+              <span class="metric-value" id="metric-groups">0</span>
+            </div>
+          </div>
+          <div class="metric-card highlight">
+            <div class="metric-icon">⏳</div>
+            <div class="metric-data">
+              <span class="metric-label">待审核申请</span>
+              <span class="metric-value" id="metric-pending">0</span>
+            </div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-icon">✅</div>
+            <div class="metric-data">
+              <span class="metric-label">活跃授权成员</span>
+              <span class="metric-value" id="metric-active">0</span>
+            </div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-icon">⚠️</div>
+            <div class="metric-data">
+              <span class="metric-label">暂停状态用户</span>
+              <span class="metric-value" id="metric-suspended">0</span>
+            </div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-icon">🚫</div>
+            <div class="metric-data">
+              <span class="metric-label">黑名单用户</span>
+              <span class="metric-value" id="metric-blacklist">0</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mt-4">
+          <div class="card-header">
+            <h3>最近申请记录</h3>
+          </div>
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>编号</th>
+                  <th>群号</th>
+                  <th>申请人 QQ</th>
+                  <th>提交等级</th>
+                  <th>申请时间</th>
+                  <th>状态</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="overview-recent-table">
+                <tr><td colspan="7" class="text-center text-muted">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. Applications Tab -->
+      <section id="tab-applications" class="tab-pane">
+        <div class="toolbar">
+          <div class="filter-group">
+            <input type="text" id="app-filter-group" placeholder="筛选群号" class="input-text" />
+            <input type="text" id="app-filter-user" placeholder="筛选申请人 QQ" class="input-text" />
+            <select id="app-filter-status" class="input-select">
+              <option value="">全部状态</option>
+              <option value="PENDING" selected>仅待审核 (PENDING)</option>
+              <option value="APPROVED">已批准 (APPROVED)</option>
+              <option value="REJECTED">已拒绝 (REJECTED)</option>
+              <option value="CANCELLED">已取消 (CANCELLED)</option>
+              <option value="EXPIRED">已过期 (EXPIRED)</option>
+            </select>
+            <button class="btn btn-primary" id="btn-filter-apps">🔍 查询</button>
+          </div>
+        </div>
+
+        <div class="card mt-2">
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>申请编号</th>
+                  <th>群号</th>
+                  <th>申请人 QQ</th>
+                  <th>当时群等级</th>
+                  <th>申请理由</th>
+                  <th>提交时间</th>
+                  <th>状态</th>
+                  <th>审核备注</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="applications-table-body">
+                <tr><td colspan="9" class="text-center text-muted">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3. Users & Grants Tab -->
+      <section id="tab-users" class="tab-pane">
+        <div class="toolbar">
+          <div class="filter-group">
+            <input type="text" id="user-filter-group" placeholder="群号" class="input-text" />
+            <input type="text" id="user-filter-qq" placeholder="用户 QQ" class="input-text" />
+            <select id="user-filter-status" class="input-select">
+              <option value="">全部状态</option>
+              <option value="ACTIVE">活跃 (ACTIVE)</option>
+              <option value="SUSPENDED">暂停 (SUSPENDED)</option>
+              <option value="REVOKED">撤销 (REVOKED)</option>
+              <option value="EXPIRED">过期 (EXPIRED)</option>
+            </select>
+            <button class="btn btn-primary" id="btn-filter-users">🔍 查询</button>
+          </div>
+          <button class="btn btn-success" id="btn-open-manual-grant">➕ 手动添加授权</button>
+        </div>
+
+        <div class="card mt-2">
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>授权 ID</th>
+                  <th>群号</th>
+                  <th>用户 QQ</th>
+                  <th>状态</th>
+                  <th>核验等级</th>
+                  <th>有效期</th>
+                  <th>批准人</th>
+                  <th>最后核验</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="users-table-body">
+                <tr><td colspan="9" class="text-center text-muted">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. Group Policies Tab -->
+      <section id="tab-groups" class="tab-pane">
+        <div class="toolbar">
+          <h3>QQ 群准入与等级要求配置</h3>
+          <button class="btn btn-success" id="btn-open-add-group">➕ 添加/修改群策略</button>
+        </div>
+
+        <div class="card mt-2">
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>群号</th>
+                  <th>准入状态</th>
+                  <th>最低群等级门槛</th>
+                  <th>必须审批</th>
+                  <th>授权期限</th>
+                  <th>复核周期</th>
+                  <th>恢复策略</th>
+                  <th>群管豁免</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="groups-table-body">
+                <tr><td colspan="9" class="text-center text-muted">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 5. Audit Logs Tab -->
+      <section id="tab-audit" class="tab-pane">
+        <div class="toolbar">
+          <div class="filter-group">
+            <input type="text" id="audit-filter-group" placeholder="群号" class="input-text" />
+            <input type="text" id="audit-filter-user" placeholder="目标 QQ" class="input-text" />
+            <select id="audit-filter-action" class="input-select">
+              <option value="">全部操作</option>
+              <option value="APPLICATION_APPROVED">审批通过</option>
+              <option value="APPLICATION_REJECTED">审批拒绝</option>
+              <option value="GRANT_REVOKED">撤销授权</option>
+              <option value="MANUAL_GRANT">手动授权</option>
+              <option value="USER_BANNED">加入黑名单</option>
+              <option value="GRANT_SUSPENDED">等级下降暂停</option>
+            </select>
+            <button class="btn btn-primary" id="btn-filter-audit">🔍 查询</button>
+          </div>
+          <div class="btn-group">
+            <button class="btn btn-secondary" id="btn-export-audit-json">⬇️ 导出 JSON</button>
+            <button class="btn btn-secondary" id="btn-export-audit-csv">⬇️ 导出 CSV</button>
+          </div>
+        </div>
+
+        <div class="card mt-2">
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>操作人</th>
+                  <th>角色</th>
+                  <th>目标群</th>
+                  <th>目标 QQ</th>
+                  <th>动作</th>
+                  <th>状态变更</th>
+                  <th>详情</th>
+                </tr>
+              </thead>
+              <tbody id="audit-table-body">
+                <tr><td colspan="8" class="text-center text-muted">加载中...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Modal: Action Prompt -->
+    <div class="modal" id="modal-action">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h3 id="modal-title">审批操作</h3>
+          <button class="modal-close" id="modal-close">&times;</button>
+        </div>
+        <div class="modal-body" id="modal-body">
+          <label for="modal-input-note" id="modal-input-label">备注：</label>
+          <textarea id="modal-input-note" class="input-textarea" rows="3"></textarea>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="modal-btn-cancel">取消</button>
+          <button class="btn btn-primary" id="modal-btn-confirm">确认执行</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Group Policy Edit -->
+    <div class="modal" id="modal-group">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h3>配置群准入策略</h3>
+          <button class="modal-close" id="modal-group-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-row">
+            <label>群号：</label>
+            <input type="text" id="group-form-id" class="input-text" placeholder="例如：123456789" />
+          </div>
+          <div class="form-row">
+            <label>准入开关：</label>
+            <select id="group-form-enabled" class="input-select">
+              <option value="true">开启准入</option>
+              <option value="false">关闭准入</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>最低群成员等级（LV）：</label>
+            <input type="number" id="group-form-level" class="input-text" value="10" min="1" max="100" />
+          </div>
+          <div class="form-row">
+            <label>必须管理员审批：</label>
+            <select id="group-form-approval" class="input-select">
+              <option value="true">是（达标后提交申请）</option>
+              <option value="false">否（达标即自动可用）</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>授权有效期（天，0为永久）：</label>
+            <input type="number" id="group-form-duration" class="input-text" value="0" min="0" />
+          </div>
+          <div class="form-row">
+            <label>等级复核间隔（秒）：</label>
+            <input type="number" id="group-form-recheck" class="input-text" value="300" min="0" />
+          </div>
+          <div class="form-row">
+            <label>资格恢复策略：</label>
+            <select id="group-form-restore" class="input-select">
+              <option value="automatic">等级恢复后自动重新激活</option>
+              <option value="manual">需管理员手动重新授权</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>豁免群管理员：</label>
+            <select id="group-form-admin-bypass" class="input-select">
+              <option value="false">否（群管也需满足门槛）</option>
+              <option value="true">是（群主与管理员免门槛）</option>
+            </select>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="modal-group-cancel">取消</button>
+          <button class="btn btn-primary" id="modal-group-save">保存配置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

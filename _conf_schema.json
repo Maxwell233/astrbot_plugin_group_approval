@@ -1,0 +1,105 @@
+{
+  "enabled": {
+    "description": "是否启用插件",
+    "type": "bool",
+    "default": true
+  },
+  "default_policy": {
+    "description": "未显式配置群的默认准入策略",
+    "type": "string",
+    "options": ["deny", "allow"],
+    "labels": ["默认拒绝（需配置后才开放申请）", "默认允许（不设门槛）"],
+    "default": "deny"
+  },
+  "owner_qq_ids": {
+    "description": "插件最高管理员（Owner）QQ 号列表",
+    "type": "list",
+    "hint": "拥有全局群策略配置、手动授权、黑名单及审核员管理权限",
+    "default": []
+  },
+  "reviewer_qq_ids": {
+    "description": "插件审核员（Reviewer）QQ 号列表",
+    "type": "list",
+    "hint": "拥有查看待审申请、批准、拒绝与撤销授权权限",
+    "default": []
+  },
+  "application": {
+    "description": "申请参数配置",
+    "type": "object",
+    "items": {
+      "expire_hours": {
+        "description": "待审核申请有效期（小时）",
+        "type": "int",
+        "default": 72
+      },
+      "reject_cooldown_hours": {
+        "description": "申请被拒绝后的再次申请冷却时间（小时）",
+        "type": "int",
+        "default": 24
+      },
+      "duplicate_pending_allowed": {
+        "description": "是否允许同群提交多条待审申请",
+        "type": "bool",
+        "default": false
+      }
+    }
+  },
+  "private_chat": {
+    "description": "私聊行为设置",
+    "type": "object",
+    "items": {
+      "enabled_for_normal_users": {
+        "description": "是否对普通用户开放 Bot 私聊对话",
+        "type": "bool",
+        "default": false
+      },
+      "admin_commands_enabled": {
+        "description": "是否允许管理员在私聊中执行 /ga 管理指令",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "notifications": {
+    "description": "通知与提醒设置",
+    "type": "object",
+    "items": {
+      "reviewer_private_message": {
+        "description": "有新申请时向审核员发送私聊提醒",
+        "type": "bool",
+        "default": true
+      },
+      "fallback_group_id": {
+        "description": "审核通知备用群群号（私聊发送失败时推送）",
+        "type": "string",
+        "default": ""
+      },
+      "retry_enabled": {
+        "description": "开启持久化通知发信队列与重试",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "security": {
+    "description": "安全与审计策略",
+    "type": "object",
+    "items": {
+      "fail_closed": {
+        "description": "当群成员等级接口异常时严格阻断授权（Fail-Closed）",
+        "type": "bool",
+        "default": true
+      },
+      "log_denied_messages": {
+        "description": "记录被拦截消息的详细日志",
+        "type": "bool",
+        "default": false
+      },
+      "keep_audit_days": {
+        "description": "审计日志保留天数",
+        "type": "int",
+        "default": 90
+      }
+    }
+  }
+}

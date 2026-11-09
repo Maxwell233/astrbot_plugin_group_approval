@@ -1,0 +1,230 @@
+"""Group member level lookup service with TTL caching and request coalescing."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import time
+from typing import Any
+
+from .models import GroupMemberLevelResult
+from .napcat_client import NapCatClient
+
+logger = logging.getLogger("astrbot_plugin_group_approval.level")
+
+# Regex to safely extract integers from level string (e.g., "LV18" -> 18, "18" -> 18)
+LEVEL_REGEX = re.compile(r"(\d+)")
+
+
+class LevelService:
+    """Manages group member level lookups, caching, and concurrent request coalescing."""
+
+    def __init__(self, napcat_client: NapCatClient, cache_ttl: float = 300.0):
+        self.client = napcat_client
+        self.cache_ttl = cache_ttl
+
+        # Cache key: (bot_id, group_id, user_id) -> (GroupMemberLevelResult, expire_timestamp)
+        self._cache: dict[tuple[str, str, str], tuple[GroupMemberLevelResult, float]] = {}
+
+        # Request coalescing (single-flight): key -> Future[GroupMemberLevelResult]
+        self._in_flight: dict[tuple[str, str, str], asyncio.Future[GroupMemberLevelResult]] = {}
+        self._lock = asyncio.Lock()
+
+    def parse_level(self, raw_level: Any) -> int | None:
+        """Strictly parse member level.
+
+        Returns integer if valid, or None if invalid/missing.
+        """
+        if raw_level is None:
+            return None
+
+        if isinstance(raw_level, int):
+            return raw_level if raw_level >= 0 else None
+
+        raw_str = str(raw_level).strip()
+        if not raw_str:
+            return None
+
+        # Check for numeric or LV-prefixed format
+        match = LEVEL_REGEX.search(raw_str)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+        return None
+
+    async def get_group_member_level(
+        self,
+        bot_id: str,
+        group_id: str,
+        user_id: str,
+        force_refresh: bool = False,
+    ) -> GroupMemberLevelResult:
+        """Query member group level with caching and single-flight concurrency."""
+        b_id = str(bot_id).strip()
+        g_id = str(group_id).strip()
+        u_id = str(user_id).strip()
+        key = (b_id, g_id, u_id)
+        now = time.time()
+
+        # 1. Check cache if not forcing refresh
+        if not force_refresh:
+            cached = self._cache.get(key)
+            if cached is not None:
+                res, expire_at = cached
+                if now < expire_at:
+                    return res
+
+        # 2. Check in-flight requests (request coalescing)
+        async with self._lock:
+            # Re-check cache under lock
+            if not force_refresh:
+                cached = self._cache.get(key)
+                if cached is not None:
+                    res, expire_at = cached
+                    if now < expire_at:
+                        return res
+
+            future = self._in_flight.get(key)
+            if future is not None:
+                # Another task is currently fetching the exact same user info
+                need_wait = True
+            else:
+                loop = asyncio.get_running_loop()
+                future = loop.create_future()
+                self._in_flight[key] = future
+                need_wait = False
+
+        if need_wait:
+            return await future
+
+        # 3. Perform actual remote query
+        try:
+            result = await self._fetch_from_napcat(g_id, u_id, force_refresh)
+            # Store in cache only on successful member lookup
+            if result.success and result.is_member:
+                self._cache[key] = (result, now + self.cache_ttl)
+
+            if not future.done():
+                future.set_result(result)
+            return result
+        except Exception:
+            err_res = GroupMemberLevelResult(
+                success=False,
+                level=0,
+                is_member=False,
+                group_id=g_id,
+                user_id=u_id,
+                error_code="QUERY_EXCEPTION",
+            )
+            if not future.done():
+                future.set_result(err_res)
+            return err_res
+        finally:
+            async with self._lock:
+                self._in_flight.pop(key, None)
+
+    async def _fetch_from_napcat(
+        self,
+        group_id: str,
+        user_id: str,
+        force_refresh: bool,
+    ) -> GroupMemberLevelResult:
+        """Call NapCat OneBot API and validate responses."""
+        resp = await self.client.get_group_member_info(
+            group_id=group_id,
+            user_id=user_id,
+            no_cache=force_refresh,
+        )
+
+        status = resp.get("status")
+        retcode = resp.get("retcode")
+        data = resp.get("data")
+
+        # Check for successful OneBot response
+        if status != "ok" or retcode != 0 or not isinstance(data, dict):
+            logger.warning(
+                f"NapCat get_group_member_info failed for group={group_id}, user={user_id}: {resp}"
+            )
+            return GroupMemberLevelResult(
+                success=False,
+                level=0,
+                role="",
+                is_member=False,
+                group_id=group_id,
+                user_id=user_id,
+                error_code=f"RETCODE_{retcode}",
+                raw_data=resp,
+            )
+
+        # Validate that returned group_id and user_id match
+        resp_gid = str(data.get("group_id", "")).strip()
+        resp_uid = str(data.get("user_id", "")).strip()
+        if resp_gid and resp_gid != group_id:
+            logger.error(f"Identity mismatch: expected group {group_id}, got {resp_gid}")
+            return GroupMemberLevelResult(
+                success=False,
+                level=0,
+                is_member=False,
+                group_id=group_id,
+                user_id=user_id,
+                error_code="GROUP_ID_MISMATCH",
+                raw_data=data,
+            )
+
+        if resp_uid and resp_uid != user_id:
+            logger.error(f"Identity mismatch: expected user {user_id}, got {resp_uid}")
+            return GroupMemberLevelResult(
+                success=False,
+                level=0,
+                is_member=False,
+                group_id=group_id,
+                user_id=user_id,
+                error_code="USER_ID_MISMATCH",
+                raw_data=data,
+            )
+
+        # Extract group level (CRITICAL: 'level', NEVER 'qq_level')
+        # In NapCat, level corresponds to memberRealLevel
+        raw_level = data.get("level")
+        parsed_level = self.parse_level(raw_level)
+
+        if parsed_level is None:
+            logger.warning(
+                f"Invalid or missing group level for group={group_id}, user={user_id}: raw={raw_level}"
+            )
+            return GroupMemberLevelResult(
+                success=False,
+                level=0,
+                role=str(data.get("role", "member")),
+                is_member=True,
+                group_id=group_id,
+                user_id=user_id,
+                error_code="INVALID_LEVEL",
+                raw_data=data,
+            )
+
+        role = str(data.get("role", "member")).lower()
+        if role not in ("owner", "admin", "member"):
+            role = "member"
+
+        return GroupMemberLevelResult(
+            success=True,
+            level=parsed_level,
+            role=role,
+            is_member=True,
+            group_id=group_id,
+            user_id=user_id,
+            raw_data=data,
+        )
+
+    def invalidate_cache(self, bot_id: str, group_id: str, user_id: str) -> None:
+        """Evict cache entry."""
+        key = (str(bot_id).strip(), str(group_id).strip(), str(user_id).strip())
+        self._cache.pop(key, None)
+
+    def clear_cache(self) -> None:
+        """Clear all cached level entries."""
+        self._cache.clear()

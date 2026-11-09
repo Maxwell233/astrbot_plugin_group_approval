@@ -1,0 +1,18 @@
+name: astrbot_plugin_group_approval
+display_name: 群等级准入与管理员审批
+author: Maxwell233
+version: v1.0.0
+desc: 基于 NapCat OneBot v11 群成员真实等级的准入申请与管理员审批流，提供 SQLite 事务持久化、WebUI 管理看板与全群审核兼容
+help: |
+  用户指令：
+  /申请使用 [理由] - 提交入群使用申请
+  /我的权限 - 查询当前群授权状态
+  /申请状态 - 查询待审申请进度
+  /取消申请 - 取消待审申请
+  /使用规则 - 查看当前群准入门槛
+  管理员指令：
+  /ga - 打开管理控制台帮助
+repo: https://github.com/Maxwell233/astrbot_plugin_group_approval
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.16.0"
