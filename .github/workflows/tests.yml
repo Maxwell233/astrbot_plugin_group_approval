@@ -45,14 +45,7 @@ jobs:
       - name: Run unit/service tests
         run: python -m pytest -q -p no:cacheprovider
 
-  # Real AstrBot framework-registry tests: install the actual framework and run
-  # ONLY tests/test_framework_handler_order.py (real decorators, real global
-  # star_handlers_registry, real AstrMessageEvent / stop_event semantics).
-  #
-  # This job is intentionally BLOCKING (no continue-on-error): the local PyPI
-  # install of AstrBot==4.29.4 takes ~50s and resolves on macOS arm64 / Python
-  # 3.13, so a framework-ordering regression must fail CI rather than be ignored.
-  # Do not claim this job is green until it has actually run on GitHub.
+  # Real framework and default-Agent admission component tests.
   framework-integration:
     name: Real AstrBot framework integration (AstrBot 4.29.4)
     runs-on: ubuntu-latest
@@ -89,4 +82,4 @@ jobs:
         run: node --test tests/dashboard_bot_scope.test.cjs
 
       - name: Run real-framework component tests
-        run: python -m pytest tests/test_framework_handler_order.py -q -p no:cacheprovider
+        run: python -m pytest tests/test_framework_handler_order.py tests/test_native_llm.py -q -p no:cacheprovider

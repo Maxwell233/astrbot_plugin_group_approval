@@ -26,4 +26,3 @@ def _make_event(message_str: str = "hello", stop: bool = False) -> AstrMessageEv
     if stop:
         event.stop_event()
     return event
-
