@@ -1,144 +1,116 @@
-"""Read-only handler diagnostics: verify real AstrBot handler precedence.
-
-Verified AstrBot 4.29.4 facts used here (see COMPATIBILITY.md):
-* The global registry is ``astrbot.core.star.star_handler.star_handlers_registry``.
-  (There is no ``astrbot.core.star.star_handlers_registry`` module.)
-* Priority is stored in ``handler.extras_configs["priority"]`` (default 0); there is no
-  ``handler.priority`` attribute.
-* The registry iterates handlers in real dispatch order (descending priority, stable
-  registration order for ties), because ``StarHandlerRegistry.append`` sorts with
-  ``key=lambda h: -h.extras_configs["priority"]``.
-
-This service only *reports* reality. It never mutates another plugin's handler state.
-"""
+"""Read-only inspection of the live AstrBot adapter handler registry."""
 
 from __future__ import annotations
 
-import logging
 from typing import Any
-
-logger = logging.getLogger("astrbot_plugin_group_approval.diagnostics")
 
 GATE_PRIORITY = 50
 MODERATION_MIN_PRIORITY = GATE_PRIORITY + 1
 MODERATION_RECOMMENDED_PRIORITY = 100
 
-_PLUGIN_MODULE_HINT = "astrbot_plugin_group_approval"
-_MODERATION_MODULE_HINT = "group_guardian"
-_MODERATION_HANDLER_NAMES = ("_handle_message",)
-
-
-def _load_registry() -> Any | None:
-    """Import the real AstrBot registry, or return None when unavailable."""
-    try:
-        from astrbot.core.star.star_handler import star_handlers_registry
-
-        return star_handlers_registry
-    except Exception:  # noqa: BLE001 - older AstrBot or import failure
-        return None
+_APPROVAL = "astrbot_plugin_group_approval"
+_GUARDIAN = "astrbot_plugin_group_guardian"
 
 
 class HandlerDiagnostics:
-    """Inspects the real StarHandler registry and reports moderation precedence."""
+    """Report registration order independently of per-group moderation settings."""
 
     def __init__(self, context: Any = None):
         self.context = context
 
-    def _iter_handlers(self) -> list[Any] | None:
-        registry = _load_registry()
-        if registry is None:
-            return None
+    def diagnose_handlers(self) -> dict[str, Any]:
         try:
-            handlers = list(registry)
-        except TypeError:
-            handlers = list(getattr(registry, "_handlers", []) or [])
-        return handlers
+            from astrbot.core.star.filter.event_message_type import EventMessageType, EventMessageTypeFilter
+            from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType, PlatformAdapterTypeFilter
+            from astrbot.core.star.star import star_map
+            from astrbot.core.star.star_handler import EventType, star_handlers_registry
+        except ImportError:
+            return self._report("UNVERIFIED", "无法读取 AstrBot Handler 注册表。")
+
+        def is_group_onebot_listener(handler: Any) -> bool:
+            filters = handler.event_filters
+            return (
+                len(filters) == 2
+                and any(isinstance(f, EventMessageTypeFilter) and f.event_message_type & EventMessageType.GROUP_MESSAGE
+                        for f in filters)
+                and any(isinstance(f, PlatformAdapterTypeFilter) and f.platform_type == PlatformAdapterType.AIOCQHTTP
+                        for f in filters)
+            )
+
+        def find(plugin_name: str, method: str) -> list[Any]:
+            return [
+                h for h in star_handlers_registry
+                if h.event_type == EventType.AdapterMessageEvent
+                and h.handler_name == method
+                and h.handler_full_name == f"{h.handler_module_path}_{method}"
+                and getattr(star_map.get(h.handler_module_path), "name", None) == plugin_name
+                and (plugin_name != _GUARDIAN or h.handler_module_path.endswith(".main"))
+            ]
+
+        installed = [plugin for plugin in star_map.values() if plugin.name == _GUARDIAN]
+        if not installed:
+            return self._report("NOT_INSTALLED", "AstrBot 未加载 GroupGuardian，无法提供审核先行。")
+        if not any(plugin.activated for plugin in installed):
+            return self._report("DISABLED", "GroupGuardian 已停用，无法提供审核先行。")
+
+        gates = find(_APPROVAL, "on_message_gate")
+        moderators = find(_GUARDIAN, "_handle_message")
+        if len(gates) != 1 or len(moderators) != 1:
+            return self._report("UNVERIFIED", "无法唯一定位准入闸门与 GroupGuardian 主审核入口。")
+        gate, moderator = gates[0], moderators[0]
+        if not all(is_group_onebot_listener(h) for h in (gate, moderator)):
+            return self._report("UNVERIFIED", "审核或准入入口的群消息平台过滤器与已核对版本不同。")
+
+        handlers = star_handlers_registry.get_handlers_by_event_type(EventType.AdapterMessageEvent)
+        if moderator not in handlers or gate not in handlers:
+            return self._report("DISABLED", "审核或准入入口未处于启用的消息调度列表。")
+
+        gate_position = handlers.index(gate)
+        moderation_position = handlers.index(moderator)
+        gate_priority = gate.extras_configs.get("priority", 0)
+        moderation_priority = moderator.extras_configs.get("priority", 0)
+        order = [
+            {
+                "name": h.handler_name,
+                "module": h.handler_module_path,
+                "priority": h.extras_configs.get("priority", 0),
+                "position": i,
+            }
+            for i, h in enumerate(handlers)
+        ]
+        verified = (
+            isinstance(moderation_priority, int)
+            and isinstance(gate_priority, int)
+            and moderation_priority > gate_priority
+            and moderation_position < gate_position
+        )
+        report = self._report(
+            "VERIFIED" if verified else "CONFLICT",
+            "已验证注册表中主审核入口排在准入闸门之前。"
+            if verified else "阻断级配置错误：无法保证主审核先于准入闸门。请暂停受影响 Bot 的群消息接入。",
+            gate_priority,
+            moderation_priority,
+        )
+        report.update(
+            gate_position=gate_position,
+            moderation_position=moderation_position,
+            handlers=order,
+            other_handlers_before_gate=[h for h in order[:gate_position] if h["position"] != moderation_position],
+        )
+        return report
 
     @staticmethod
-    def _priority_of(handler: Any) -> int:
-        extras = getattr(handler, "extras_configs", None) or {}
-        try:
-            return int(extras.get("priority", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    def diagnose_handlers(self) -> dict[str, Any]:
-        """Return a factual report about handler precedence.
-
-        ``moderation_precedence`` values:
-          - ``VERIFIED``: a GroupGuardian message handler runs before this gate.
-          - ``CONFLICT``: GroupGuardian is installed but would be pre-empted by the gate.
-          - ``NOT_INSTALLED``: no GroupGuardian handlers found.
-          - ``UNVERIFIED``: the real registry could not be imported (framework too old).
-        """
-        handlers = self._iter_handlers()
-        if handlers is None:
-            return {
-                "moderation_precedence": "UNVERIFIED",
-                "gate_priority": GATE_PRIORITY,
-                "moderation_priority": None,
-                "message": "无法导入 AstrBot 真实 Handler 注册表，无法验证内容审核与准入闸门的执行顺序。",
-                "recommendations": "确认 AstrBot 版本 >= 4.26.0（本插件的最低支持版本）。",
-                "handlers": [],
-            }
-
-        records: list[dict[str, Any]] = []
-        gate_priority: int | None = None
-        moderation: list[dict[str, Any]] = []
-
-        for handler in handlers:
-            module = str(getattr(handler, "handler_module_path", "") or "")
-            name = str(getattr(handler, "handler_name", "") or "")
-            priority = self._priority_of(handler)
-            records.append(
-                {
-                    "name": name,
-                    "module": module,
-                    "priority": priority,
-                }
-            )
-            if _PLUGIN_MODULE_HINT in module and name == "on_message_gate":
-                gate_priority = priority
-            if _MODERATION_MODULE_HINT in module.lower():
-                moderation.append({"name": name, "priority": priority})
-
-        effective_gate_priority = gate_priority if gate_priority is not None else GATE_PRIORITY
-
-        if not moderation:
-            status = "NOT_INSTALLED"
-            moderation_priority = None
-            message = "未在真实注册表中发现 GroupGuardian 审核 Handler。"
-            recommendations = (
-                "若需要群内容安全审核，请安装 GroupGuardian 并应用兼容补丁 "
-                "(patches/group_guardian_priority.patch)。"
-            )
-        else:
-            moderation_priority = max(item["priority"] for item in moderation)
-            if moderation_priority > effective_gate_priority:
-                status = "VERIFIED"
-                message = (
-                    f"已验证：GroupGuardian 审核 Handler 实际优先级 {moderation_priority} "
-                    f"> 准入闸门 {effective_gate_priority}，未授权用户的违规消息会先被审核。"
-                )
-                recommendations = "当前 Handler 顺序符合安全要求，无需额外配置。"
-            else:
-                status = "CONFLICT"
-                message = (
-                    f"安全冲突：GroupGuardian 审核 Handler 实际优先级 {moderation_priority} "
-                    f"<= 准入闸门 {effective_gate_priority}。"
-                    "未授权用户的违规消息会在被审核前遭到拦截。"
-                )
-                recommendations = (
-                    "请对 GroupGuardian 应用 patches/group_guardian_priority.patch"
-                    f"（将主审核 Handler 提升至 priority={MODERATION_RECOMMENDED_PRIORITY}）。"
-                )
-
+    def _report(status: str, message: str, gate_priority=None, moderation_priority=None) -> dict[str, Any]:
         return {
             "moderation_precedence": status,
-            "gate_priority": effective_gate_priority,
+            "gate_priority": gate_priority,
             "moderation_priority": moderation_priority,
             "recommended_moderation_priority": MODERATION_RECOMMENDED_PRIORITY,
             "message": message,
-            "recommendations": recommendations,
-            "handlers": records,
+            "recommendations": (
+                "核对每群审核开关、Bot 群管理权限、会话插件过滤和闸门前的其他 Handler。"
+                if status == "VERIFIED" else
+                "核对两插件均已启用，应用 patches/group_guardian_priority.patch 并重载后重新诊断。"
+            ),
+            "handlers": [],
         }

@@ -90,6 +90,9 @@ async def test_gate_post_type_filtering(access_system):
             self.message_obj.sender = MagicMock(role="member")
             self.message_obj.message = []
 
+        def get_platform_name(self):
+            return "aiocqhttp"
+
         def get_self_id(self):
             return "11111"
 

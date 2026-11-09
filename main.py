@@ -57,6 +57,7 @@ except ImportError:
 logger = logging.getLogger("astrbot_plugin_group_approval")
 
 PLUGIN_NAME = "astrbot_plugin_group_approval"
+LIVINGMEMORY_CAPTURE_KEY = "group_approval.livingmemory_capture"
 
 # Graceful AstrBot import with standalone fallback
 try:
@@ -83,6 +84,9 @@ except ImportError:
     StarTools = AstrTools  # type: ignore
 
     class _FilterMock:
+        class PlatformAdapterType:
+            AIOCQHTTP = "aiocqhttp"
+
         class EventMessageType:
             ALL = "ALL"
 
@@ -91,6 +95,9 @@ except ImportError:
                 return f
 
             return dec
+
+        platform_adapter_type = event_message_type
+        on_astrbot_loaded = event_message_type
 
         def command(self, *args: Any, **kwargs: Any) -> Any:
             def dec(f: Any) -> Any:
@@ -113,6 +120,11 @@ try:
     from astrbot.core.platform.message_type import MessageType as _RealMessageType
 except ImportError:  # pragma: no cover - standalone test mode
     _RealMessageType = None
+
+
+def _is_onebot_event(event: Any) -> bool:
+    get_platform_name = getattr(event, "get_platform_name", None)
+    return callable(get_platform_name) and get_platform_name() == "aiocqhttp"
 
 
 def _bot_self_id(event: Any) -> str:
@@ -304,6 +316,10 @@ class GroupApprovalPlugin(Star):
         self._report_moderation_precedence()
         logger.info("GroupApprovalPlugin v0.1.1 initialized successfully.")
 
+    @filter.on_astrbot_loaded()
+    async def _check_moderation_after_startup(self) -> None:
+        self._report_moderation_precedence()
+
     def _report_moderation_precedence(self) -> None:
         """Log the real, registry-verified moderation precedence (never assume it)."""
         try:
@@ -313,7 +329,7 @@ class GroupApprovalPlugin(Star):
             return
         status = report.get("moderation_precedence")
         message = report.get("message", "")
-        if status == "CONFLICT":
+        if status in {"CONFLICT", "DISABLED"}:
             logger.error("内容审核优先级未满足安全要求：%s %s", message, report.get("recommendations", ""))
         elif status == "VERIFIED":
             logger.info("内容审核优先级已验证：%s", message)
@@ -382,7 +398,7 @@ class GroupApprovalPlugin(Star):
         operator = self.auth.get_authenticated_user(request)
         if not operator:
             return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
-        return await self.web_api.get_dashboard_stats()
+        return await self.web_api.get_dashboard_stats(_get_query_param(request, "bot_self_id"))
 
     async def _web_diagnostics(self) -> dict[str, Any]:
         operator = self.auth.get_authenticated_user(request)
@@ -491,6 +507,7 @@ class GroupApprovalPlugin(Star):
     # ------------------------------------------------------------------
     # Trusted admission dispatcher (priority GATE_PRIORITY = 50)
     # ------------------------------------------------------------------
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=GATE_PRIORITY)
     async def on_message_gate(self, event: AstrMessageEvent) -> None:
         """Single trusted admission entry point.
@@ -499,6 +516,8 @@ class GroupApprovalPlugin(Star):
         ordinary business plugins (0). Reply-producing admission commands are executed HERE
         and the event is stopped, so they can never leak to other plugins or the LLM.
         """
+        if not _is_onebot_event(event):
+            return
         msg_obj = getattr(event, "message_obj", None)
         if msg_obj is None:
             return
@@ -516,10 +535,7 @@ class GroupApprovalPlugin(Star):
         message_str = getattr(event, "message_str", "") or ""
         is_command = bool(getattr(event, "is_at_or_wake_command", False))
 
-        # Attest the verified bot identity for this inbound event so outbound routing
-        # (notifications, level lookups) targets the correct OneBot connection even
-        # before/without a get_login_info round-trip. The adapter sets self_id from the
-        # authenticated OneBot connection, so this is not client-controlled data.
+        # Registry-less OneBot clients can learn short-lived routing candidates from events.
         try:
             await self.napcat.remember_event_identity(event)
         except Exception:  # noqa: BLE001 - identity attestation must not break the gate
@@ -579,7 +595,16 @@ class GroupApprovalPlugin(Star):
             yield event.plain_result(reply)
             return
 
-        # AdmissionKind.ALLOW: authorized user; let normal business handlers run.
+        # The LivingMemory compatibility patch defers its pre-handler filter side effect.
+        # Only a successful group admission may release the queued callback.
+        if group_id and self.plugin_config.enabled:
+            capture = event.get_extra(LIVINGMEMORY_CAPTURE_KEY)
+            if callable(capture):
+                event.set_extra(LIVINGMEMORY_CAPTURE_KEY, None)
+                try:
+                    capture()
+                except Exception:
+                    logger.exception("Could not schedule admitted LivingMemory capture")
 
     async def _execute_user_command(
         self,
@@ -607,8 +632,11 @@ class GroupApprovalPlugin(Star):
     # ------------------------------------------------------------------
     # Command handlers (defense in depth; the gate executes commands first)
     # ------------------------------------------------------------------
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("申请使用")
     async def cmd_apply(self, event: AstrMessageEvent) -> None:
+        if not _is_onebot_event(event):
+            return
         bot_self_id = _bot_self_id(event)
         group_id = _group_id(event) or ""
         user_id = str(event.get_sender_id() or "").strip()
@@ -617,38 +645,53 @@ class GroupApprovalPlugin(Star):
         event.stop_event()
         yield event.plain_result(reply)
 
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("我的权限")
     async def cmd_my_status(self, event: AstrMessageEvent) -> None:
+        if not _is_onebot_event(event):
+            return
         reply = await self.dispatcher.handle_my_status(
             _bot_self_id(event), _group_id(event) or "", str(event.get_sender_id() or "").strip()
         )
         event.stop_event()
         yield event.plain_result(reply)
 
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("申请状态")
     async def cmd_application_status(self, event: AstrMessageEvent) -> None:
+        if not _is_onebot_event(event):
+            return
         reply = await self.dispatcher.handle_application_status(
             _bot_self_id(event), _group_id(event) or "", str(event.get_sender_id() or "").strip()
         )
         event.stop_event()
         yield event.plain_result(reply)
 
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("取消申请")
     async def cmd_cancel_application(self, event: AstrMessageEvent) -> None:
+        if not _is_onebot_event(event):
+            return
         reply = await self.dispatcher.handle_cancel_application(
             _bot_self_id(event), _group_id(event) or "", str(event.get_sender_id() or "").strip()
         )
         event.stop_event()
         yield event.plain_result(reply)
 
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("使用规则")
     async def cmd_rules(self, event: AstrMessageEvent) -> None:
+        if not _is_onebot_event(event):
+            return
         reply = await self.dispatcher.handle_rules(_bot_self_id(event), _group_id(event) or "")
         event.stop_event()
         yield event.plain_result(reply)
 
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("ga")
     async def cmd_ga(self, event: AstrMessageEvent) -> None:
+        if not _is_onebot_event(event):
+            return
         msg = getattr(event, "message_str", "").strip()
         parts = [p for p in msg.split() if p]
         args = parts[1:] if len(parts) > 1 else []

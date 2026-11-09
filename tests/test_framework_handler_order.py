@@ -200,35 +200,6 @@ def test_stop_event_suppresses_business_even_at_same_priority():
     assert event.get_extra("business_ran") is None
 
 
-def test_real_diagnostics_detects_stock_vs_patched_group_guardian():
-    """HandlerDiagnostics reads the real registry: stock GG => CONFLICT, patched => VERIFIED."""
-    from approval.diagnostics import HandlerDiagnostics
-
-    # Bootstrap: register a genuine handler whose module path contains group_guardian by
-    # using the module path of a helper module. Simplest reliable route: inspect the real
-    # registry for our stock handler name in this test module is not group_guardian, so we
-    # patch the handler_module_path on the real metadata object (test-only, read by diag).
-    for h in star_handlers_registry:
-        if h.handler_name == "stock_moderation_default":
-            h.handler_module_path = "data.plugins.astrbot_plugin_group_guardian.main"
-        if h.handler_name == "patched_moderation_100":
-            h.handler_module_path = "data.plugins.astrbot_plugin_group_guardian.patched"
-
-    # Both handlers exist now; max priority is 100 => VERIFIED.
-    verified = HandlerDiagnostics().diagnose_handlers()
-    assert verified["moderation_precedence"] == "VERIFIED"
-    assert verified["moderation_priority"] == 100
-
-    # Remove the patched one from the real registry => stock 0 => CONFLICT.
-    for h in list(star_handlers_registry._handlers):
-        if h.handler_name == "patched_moderation_100":
-            star_handlers_registry._handlers.remove(h)
-            star_handlers_registry.star_handlers_map.pop(h.handler_full_name, None)
-    conflict = HandlerDiagnostics().diagnose_handlers()
-    assert conflict["moderation_precedence"] == "CONFLICT"
-    assert conflict["moderation_priority"] == 0
-
-
 # ---------------------------------------------------------------------------
 # End-to-end gate behaviour under the real AstrBot event object
 # ---------------------------------------------------------------------------
@@ -340,3 +311,165 @@ def test_real_gate_blocks_unauthorized_but_allows_granted_user(tmp_path):
         assert other_user.is_stopped() is True, "a different unauthorized user is still blocked"
     finally:
         asyncio.run(plugin.terminate())
+
+
+def test_non_onebot_event_skips_registered_gate(tmp_path):
+    plugin = asyncio.run(_make_plugin(tmp_path))
+    try:
+        event = _make_event("!help")
+        event.platform_meta.name = "telegram"
+        gate = next(h for h in _adapter_handlers_in_dispatch_order() if h.handler_name == "on_message_gate")
+        assert not all(item.filter(event, {}) for item in gate.event_filters)
+        _gate_result(event, plugin)
+        assert not event.is_stopped()
+    finally:
+        asyncio.run(plugin.terminate())
+
+
+def test_diagnostics_does_not_mistake_a_high_priority_sibling_for_main(monkeypatch):
+    from copy import copy
+    from types import SimpleNamespace
+
+    from astrbot.core.star.star import star_map
+
+    from approval.diagnostics import HandlerDiagnostics
+
+    module = "data.plugins.astrbot_plugin_group_guardian.main"
+    gate = next(h for h in star_handlers_registry if h.handler_name == "on_message_gate")
+    monkeypatch.setitem(star_map, gate.handler_module_path, SimpleNamespace(
+        activated=True, name="astrbot_plugin_group_approval",
+    ))
+    metadata = SimpleNamespace(activated=True, name="astrbot_plugin_group_guardian")
+    monkeypatch.setitem(star_map, module, metadata)
+    sibling = copy(next(h for h in star_handlers_registry if h.handler_name == "patched_moderation_100"))
+    sibling.handler_module_path = module
+    sibling.handler_full_name = f"{module}_other_handler"
+    main_handler = copy(next(h for h in star_handlers_registry if h.handler_name == "stock_moderation_default"))
+    main_handler.handler_module_path = module
+    main_handler.handler_name = "_handle_message"
+    main_handler.handler_full_name = f"{module}__handle_message"
+    from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterTypeFilter
+
+    main_handler.event_filters = [*main_handler.event_filters, PlatformAdapterTypeFilter("aiocqhttp")]
+    star_handlers_registry.append(sibling)
+    star_handlers_registry.append(main_handler)
+    assert HandlerDiagnostics().diagnose_handlers()["moderation_precedence"] == "CONFLICT"
+    star_handlers_registry._handlers.remove(main_handler)
+    main_handler.extras_configs = {"priority": 100}
+    star_handlers_registry.append(main_handler)
+    assert HandlerDiagnostics().diagnose_handlers()["moderation_precedence"] == "VERIFIED"
+    metadata.activated = False
+    assert HandlerDiagnostics().diagnose_handlers()["moderation_precedence"] == "DISABLED"
+    star_handlers_registry._handlers.remove(main_handler)
+    metadata.activated = True
+    assert HandlerDiagnostics().diagnose_handlers()["moderation_precedence"] == "UNVERIFIED"
+
+
+def test_passive_capture_waits_for_admission_decision(tmp_path):
+    plugin = asyncio.run(_make_plugin(tmp_path))
+    try:
+        captured = []
+        denied = _make_event("!help")
+        denied.set_extra("group_approval.livingmemory_capture", lambda: captured.append("denied"))
+        _gate_result(denied, plugin)
+        assert denied.is_stopped()
+        assert not captured
+
+        allowed = _make_event("hello")
+        plugin.plugin_config.owner_qq_ids.append(allowed.get_sender_id())
+        plugin.plugin_config.default_policy = "allow"
+        allowed.set_extra("group_approval.livingmemory_capture", lambda: captured.append("allowed"))
+        _gate_result(allowed, plugin)
+        assert captured == ["allowed"]
+    finally:
+        asyncio.run(plugin.terminate())
+
+
+async def test_shipped_guardian_decorators_register_priority_and_run_in_real_stage(monkeypatch, tmp_path):
+    from copy import copy
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from astrbot.core.pipeline.process_stage.method.star_request import StarRequestSubStage
+    from astrbot.core.star.star import star_map
+
+    lines = Path("patches/group_guardian_priority.patch").read_text().splitlines()
+    decorators = [
+        line[1:].strip() for line in lines
+        if line.startswith(("+", " ")) and line[1:].strip().startswith("@filter.")
+    ]
+    module = "data.plugins.astrbot_plugin_group_guardian.main"
+    namespace = {"filter": filter, "__name__": module}
+    # Real decorators from the patch, a harmless moderation body and the real process stage.
+    exec("\n".join([*decorators, "async def _handle_message(event):",
+                   "    event.set_extra('moderation_ran', True)"]), namespace)
+    guardian = next(h for h in star_handlers_registry if h.handler_module_path == module)
+    assert guardian.extras_configs["priority"] == 100
+
+    plugin = await _make_plugin(tmp_path)
+    try:
+        gate = copy(next(h for h in star_handlers_registry if h.handler_name == "on_message_gate"))
+        gate.handler = plugin.on_message_gate
+        business = next(h for h in star_handlers_registry if h.handler_name == "ordinary_business_default")
+        for handler in (guardian, gate, business):
+            monkeypatch.setitem(star_map, handler.handler_module_path, SimpleNamespace(
+                activated=True, name=handler.handler_module_path, display_name="",
+            ))
+        event = _make_event()
+        event.set_extra("activated_handlers", [
+            gate if h.handler_name == "on_message_gate" else h
+            for h in _adapter_handlers_in_dispatch_order()
+            if h in (guardian, business) or h.handler_name == "on_message_gate"
+        ])
+        async for _ in StarRequestSubStage().process(event):
+            pass
+        assert event.get_extra("moderation_ran") is True
+        assert event.is_stopped()
+        assert event.get_extra("business_ran") is None
+    finally:
+        await plugin.terminate()
+
+
+async def test_real_aiocqhttp_routes_multiple_accounts_in_one_adapter():
+    import json
+    from types import SimpleNamespace
+
+    from aiocqhttp import CQHttp
+    from aiocqhttp.api_impl import ResultStore
+
+    from approval.napcat_client import NapCatClient
+
+    class Socket:
+        def __init__(self, qq):
+            self.qq = qq
+            self.requests = []
+
+        async def send(self, message):
+            request = json.loads(message)
+            self.requests.append(request)
+            result = {"user_id": int(self.qq)} if request["action"] == "get_login_info" else {"message_id": 1}
+            # Deliver after the SDK starts waiting for this sequence.
+            asyncio.get_running_loop().call_soon(ResultStore.add, {
+                "status": "ok", "retcode": 0, "data": result, "echo": request["echo"],
+            })
+
+    transport = CQHttp()
+    sockets = {qq: Socket(qq) for qq in ("10001", "20002")}
+    transport._wsr_api_clients.update(sockets)
+    platform = SimpleNamespace(
+        meta=lambda: SimpleNamespace(name="aiocqhttp", id="shared"),
+        get_client=lambda: transport,
+    )
+    client = NapCatClient()
+    client.set_context(SimpleNamespace(platform_manager=SimpleNamespace(get_insts=lambda: [platform])))
+    assert await client.list_bots() == ["10001", "20002"]
+    for qq, socket in sockets.items():
+        assert await client.verify_bot(qq)
+        assert (await client.send_private_msg("30001", "test", bot_self_id=qq))[0]
+        assert [req["action"] for req in socket.requests] == [
+            "get_login_info", "get_login_info", "send_private_msg",
+        ]
+        assert all(req["params"]["self_id"] == qq for req in socket.requests)
+    del transport._wsr_api_clients["10001"]
+    assert not await client.verify_bot("10001")
+    assert await client.verify_bot("20002")

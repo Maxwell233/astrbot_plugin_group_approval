@@ -224,19 +224,18 @@ async def test_group_unban_does_not_clear_global_ban(access_system):
 async def test_web_api_v011_features(web_system):
     web, approval, db, napcat, config = web_system
 
-    # Initially no bots connected -> empty list, NO "default" placeholder
+    # Live discovery stays empty while historical policies remain available for reads.
+    napcat.verified_bot_ids.clear()
     bots_res = await web.list_bots()
     assert bots_res["status"] == "ok"
-    assert "bots" in bots_res["data"]
-    assert bots_res["data"]["bots"] == []
+    assert bots_res["data"]["verified_bots"] == []
 
-    # Insert a policy with bot1
     await db.execute(
-        "INSERT INTO group_policies (bot_self_id, group_id, enabled, min_level, created_at, updated_at) VALUES ('bot1', '10001', 1, 10, 100, 100)"
+        "INSERT INTO group_policies (bot_self_id, group_id, enabled, min_level, created_at, updated_at)"
+        " VALUES ('10001', '10001', 1, 10, 100, 100)"
     )
-    await db.commit()
-    bots_res2 = await web.list_bots()
-    assert bots_res2["data"]["bots"] == ["bot1"]
+    assert (await web.list_bots())["data"]["verified_bots"] == []
+    assert (await web.list_groups("10001"))["data"]["groups"][0]["bot_self_id"] == "10001"
 
     # Test modern query parameter helper
     class MockRequest:
@@ -289,46 +288,8 @@ async def test_web_api_v011_features(web_system):
     assert role_unknown == "DASHBOARD_USER"
 
 
-# 7. Handler Diagnostics Service reads the REAL registry shape
-def test_handler_diagnostics_service():
-    from unittest.mock import patch
-
-    from approval import diagnostics as diag_mod
-    from approval.diagnostics import HandlerDiagnostics
-
-    def handler(name, module, priority):
-        h = MagicMock()
-        h.handler_name = name
-        h.handler_module_path = module
-        h.extras_configs = {"priority": priority}
-        return h
-
-    gg_module = "astrbot_plugin_group_guardian.main"
-
-    # Stock upstream GroupGuardian (no priority=) -> default 0 -> CONFLICT with the gate.
-    with patch.object(diag_mod, "_load_registry", lambda: [handler("_handle_message", gg_module, 0)]):
-        res = HandlerDiagnostics().diagnose_handlers()
-    assert res["moderation_precedence"] == "CONFLICT"
-    assert res["moderation_priority"] == 0
-    assert "patches/group_guardian_priority.patch" in res["recommendations"]
-
-    # Patched GroupGuardian (priority=100) -> VERIFIED.
-    with patch.object(diag_mod, "_load_registry", lambda: [handler("_handle_message", gg_module, 100)]):
-        res = HandlerDiagnostics().diagnose_handlers()
-    assert res["moderation_precedence"] == "VERIFIED"
-    assert res["moderation_priority"] == 100
-
-    # GroupGuardian not installed.
-    with patch.object(diag_mod, "_load_registry", lambda: []):
-        res = HandlerDiagnostics().diagnose_handlers()
-    assert res["moderation_precedence"] == "NOT_INSTALLED"
-
-    # Real registry unavailable (old AstrBot) -> UNVERIFIED, never a false "safe".
-    with patch.object(diag_mod, "_load_registry", lambda: None):
-        res = HandlerDiagnostics().diagnose_handlers()
-    assert res["moderation_precedence"] == "UNVERIFIED"
-
-    # Verify runtime monkey-patch method stays removed from GroupApprovalPlugin.
+# Moderation registry coverage uses AstrBot's actual metadata and decorators.
+def test_no_runtime_moderation_priority_mutation():
     plugin = GroupApprovalPlugin(context=MagicMock())
     assert not hasattr(plugin, "_promote_group_guardian_priority")
     assert not hasattr(plugin, "on_message_gate_priority_mutation")

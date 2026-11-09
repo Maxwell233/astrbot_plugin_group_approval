@@ -1,0 +1,17 @@
+--- a/core/passive_group_capture.py
++++ b/core/passive_group_capture.py
+@@ -140,5 +140,13 @@
+         if not is_event_memory_allowed(plugin.config_manager, event):
+             return False
+ 
+-        plugin._schedule_passive_group_capture(event)
++        if event.get_platform_name() == "aiocqhttp":
++            # AstrBot evaluates custom filters before Group Approval runs. Defer
++            # scheduling until its group gate explicitly admits the message.
++            event.set_extra(
++                "group_approval.livingmemory_capture",
++                lambda: plugin._schedule_passive_group_capture(event),
++            )
++        else:
++            plugin._schedule_passive_group_capture(event)
+         return False

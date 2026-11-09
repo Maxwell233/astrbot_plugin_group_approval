@@ -26,8 +26,7 @@ def test_patch_exists_and_targets_the_main_moderation_handler():
     joined_added = "\n".join(added)
 
     # Exactly the moderation-handler decorator changes; nothing else is touched.
-    assert len(removed) == 1, removed
-    assert removed[0].strip() == "@filter.event_message_type(filter.EventMessageType.ALL)"
+    assert [line.strip() for line in removed] == ["@filter.event_message_type(filter.EventMessageType.ALL)"]
 
     assert f"priority={MODERATION_RECOMMENDED_PRIORITY}" in joined_added
     assert "async def _handle_message" in text  # context line of the hunk
