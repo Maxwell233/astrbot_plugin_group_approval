@@ -20,7 +20,7 @@ function escapeHtml(str) {
 
 function getSelectedBotId() {
   const sel = document.getElementById("global-bot-select");
-  return sel ? sel.value.trim() : "default";
+  return sel ? sel.value.trim() : "";
 }
 
 async function apiCall(endpoint, method = "GET", payload = null, queryParams = null) {
@@ -112,16 +112,42 @@ document.addEventListener("DOMContentLoaded", async () => {
   initFilters();
 
   await loadBots();
+  await loadDiagnostics();
   await loadDashboard();
 });
+
+async function loadDiagnostics() {
+  const badge = document.getElementById("handler-diag-badge");
+  if (!badge) return;
+  try {
+    const res = await apiCall("diagnostics");
+    if (!res || res.status !== "ok") return;
+    const d = res.data;
+    if (d.group_guardian_status === "OPTIMAL") {
+      badge.className = "status-badge live";
+      badge.textContent = "🛡️ 审核链安全 (GG优先)";
+    } else if (d.group_guardian_status === "WARNING") {
+      badge.className = "status-badge warning";
+      badge.textContent = "⚠️ 审核链风险 (GG<=50)";
+    } else {
+      badge.className = "status-badge";
+      badge.textContent = "ℹ️ GroupGuardian: 未检测到";
+    }
+    badge.onclick = () => {
+      alert(`【Handler 优先级诊断报告】\n状态: ${d.group_guardian_status}\n${d.message}\n建议: ${d.recommendations}`);
+    };
+  } catch (e) {
+    console.warn("Could not load diagnostics:", e);
+  }
+}
 
 async function loadBots() {
   try {
     const res = await apiCall("bots");
     const select = document.getElementById("global-bot-select");
     if (!select) return;
-    const bots = res?.data?.bots || ["default"];
-    select.innerHTML = "";
+    const bots = res?.data?.bots || [];
+    select.innerHTML = '<option value="">全部 Bot</option>';
     bots.forEach((b) => {
       const opt = document.createElement("option");
       opt.value = b;

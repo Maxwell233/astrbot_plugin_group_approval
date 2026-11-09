@@ -16,28 +16,34 @@ try:
         AdmissionGate,
         ApprovalService,
         AuditService,
+        AuthorizationService,
         CommandDispatcher,
         Database,
+        HandlerDiagnostics,
         LevelService,
         NapCatClient,
         NotificationService,
         PluginConfig,
         WebApiHandler,
     )
+    from .approval.web_api import parse_bool
 except ImportError:
     from approval import (  # type: ignore
         AccessService,
         AdmissionGate,
         ApprovalService,
         AuditService,
+        AuthorizationService,
         CommandDispatcher,
         Database,
+        HandlerDiagnostics,
         LevelService,
         NapCatClient,
         NotificationService,
         PluginConfig,
         WebApiHandler,
     )
+    from approval.web_api import parse_bool  # type: ignore
 
 logger = logging.getLogger("astrbot_plugin_group_approval")
 
@@ -83,7 +89,9 @@ except ImportError:
     filter = _FilterMock()  # type: ignore
     AstrMessageEvent = Any  # type: ignore
 
-    def json_response(data: Any, *args: Any, **kwargs: Any) -> Any:
+    def json_response(data: Any, *args: Any, status: int = 200, **kwargs: Any) -> Any:
+        if isinstance(data, dict):
+            data["_status_code"] = status
         return data
 
     request = Any  # type: ignore
@@ -125,15 +133,29 @@ async def _get_request_json(req: Any) -> dict[str, Any]:
     return {}
 
 
-def _get_request_operator(req: Any) -> str:
-    """Extract authenticated dashboard user ID from request headers or auth context."""
-    headers = getattr(req, "headers", None)
-    if headers and hasattr(headers, "get"):
-        for header_name in ("X-AstrBot-User", "X-User-Id", "X-Username", "Authorization-User"):
-            val = headers.get(header_name)
-            if val:
-                return str(val).strip()
-    return "dashboard_admin"
+def _get_request_operator(req: Any) -> str | None:
+    """Extract authenticated dashboard user ID strictly from official session/context.
+
+    Rejects spoofable client HTTP headers (e.g. X-AstrBot-User, Authorization-User).
+    """
+    username = getattr(req, "username", None)
+    if username and str(username).strip():
+        return str(username).strip()
+    session = getattr(req, "session", None)
+    if isinstance(session, dict):
+        s_user = session.get("user") or session.get("username")
+        if s_user and str(s_user).strip():
+            return str(s_user).strip()
+    user_obj = getattr(req, "user", None)
+    if user_obj is not None:
+        identity = (
+            getattr(user_obj, "identity", None)
+            or getattr(user_obj, "username", None)
+            or getattr(user_obj, "name", None)
+        )
+        if identity and str(identity).strip():
+            return str(identity).strip()
+    return None
 
 
 class GroupApprovalPlugin(Star):
@@ -200,6 +222,11 @@ class GroupApprovalPlugin(Star):
             audit_service=self.audit_service,
             config=self.plugin_config,
         )
+        self.auth = AuthorizationService(
+            config=self.plugin_config,
+            is_reviewer_fn=self.approval_service.is_reviewer,
+        )
+        self.diagnostics = HandlerDiagnostics(self.context)
 
         # 4. Schedule startup initialization task
         asyncio.create_task(self._init_plugin())
@@ -215,47 +242,12 @@ class GroupApprovalPlugin(Star):
             await self.approval_service.clean_expired()
             # Sync persistent reviewers from database
             await self.approval_service.sync_reviewers_from_db()
-            # Promote GroupGuardian handler priority if loaded
-            self._promote_group_guardian_priority()
             # Start persistent outbox notification retry worker
             if self.plugin_config.notifications.retry_enabled:
                 self.notification_service.start_worker()
             logger.info("GroupApprovalPlugin v0.1.1 initialized successfully.")
         except Exception as e:
             logger.error(f"Failed to initialize GroupApprovalPlugin: {e}", exc_info=True)
-
-    def _promote_group_guardian_priority(self) -> None:
-        """Dynamically elevate GroupGuardian handlers to priority 100 so content audit precedes access gate."""
-        if self.context is None:
-            return
-        promoted = 0
-        try:
-            candidates = []
-            for attr in ("handlers", "star_manager", "event_manager", "star_handlers"):
-                obj = getattr(self.context, attr, None)
-                if obj is not None:
-                    candidates.append(obj)
-
-            for target in candidates:
-                handlers = getattr(target, "handlers", target)
-                if isinstance(handlers, (list, tuple)):
-                    for h in handlers:
-                        name = str(getattr(h, "name", "") or getattr(h, "__name__", "") or str(h)).lower()
-                        if "group_guardian" in name or "groupguardian" in name or "guardian" in name:
-                            if hasattr(h, "priority") and getattr(h, "priority") < 100:
-                                h.priority = 100
-                                promoted += 1
-                elif isinstance(handlers, dict):
-                    for k, v in handlers.items():
-                        name = str(k).lower()
-                        if "group_guardian" in name or "groupguardian" in name or "guardian" in name:
-                            if hasattr(v, "priority") and getattr(v, "priority") < 100:
-                                v.priority = 100
-                                promoted += 1
-            if promoted > 0:
-                logger.info(f"Dynamically promoted {promoted} GroupGuardian handler(s) to priority 100.")
-        except Exception as e:
-            logger.debug(f"GroupGuardian priority scan note: {e}")
 
     async def terminate(self) -> None:
         """Clean up background workers and close database connections upon unloading."""
@@ -281,6 +273,7 @@ class GroupApprovalPlugin(Star):
         routes = [
             (f"/{PLUGIN_NAME}/bots", self._web_bots, ["GET"], "List connected bots"),
             (f"/{PLUGIN_NAME}/dashboard", self._web_dashboard, ["GET"], "Dashboard metrics"),
+            (f"/{PLUGIN_NAME}/diagnostics", self._web_diagnostics, ["GET"], "Handler precedence diagnostics"),
             (f"/{PLUGIN_NAME}/applications", self._web_applications, ["GET"], "List applications"),
             (f"/{PLUGIN_NAME}/applications/approve", self._web_approve, ["POST"], "Approve application"),
             (f"/{PLUGIN_NAME}/applications/reject", self._web_reject, ["POST"], "Reject application"),
@@ -292,6 +285,7 @@ class GroupApprovalPlugin(Star):
             (f"/{PLUGIN_NAME}/groups", self._web_groups, ["GET"], "List group policies"),
             (f"/{PLUGIN_NAME}/groups/update", self._web_update_group, ["POST"], "Update group policy"),
             (f"/{PLUGIN_NAME}/audit_logs", self._web_audit_logs, ["GET"], "List audit logs"),
+            (f"/{PLUGIN_NAME}/audit_logs/export", self._web_export_audit_logs, ["GET"], "Export audit logs"),
         ]
 
         for path, handler_fn, methods, desc in routes:
@@ -300,67 +294,146 @@ class GroupApprovalPlugin(Star):
             except Exception as e:
                 logger.warning(f"Could not register web route {path}: {e}")
 
-    # --- Web Route Handlers ---
+    # --- Web Route Handlers with Authentication & Server-Side Authorization ---
     async def _web_bots(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
         return await self.web_api.list_bots(context=self.context)
 
     async def _web_dashboard(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
         return await self.web_api.get_dashboard_stats()
 
+    async def _web_diagnostics(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
+        return {"status": "ok", "retcode": 0, "data": self.diagnostics.diagnose_handlers()}
+
     async def _web_applications(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
         gid = _get_query_param(request, "group_id")
         status = _get_query_param(request, "status")
         uid = _get_query_param(request, "user_id")
-        return await self.web_api.list_applications(group_id=gid, status=status, user_id=uid)
+        bid = _get_query_param(request, "bot_self_id")
+        return await self.web_api.list_applications(group_id=gid, status=status, user_id=uid, bot_self_id=bid)
 
     async def _web_approve(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
+        ok, role, reason = await self.auth.authorize_action(operator, "approve")
+        if not ok:
+            return {"status": "error", "retcode": 403, "message": f"Forbidden: {reason}"}
         data = await _get_request_json(request)
-        operator = _get_request_operator(request)
-        return await self.web_api.approve_application(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
+        return await self.web_api.approve_application(data, actor_id=operator, actor_role=role)
 
     async def _web_reject(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
+        ok, role, reason = await self.auth.authorize_action(operator, "reject")
+        if not ok:
+            return {"status": "error", "retcode": 403, "message": f"Forbidden: {reason}"}
         data = await _get_request_json(request)
-        operator = _get_request_operator(request)
-        return await self.web_api.reject_application(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
+        return await self.web_api.reject_application(data, actor_id=operator, actor_role=role)
 
     async def _web_users(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
         gid = _get_query_param(request, "group_id")
         uid = _get_query_param(request, "user_id")
         status = _get_query_param(request, "status")
-        return await self.web_api.list_users(group_id=gid, user_id=uid, status=status)
+        bid = _get_query_param(request, "bot_self_id")
+        return await self.web_api.list_users(group_id=gid, user_id=uid, status=status, bot_self_id=bid)
 
     async def _web_manual_grant(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
         data = await _get_request_json(request)
-        operator = _get_request_operator(request)
-        return await self.web_api.manual_grant(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
+        is_level_exempt = parse_bool(data.get("is_level_exempt", False))
+        ok, role, reason = await self.auth.authorize_action(operator, "grant", is_level_exempt=is_level_exempt)
+        if not ok:
+            return {"status": "error", "retcode": 403, "message": f"Forbidden: {reason}"}
+        return await self.web_api.manual_grant(data, actor_id=operator, actor_role=role)
 
     async def _web_revoke_grant(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
+        ok, role, reason = await self.auth.authorize_action(operator, "revoke")
+        if not ok:
+            return {"status": "error", "retcode": 403, "message": f"Forbidden: {reason}"}
         data = await _get_request_json(request)
-        operator = _get_request_operator(request)
-        return await self.web_api.revoke_grant(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
+        return await self.web_api.revoke_grant(data, actor_id=operator, actor_role=role)
 
     async def _web_ban(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
+        ok, role, reason = await self.auth.authorize_action(operator, "ban")
+        if not ok:
+            return {"status": "error", "retcode": 403, "message": f"Forbidden: {reason}"}
         data = await _get_request_json(request)
-        operator = _get_request_operator(request)
-        return await self.web_api.ban_user(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
+        return await self.web_api.ban_user(data, actor_id=operator, actor_role=role)
 
     async def _web_unban(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
+        ok, role, reason = await self.auth.authorize_action(operator, "unban")
+        if not ok:
+            return {"status": "error", "retcode": 403, "message": f"Forbidden: {reason}"}
         data = await _get_request_json(request)
-        operator = _get_request_operator(request)
-        return await self.web_api.unban_user(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
+        return await self.web_api.unban_user(data, actor_id=operator, actor_role=role)
 
     async def _web_groups(self) -> dict[str, Any]:
-        return await self.web_api.list_groups()
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
+        bid = _get_query_param(request, "bot_self_id")
+        return await self.web_api.list_groups(bot_self_id=bid)
 
     async def _web_update_group(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
+        ok, role, reason = await self.auth.authorize_action(operator, "update_group")
+        if not ok:
+            return {"status": "error", "retcode": 403, "message": f"Forbidden: {reason}"}
         data = await _get_request_json(request)
         return await self.web_api.update_group_policy(data)
 
     async def _web_audit_logs(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
         gid = _get_query_param(request, "group_id")
         uid = _get_query_param(request, "user_id")
         action = _get_query_param(request, "action")
-        return await self.web_api.list_audit_logs(group_id=gid, user_id=uid, action=action)
+        bid = _get_query_param(request, "bot_self_id")
+        return await self.web_api.list_audit_logs(group_id=gid, user_id=uid, action=action, bot_self_id=bid)
+
+    async def _web_export_audit_logs(self) -> dict[str, Any]:
+        operator = self.auth.get_authenticated_user(request)
+        if not operator:
+            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
+        ok, role, reason = await self.auth.authorize_action(operator, "export_logs")
+        if not ok:
+            return {"status": "error", "retcode": 403, "message": f"Forbidden: {reason}"}
+        fmt = str(_get_query_param(request, "format", "json")).strip().lower()
+        gid = _get_query_param(request, "group_id")
+        bid = _get_query_param(request, "bot_self_id")
+        action = _get_query_param(request, "action")
+        content = await self.web_api.export_audit_logs(format_type=fmt, bot_self_id=bid, group_id=gid, action=action)
+        return {"status": "ok", "retcode": 0, "format": fmt, "data": content}
 
     # --- Priority 50 Admission Gate ---
     @filter.event_message_type(filter.EventMessageType.ALL, priority=50)
@@ -370,7 +443,13 @@ class GroupApprovalPlugin(Star):
         Runs at priority=50, after GroupGuardian (100) and before normal plugins (0).
         """
         # Ignore non-message events (e.g. notices, requests, lifecycle events)
-        if getattr(event, "message_obj", None) is None:
+        msg_obj = getattr(event, "message_obj", None)
+        if msg_obj is None:
+            return
+
+        # Check post_type: strictly scope gate to QQ chat messages
+        post_type = getattr(msg_obj, "post_type", None) or getattr(event, "post_type", None)
+        if post_type and str(post_type).strip().lower() != "message":
             return
 
         bot_self_id = str(event.get_self_id() or getattr(getattr(event, "message_obj", None), "self_id", "default")).strip()

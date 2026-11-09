@@ -84,6 +84,12 @@ body {
   border: 1px solid var(--success);
 }
 
+.status-badge.warning {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--warning);
+  border: 1px solid var(--warning);
+}
+
 /* Nav Tabs */
 .app-nav {
   display: flex;
