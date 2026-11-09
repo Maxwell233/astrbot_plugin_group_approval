@@ -20,6 +20,7 @@ class Database:
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
         self._tx_lock = asyncio.Lock()
+        self._in_transaction = False
 
     async def init(self) -> None:
         """Initialize connection, pragmas, and run schema migrations."""
@@ -55,12 +56,15 @@ class Database:
         async with self._tx_lock:
             conn = await self.get_connection()
             await conn.execute("BEGIN IMMEDIATE;")
+            self._in_transaction = True
             try:
                 yield conn
                 await conn.commit()
             except Exception:
                 await conn.rollback()
                 raise
+            finally:
+                self._in_transaction = False
 
     async def close(self) -> None:
         """Close connection cleanly."""
@@ -69,25 +73,48 @@ class Database:
                 await self._conn.close()
                 self._conn = None
 
-    async def execute(self, query: str, parameters: tuple[Any, ...] = ()) -> aiosqlite.Cursor:
-        conn = await self.get_connection()
-        return await conn.execute(query, parameters)
+    async def execute(
+        self,
+        query: str,
+        parameters: tuple[Any, ...] = (),
+        conn: aiosqlite.Connection | None = None,
+    ) -> aiosqlite.Cursor:
+        c = conn if conn is not None else await self.get_connection()
+        return await c.execute(query, parameters)
 
-    async def executemany(self, query: str, parameters: list[tuple[Any, ...]]) -> aiosqlite.Cursor:
-        conn = await self.get_connection()
-        return await conn.executemany(query, parameters)
+    async def executemany(
+        self,
+        query: str,
+        parameters: list[tuple[Any, ...]],
+        conn: aiosqlite.Connection | None = None,
+    ) -> aiosqlite.Cursor:
+        c = conn if conn is not None else await self.get_connection()
+        return await c.executemany(query, parameters)
 
-    async def fetchone(self, query: str, parameters: tuple[Any, ...] = ()) -> aiosqlite.Row | None:
-        conn = await self.get_connection()
-        async with conn.execute(query, parameters) as cursor:
+    async def fetchone(
+        self,
+        query: str,
+        parameters: tuple[Any, ...] = (),
+        conn: aiosqlite.Connection | None = None,
+    ) -> aiosqlite.Row | None:
+        c = conn if conn is not None else await self.get_connection()
+        async with c.execute(query, parameters) as cursor:
             return await cursor.fetchone()
 
-    async def fetchall(self, query: str, parameters: tuple[Any, ...] = ()) -> list[aiosqlite.Row]:
-        conn = await self.get_connection()
-        async with conn.execute(query, parameters) as cursor:
+    async def fetchall(
+        self,
+        query: str,
+        parameters: tuple[Any, ...] = (),
+        conn: aiosqlite.Connection | None = None,
+    ) -> list[aiosqlite.Row]:
+        c = conn if conn is not None else await self.get_connection()
+        async with c.execute(query, parameters) as cursor:
             return await cursor.fetchall()
 
     async def commit(self) -> None:
+        if self._in_transaction:
+            # Prevent manual commits from prematurely ending a managed transaction
+            return
         conn = await self.get_connection()
         await conn.commit()
 

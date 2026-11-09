@@ -6,6 +6,7 @@ import asyncio
 import logging
 import random
 import time
+import uuid
 
 from .audit_service import AuditService
 from .config import PluginConfig
@@ -364,6 +365,7 @@ class ApprovalService:
             level=lvl_res.level,
             min_level=policy.min_level,
             recipients=admin_recipients,
+            bot_self_id=b_id,
             fallback_group=self.config.notifications.fallback_group_id,
         )
 
@@ -394,9 +396,9 @@ class ApprovalService:
             if current_status != "PENDING":
                 return False, f"该申请已被处理（当前状态：{current_status}）"
 
-            # Real-time expiration check
+            # Real-time expiration check (expires_at <= now)
             exp_at = row["expires_at"]
-            if exp_at > 0 and exp_at < now:
+            if exp_at > 0 and exp_at <= now:
                 await self.db.execute(
                     "UPDATE applications SET status = 'EXPIRED' WHERE id = ? AND status = 'PENDING'",
                     (app_id,),
@@ -437,7 +439,7 @@ class ApprovalService:
 
             grant_id = f"G{app_id.removeprefix('A')}"
 
-            # 4. Atomic transaction update
+            # 4. Atomic transaction update (Application + Grant + Audit + Outbox Notification)
             try:
                 async with self.db.transaction():
                     # Update application
@@ -487,31 +489,32 @@ class ApprovalService:
                             now,
                         ),
                     )
+
+                    # Audit log inside same transaction
+                    await self.audit.log(
+                        actor_id=str(actor_id),
+                        actor_type=actor_role,
+                        bot_self_id=bot_self_id,
+                        group_id=group_id,
+                        target_user_id=user_id,
+                        action="APPLICATION_APPROVED",
+                        old_state="PENDING",
+                        new_state="APPROVED",
+                        request_id=app_id,
+                        details={"grant_id": grant_id, "note": note, "verified_level": lvl_res.level},
+                    )
+
+                    # Enqueue user notification outbox inside same transaction
+                    await self.notifications.notify_user_result(
+                        user_id=user_id,
+                        group_id=group_id,
+                        approved=True,
+                        note=note,
+                        bot_self_id=bot_self_id,
+                    )
             except Exception as e:
                 logger.error(f"Transaction failed during approve_application {app_id}: {e}")
                 return False, f"数据库事务异常：{e}"
-
-        # 5. Audit log
-        await self.audit.log(
-            actor_id=str(actor_id),
-            actor_type=actor_role,
-            bot_self_id=bot_self_id,
-            group_id=group_id,
-            target_user_id=user_id,
-            action="APPLICATION_APPROVED",
-            old_state="PENDING",
-            new_state="APPROVED",
-            request_id=app_id,
-            details={"grant_id": grant_id, "note": note, "verified_level": lvl_res.level},
-        )
-
-        # 6. Notify user
-        await self.notifications.notify_user_result(
-            user_id=user_id,
-            group_id=group_id,
-            approved=True,
-            note=note,
-        )
 
         return True, f"已成功批准申请 {app_id}，用户 {user_id} 已获得本群 Bot 使用权限！"
 
@@ -535,9 +538,9 @@ class ApprovalService:
             if current_status != "PENDING":
                 return False, f"该申请已被处理（当前状态：{current_status}）"
 
-            # Real-time expiration check
+            # Real-time expiration check (expires_at <= now)
             exp_at = row["expires_at"]
-            if exp_at > 0 and exp_at < now:
+            if exp_at > 0 and exp_at <= now:
                 await self.db.execute(
                     "UPDATE applications SET status = 'EXPIRED' WHERE id = ? AND status = 'PENDING'",
                     (app_id,),
@@ -558,28 +561,27 @@ class ApprovalService:
                     """,
                     (now, str(actor_id).strip(), reason, app_id),
                 )
-
-        # Audit log
-        await self.audit.log(
-            actor_id=str(actor_id),
-            actor_type=actor_role,
-            bot_self_id=bot_self_id,
-            group_id=group_id,
-            target_user_id=user_id,
-            action="APPLICATION_REJECTED",
-            old_state="PENDING",
-            new_state="REJECTED",
-            request_id=app_id,
-            details={"reason": reason},
-        )
-
-        # Notify user
-        await self.notifications.notify_user_result(
-            user_id=user_id,
-            group_id=group_id,
-            approved=False,
-            note=reason,
-        )
+                # Audit log
+                await self.audit.log(
+                    actor_id=str(actor_id),
+                    actor_type=actor_role,
+                    bot_self_id=bot_self_id,
+                    group_id=group_id,
+                    target_user_id=user_id,
+                    action="APPLICATION_REJECTED",
+                    old_state="PENDING",
+                    new_state="REJECTED",
+                    request_id=app_id,
+                    details={"reason": reason},
+                )
+                # Notify user
+                await self.notifications.notify_user_result(
+                    user_id=user_id,
+                    group_id=group_id,
+                    approved=False,
+                    note=reason,
+                    bot_self_id=bot_self_id,
+                )
 
         return True, f"已拒绝申请 {app_id}（原因：{reason or '未说明'}）"
 
@@ -687,7 +689,7 @@ class ApprovalService:
         actual_level = existing.last_verified_level if existing else 0
 
         exp_at = (now + duration_days * 86400) if duration_days > 0 else 0
-        grant_id = f"G_MANUAL_{int(time.time()) % 100000}"
+        grant_id = f"G_MANUAL_{uuid.uuid4().hex[:12]}"
         grant_type = "LEVEL_EXEMPTION" if is_level_exempt else "OWNER_MANUAL"
 
         async with self._action_lock:
@@ -699,6 +701,7 @@ class ApprovalService:
                     grant_type, is_level_exempt
                 ) VALUES (?, ?, ?, ?, 'ACTIVE', 'MANUAL', ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(bot_self_id, group_id, user_id) DO UPDATE SET
+                    id = excluded.id,
                     status = 'ACTIVE',
                     source_application_id = 'MANUAL',
                     approved_by = excluded.approved_by,
@@ -728,18 +731,17 @@ class ApprovalService:
                         1 if is_level_exempt else 0,
                     ),
                 )
-
-        await self.audit.log(
-            actor_id=str(actor_id),
-            actor_type=actor_role,
-            bot_self_id=b_id,
-            group_id=g_id,
-            target_user_id=u_id,
-            action="MANUAL_GRANT",
-            old_state=None,
-            new_state="ACTIVE",
-            details={"duration_days": duration_days, "note": note},
-        )
+                await self.audit.log(
+                    actor_id=str(actor_id),
+                    actor_type=actor_role,
+                    bot_self_id=b_id,
+                    group_id=g_id,
+                    target_user_id=u_id,
+                    action="MANUAL_GRANT",
+                    old_state=None,
+                    new_state="ACTIVE",
+                    details={"grant_id": grant_id, "duration_days": duration_days, "note": note},
+                )
         return True, f"已手动向用户 {u_id} 授予群 {g_id} 的 Bot 使用权限（有效期：{'永久' if duration_days == 0 else f'{duration_days}天'}）"
 
     async def ban_user(
@@ -919,16 +921,16 @@ class ApprovalService:
             logger.warning(f"Could not sync reviewers from db: {e}")
 
     async def clean_expired(self) -> tuple[int, int]:
-        """Expire stale applications and expired grants."""
+        """Expire stale applications and expired grants (expires_at <= now)."""
         now = int(time.time())
         # Expire pending applications past expires_at
         c1 = await self.db.execute(
-            "UPDATE applications SET status = 'EXPIRED' WHERE status = 'PENDING' AND expires_at > 0 AND expires_at < ?",
+            "UPDATE applications SET status = 'EXPIRED' WHERE status = 'PENDING' AND expires_at > 0 AND expires_at <= ?",
             (now,),
         )
         # Expire active grants past expires_at
         c2 = await self.db.execute(
-            "UPDATE grants SET status = 'EXPIRED' WHERE status = 'ACTIVE' AND expires_at > 0 AND expires_at < ?",
+            "UPDATE grants SET status = 'EXPIRED' WHERE status = 'ACTIVE' AND expires_at > 0 AND expires_at <= ?",
             (now,),
         )
         await self.db.commit()

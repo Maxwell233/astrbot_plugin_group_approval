@@ -107,30 +107,38 @@ class AccessService:
                     force_refresh=True,
                 )
                 if lvl_res.success and lvl_res.is_member and lvl_res.level >= policy.min_level:
-                    # Automatically restore grant
-                    await self.db.execute(
+                    # Automatically restore grant (only if currently SUSPENDED, never revive REVOKED or EXPIRED)
+                    cursor = await self.db.execute(
                         """
                         UPDATE grants
                         SET status = 'ACTIVE', last_verified_level = ?, last_verified_at = ?, suspend_reason = NULL
-                        WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
+                        WHERE bot_self_id = ? AND group_id = ? AND user_id = ? AND status = 'SUSPENDED'
                         """,
                         (lvl_res.level, now, b_id, g_id, u_id),
                     )
                     await self.db.commit()
-                    await self.audit.log(
-                        actor_id="SYSTEM",
-                        actor_type="SYSTEM",
-                        bot_self_id=b_id,
-                        group_id=g_id,
-                        target_user_id=u_id,
-                        action="GRANT_AUTOMATICALLY_RESTORED",
-                        old_state="SUSPENDED",
-                        new_state="ACTIVE",
-                        details={"recovered_level": lvl_res.level, "min_level": policy.min_level},
-                    )
-                    grant.status = GrantStatus.ACTIVE
-                    grant.last_verified_level = lvl_res.level
-                    grant.last_verified_at = now
+                    if cursor.rowcount > 0:
+                        await self.audit.log(
+                            actor_id="SYSTEM",
+                            actor_type="SYSTEM",
+                            bot_self_id=b_id,
+                            group_id=g_id,
+                            target_user_id=u_id,
+                            action="GRANT_AUTOMATICALLY_RESTORED",
+                            old_state="SUSPENDED",
+                            new_state="ACTIVE",
+                            details={"recovered_level": lvl_res.level, "min_level": policy.min_level},
+                        )
+                        grant.status = GrantStatus.ACTIVE
+                        grant.last_verified_level = lvl_res.level
+                        grant.last_verified_at = now
+                    else:
+                        # Grant was not in SUSPENDED state (e.g. revoked or expired concurrently)
+                        return AccessDecision(
+                            allowed=False,
+                            reason="GRANT_NOT_ACTIVE",
+                            minimum_level=policy.min_level,
+                        )
                 else:
                     return AccessDecision(
                         allowed=False,
@@ -159,10 +167,10 @@ class AccessService:
                 last_verified_at=grant.last_verified_at,
             )
 
-        # 8. Check grant expiration
-        if grant.expires_at > 0 and now > grant.expires_at:
+        # 8. Check grant expiration (expires_at <= now)
+        if grant.expires_at > 0 and now >= grant.expires_at:
             await self.db.execute(
-                "UPDATE grants SET status = 'EXPIRED' WHERE bot_self_id = ? AND group_id = ? AND user_id = ?",
+                "UPDATE grants SET status = 'EXPIRED' WHERE bot_self_id = ? AND group_id = ? AND user_id = ? AND status = 'ACTIVE'",
                 (b_id, g_id, u_id),
             )
             await self.db.commit()

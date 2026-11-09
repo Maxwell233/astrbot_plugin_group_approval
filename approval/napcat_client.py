@@ -27,12 +27,28 @@ def normalize_onebot_response(resp: Any) -> tuple[bool, dict[str, Any] | None, s
         return True, {"message_id": resp}, "", 0
 
     if isinstance(resp, dict):
-        # 1. Standard OneBot v11 wrapped format with 'retcode' or 'status'
-        if "retcode" in resp or "status" in resp:
-            retcode = resp.get("retcode", 0)
-            status = str(resp.get("status", "")).lower()
+        # 1. Direct message send result (has message_id)
+        if "message_id" in resp:
+            return True, resp, "", 0
 
-            if status == "ok" or retcode == 0:
+        # 2. Standard OneBot v11 wrapped format with 'retcode' or 'status'
+        if "retcode" in resp or "status" in resp:
+            has_status = "status" in resp
+            has_retcode = "retcode" in resp
+            status_val = str(resp.get("status", "")).strip().lower() if has_status else None
+            retcode_val = resp.get("retcode") if has_retcode else None
+
+            is_ok = True
+            if has_status and status_val != "ok":
+                is_ok = False
+            if has_retcode:
+                try:
+                    if int(retcode_val) != 0:
+                        is_ok = False
+                except (ValueError, TypeError):
+                    is_ok = False
+
+            if is_ok and (has_status or has_retcode):
                 data = resp.get("data")
                 if data is None:
                     # In some OneBot actions, payload is at root
@@ -42,14 +58,14 @@ def normalize_onebot_response(resp: Any) -> tuple[bool, dict[str, Any] | None, s
                     return True, data, "", 0
                 return True, {"value": data}, "", 0
             else:
-                msg = resp.get("msg") or resp.get("message") or f"OneBot API error (retcode={retcode})"
-                return False, None, str(msg), int(retcode) if isinstance(retcode, int) else -4
+                msg = resp.get("msg") or resp.get("message") or f"OneBot API error (retcode={retcode_val})"
+                try:
+                    code = int(retcode_val) if retcode_val is not None else -4
+                except (ValueError, TypeError):
+                    code = -4
+                return False, None, str(msg), code
 
-        # 2. Direct unpacked dictionary returned by some AstrBot adapters
-        # Check for message send result (has message_id)
-        if "message_id" in resp:
-            return True, resp, "", 0
-
+        # 3. Direct unpacked dictionary returned by some AstrBot adapters
         # Check for member info dictionary (has user_id, group_id, or level)
         if "user_id" in resp or "group_id" in resp or "level" in resp:
             return True, resp, "", 0
@@ -135,25 +151,46 @@ class NapCatClient:
             if callable(get_insts):
                 insts = get_insts()
                 for inst in insts:
-                    adapter_type = getattr(inst, "adapter_type", "") or getattr(inst, "platform_name", "")
-                    if "aiocqhttp" in str(adapter_type).lower():
+                    # Resolve platform name via official meta() or adapter_type
+                    p_name = ""
+                    meta_fn = getattr(inst, "meta", None)
+                    if callable(meta_fn):
+                        try:
+                            meta_obj = meta_fn()
+                            name_val = getattr(meta_obj, "name", "")
+                            if isinstance(name_val, str) and name_val:
+                                p_name = name_val.lower()
+                        except Exception:
+                            pass
+                    if not p_name:
+                        for attr in ("adapter_type", "platform_name"):
+                            val = getattr(inst, attr, None)
+                            if isinstance(val, str) and val:
+                                p_name = val.lower()
+                                break
+
+                    if "aiocqhttp" in p_name or "onebot" in p_name:
                         client = getattr(inst, "get_client", lambda: None)()
                         if client is None:
                             client = getattr(inst, "bot", None)
 
                         if client is not None:
-                            if not target_bid:
-                                return client
-                            # Match bot_self_id
                             c_self_id = str(
                                 getattr(client, "self_id", None)
                                 or getattr(inst, "self_id", None)
                                 or ""
                             ).strip()
+
+                            if not target_bid:
+                                return client
                             if c_self_id == target_bid:
                                 return client
 
-        # Try context.get_platform("aiocqhttp")
+        # If a specific target bot was requested and not found, strictly do NOT fallback
+        if target_bid:
+            return None
+
+        # Fallback to get_platform only if no specific bot was requested
         get_platform = getattr(self._context, "get_platform", None)
         if callable(get_platform):
             try:

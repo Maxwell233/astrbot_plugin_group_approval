@@ -35,19 +35,22 @@ class NotificationService:
         recipient_id: str,
         channel: str,
         payload: str,
+        bot_self_id: str = "",
         fallback_group: str = "",
     ) -> int:
-        """Enqueue a message into the persistent outbox table with deduplication."""
+        """Enqueue a message into the persistent outbox table with deduplication and bot routing."""
         now = int(time.time())
         sql = """
         INSERT INTO notification_outbox (
-            event_key, recipient_id, channel, payload, status, attempts, next_retry_at, created_at
-        ) VALUES (?, ?, ?, ?, 'PENDING', 0, ?, ?)
+            event_key, recipient_id, bot_self_id, fallback_group, channel, payload, status, attempts, next_retry_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)
         ON CONFLICT(event_key) DO NOTHING
         """
         params = (
             str(event_key).strip(),
             str(recipient_id).strip(),
+            str(bot_self_id).strip(),
+            str(fallback_group).strip(),
             str(channel).strip().lower(),
             payload,
             now,
@@ -65,6 +68,7 @@ class NotificationService:
         level: int,
         min_level: int,
         recipients: list[str],
+        bot_self_id: str = "",
         fallback_group: str = "",
     ) -> None:
         """Enqueue application notice to reviewer private messages. Fallback group only used on failure."""
@@ -88,6 +92,7 @@ class NotificationService:
                     recipient_id=admin_qq,
                     channel="private",
                     payload=msg,
+                    bot_self_id=bot_self_id,
                     fallback_group=fallback_group,
                 )
 
@@ -99,6 +104,7 @@ class NotificationService:
                 recipient_id=str(fallback_group).strip(),
                 channel="group",
                 payload=msg,
+                bot_self_id=bot_self_id,
             )
 
     async def notify_user_result(
@@ -107,6 +113,7 @@ class NotificationService:
         group_id: str,
         approved: bool,
         note: str = "",
+        bot_self_id: str = "",
     ) -> None:
         """Notify user of approval or rejection result."""
         if approved:
@@ -129,13 +136,15 @@ class NotificationService:
             recipient_id=user_id,
             channel="private",
             payload=msg,
+            bot_self_id=bot_self_id,
+            fallback_group=group_id,
         )
 
     async def process_outbox_once(self) -> int:
         """Process one batch of pending notifications."""
         now = int(time.time())
         sql = """
-        SELECT id, event_key, recipient_id, channel, payload, status, attempts, next_retry_at
+        SELECT id, event_key, recipient_id, bot_self_id, fallback_group, channel, payload, status, attempts, next_retry_at
         FROM notification_outbox
         WHERE status = 'PENDING' AND next_retry_at <= ?
         ORDER BY id ASC
@@ -147,19 +156,27 @@ class NotificationService:
         for r in rows:
             outbox_id = r["id"]
             recipient = r["recipient_id"]
+            bot_self_id = str(r["bot_self_id"] or "").strip()
+            fallback_group = str(r["fallback_group"] or "").strip()
             channel = r["channel"]
             payload = r["payload"]
             attempts = r["attempts"] + 1
 
-            # Dispatch notification
+            # Dispatch notification with specific bot routing
             success = False
             last_error = ""
 
+            target_bot = bot_self_id if bot_self_id else None
+
             try:
                 if channel == "private":
-                    ok, data, err_msg, retcode = await self.client.send_private_msg(recipient, payload)
+                    ok, data, err_msg, retcode = await self.client.send_private_msg(
+                        recipient, payload, bot_self_id=target_bot
+                    )
                 else:
-                    ok, data, err_msg, retcode = await self.client.send_group_msg(recipient, payload)
+                    ok, data, err_msg, retcode = await self.client.send_group_msg(
+                        recipient, payload, bot_self_id=target_bot
+                    )
 
                 if ok:
                     success = True
@@ -175,10 +192,38 @@ class NotificationService:
                 )
             else:
                 if attempts >= self.max_retries:
-                    await self.db.execute(
-                        "UPDATE notification_outbox SET status = 'FAILED', attempts = ?, last_error = ? WHERE id = ?",
-                        (attempts, last_error, outbox_id),
-                    )
+                    # Final retry failed; check if fallback to group is available
+                    fallback_success = False
+                    if channel == "private" and fallback_group:
+                        logger.warning(
+                            f"Private notification {outbox_id} failed after {attempts} attempts. "
+                            f"Attempting fallback to group {fallback_group}."
+                        )
+                        try:
+                            fb_payload = f"【Bot 权限通知（私聊受阻转群通知）】\n{payload}"
+                            fb_ok, _, fb_err, _ = await self.client.send_group_msg(
+                                group_id=fallback_group,
+                                message=fb_payload,
+                                bot_self_id=target_bot,
+                            )
+                            if fb_ok:
+                                fallback_success = True
+                                last_error = f"{last_error} (Delivered via fallback group {fallback_group})"
+                            else:
+                                last_error = f"{last_error} (Fallback to group {fallback_group} failed: {fb_err})"
+                        except Exception as fb_exc:
+                            last_error = f"{last_error} (Fallback exception: {fb_exc})"
+
+                    if fallback_success:
+                        await self.db.execute(
+                            "UPDATE notification_outbox SET status = 'SENT', attempts = ?, sent_at = ?, last_error = ? WHERE id = ?",
+                            (attempts, int(time.time()), last_error, outbox_id),
+                        )
+                    else:
+                        await self.db.execute(
+                            "UPDATE notification_outbox SET status = 'FAILED', attempts = ?, last_error = ? WHERE id = ?",
+                            (attempts, last_error, outbox_id),
+                        )
                 else:
                     backoff = self.retry_interval_seconds * (2 ** (attempts - 1))
                     next_retry = int(time.time()) + backoff

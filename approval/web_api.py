@@ -13,6 +13,22 @@ from .database import Database
 logger = logging.getLogger("astrbot_plugin_group_approval.web_api")
 
 
+def parse_bool(val: Any, default: bool = False) -> bool:
+    """Strict boolean coercion avoiding 'false' == True pitfalls."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val != 0
+    s = str(val).strip().lower()
+    if s in ("true", "1", "yes", "on", "t"):
+        return True
+    if s in ("false", "0", "no", "off", "f"):
+        return False
+    return default
+
+
 class WebApiHandler:
     """Provides REST endpoints consumed by the Plugin Pages dashboard."""
 
@@ -53,15 +69,15 @@ class WebApiHandler:
         # Also query known bot IDs from group_policies and grants
         p_rows = await self.db.fetchall("SELECT DISTINCT bot_self_id FROM group_policies")
         for r in p_rows:
-            if r["bot_self_id"]:
-                bots.add(r["bot_self_id"])
+            bid = str(r["bot_self_id"] or "").strip()
+            if bid and bid != "default":
+                bots.add(bid)
         g_rows = await self.db.fetchall("SELECT DISTINCT bot_self_id FROM grants")
         for r in g_rows:
-            if r["bot_self_id"]:
-                bots.add(r["bot_self_id"])
+            bid = str(r["bot_self_id"] or "").strip()
+            if bid and bid != "default":
+                bots.add(bid)
 
-        if not bots:
-            bots.add("default")
         return self.ok({"bots": sorted(list(bots))})
 
     async def get_dashboard_stats(self) -> dict[str, Any]:
@@ -120,12 +136,16 @@ class WebApiHandler:
         group_id: str | None = None,
         status: str | None = None,
         user_id: str | None = None,
+        bot_self_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
         """Fetch applications with filtering."""
         clauses = []
         params = []
+        if bot_self_id:
+            clauses.append("bot_self_id = ?")
+            params.append(bot_self_id.strip())
         if group_id:
             clauses.append("group_id = ?")
             params.append(group_id.strip())
@@ -204,12 +224,16 @@ class WebApiHandler:
         group_id: str | None = None,
         user_id: str | None = None,
         status: str | None = None,
+        bot_self_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
         """List user grants."""
         clauses = []
         params = []
+        if bot_self_id:
+            clauses.append("bot_self_id = ?")
+            params.append(bot_self_id.strip())
         if group_id:
             clauses.append("group_id = ?")
             params.append(group_id.strip())
@@ -224,7 +248,7 @@ class WebApiHandler:
         sql = f"""
         SELECT id, bot_self_id, group_id, user_id, status, source_application_id,
                approved_by, approved_at, expires_at, last_verified_level, last_verified_at,
-               suspend_reason, revoked_by, revoked_at
+               suspend_reason, revoked_by, revoked_at, grant_type, is_level_exempt
         FROM grants
         {where}
         ORDER BY approved_at DESC
@@ -245,10 +269,10 @@ class WebApiHandler:
         """API handler for manual grant."""
         group_id = str(payload.get("group_id", "")).strip()
         user_id = str(payload.get("user_id", "")).strip()
-        bot_self_id = str(payload.get("bot_self_id", "default")).strip()
+        bot_self_id = str(payload.get("bot_self_id", "")).strip() or "default"
         duration_days = int(payload.get("duration_days", 0))
         note = str(payload.get("note", "Dashboard手动授权")).strip()
-        is_level_exempt = bool(payload.get("is_level_exempt", False))
+        is_level_exempt = parse_bool(payload.get("is_level_exempt", False))
 
         if not group_id or not user_id:
             return self.err("缺少 group_id 或 user_id 参数")
@@ -350,36 +374,60 @@ class WebApiHandler:
             return self.err(msg)
         return self.ok({"message": msg})
 
-    async def list_groups(self) -> dict[str, Any]:
-        """List configured group policies."""
-        rows = await self.db.fetchall("SELECT * FROM group_policies ORDER BY created_at DESC")
+    async def list_groups(self, bot_self_id: str | None = None) -> dict[str, Any]:
+        """List configured group policies with optional bot_self_id filter."""
+        if bot_self_id:
+            rows = await self.db.fetchall(
+                "SELECT * FROM group_policies WHERE bot_self_id = ? ORDER BY created_at DESC",
+                (bot_self_id.strip(),),
+            )
+        else:
+            rows = await self.db.fetchall("SELECT * FROM group_policies ORDER BY created_at DESC")
         return self.ok({"groups": [dict(r) for r in rows]})
 
     async def update_group_policy(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Update or insert group policy."""
+        """Update or insert group policy with strict parameter validation."""
         group_id = str(payload.get("group_id", "")).strip()
-        bot_self_id = str(payload.get("bot_self_id", "default")).strip()
+        bot_self_id = str(payload.get("bot_self_id", "")).strip() or "default"
 
         if not group_id:
             return self.err("缺少 group_id 参数")
 
         pol = await self.approval.get_group_policy(bot_self_id, group_id)
         if "enabled" in payload:
-            pol.enabled = bool(payload["enabled"])
+            pol.enabled = parse_bool(payload["enabled"])
         if "min_level" in payload:
-            pol.min_level = int(payload["min_level"])
+            try:
+                lvl = int(payload["min_level"])
+                if lvl < 0:
+                    return self.err("min_level 不能为负数")
+                pol.min_level = lvl
+            except (ValueError, TypeError):
+                return self.err("min_level 必须为有效整数")
         if "approval_required" in payload:
-            pol.approval_required = bool(payload["approval_required"])
+            pol.approval_required = parse_bool(payload["approval_required"])
         if "grant_duration_days" in payload:
-            pol.grant_duration_seconds = int(payload["grant_duration_days"]) * 86400
+            try:
+                days = int(payload["grant_duration_days"])
+                if days < 0:
+                    return self.err("grant_duration_days 不能为负数")
+                pol.grant_duration_seconds = days * 86400
+            except (ValueError, TypeError):
+                return self.err("grant_duration_days 必须为有效整数")
         if "recheck_interval_seconds" in payload:
-            pol.recheck_interval_seconds = int(payload["recheck_interval_seconds"])
+            try:
+                interval = int(payload["recheck_interval_seconds"])
+                if interval < 10:
+                    return self.err("recheck_interval_seconds 不能小于 10 秒")
+                pol.recheck_interval_seconds = interval
+            except (ValueError, TypeError):
+                return self.err("recheck_interval_seconds 必须为有效整数")
         if "restore_policy" in payload:
             pol.restore_policy = str(payload["restore_policy"])
         if "owner_bypass" in payload:
-            pol.owner_bypass = bool(payload["owner_bypass"])
+            pol.owner_bypass = parse_bool(payload["owner_bypass"])
         if "group_admin_bypass" in payload:
-            pol.group_admin_bypass = bool(payload["group_admin_bypass"])
+            pol.group_admin_bypass = parse_bool(payload["group_admin_bypass"])
 
         await self.approval.save_group_policy(pol)
         return self.ok({"message": f"群 {group_id} 策略已更新", "policy": pol.to_dict()})
@@ -389,11 +437,13 @@ class WebApiHandler:
         group_id: str | None = None,
         user_id: str | None = None,
         action: str | None = None,
+        bot_self_id: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
         """Fetch audit log entries."""
         logs = await self.audit.query(
+            bot_self_id=bot_self_id,
             group_id=group_id,
             target_user_id=user_id,
             action=action,
@@ -402,8 +452,25 @@ class WebApiHandler:
         )
         return self.ok({"audit_logs": [e.to_dict() for e in logs]})
 
-    async def export_audit_logs(self, format_type: str = "json") -> str:
-        """Export audit logs as JSON or CSV."""
+    async def export_audit_logs(
+        self,
+        format_type: str = "json",
+        bot_self_id: str | None = None,
+        group_id: str | None = None,
+        action: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        limit: int = 5000,
+    ) -> str:
+        """Export audit logs as JSON or CSV with multi-criteria filtering."""
+        kwargs: dict[str, Any] = {
+            "bot_self_id": bot_self_id,
+            "group_id": group_id,
+            "action": action,
+            "start_time": start_time,
+            "end_time": end_time,
+            "limit": limit,
+        }
         if format_type.lower() == "csv":
-            return await self.audit.export_csv(limit=5000)
-        return await self.audit.export_json(limit=5000)
+            return await self.audit.export_csv(**kwargs)
+        return await self.audit.export_json(**kwargs)

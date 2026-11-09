@@ -13,8 +13,8 @@ from .napcat_client import NapCatClient, normalize_onebot_response
 
 logger = logging.getLogger("astrbot_plugin_group_approval.level")
 
-# Regex to safely extract integers from level string (e.g., "LV18" -> 18, "18" -> 18)
-LEVEL_REGEX = re.compile(r"(\d+)")
+# Regex to strictly parse level strings (e.g., "LV18", "lv 18", "等级18", "18")
+STRICT_LEVEL_REGEX = re.compile(r"^(?:LV|lv|Lv|等级)?\s*(\d+)$")
 
 
 class LevelService:
@@ -35,6 +35,7 @@ class LevelService:
         """Strictly parse member level.
 
         Returns integer if valid, or None if invalid/missing.
+        Rejects arbitrary messy strings like 'rank_999_user'.
         """
         if raw_level is None:
             return None
@@ -46,8 +47,8 @@ class LevelService:
         if not raw_str:
             return None
 
-        # Check for numeric or LV-prefixed format
-        match = LEVEL_REGEX.search(raw_str)
+        # Check for numeric or LV-prefixed format strictly
+        match = STRICT_LEVEL_REGEX.match(raw_str)
         if match:
             try:
                 return int(match.group(1))
