@@ -118,6 +118,10 @@ class Grant:
     suspend_reason: str | None = None
     revoked_by: str | None = None
     revoked_at: int | None = None
+    # Optimistic-concurrency counter. Every state transition increments it; automatic
+    # transitions must condition on the revision they read so they can never overwrite
+    # an administrator's concurrent revoke/ban.
+    revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
