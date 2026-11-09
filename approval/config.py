@@ -27,6 +27,11 @@ class NotificationConfig:
     retry_enabled: bool = True
     max_retries: int = 5
     retry_interval_seconds: int = 60
+    # Privacy: applicant notifications are private-only by default. A group fallback is
+    # opt-in and, when enabled, only ever sends ``user_group_fallback_text`` (a short
+    # non-sensitive reminder), never the review note/reason.
+    user_group_fallback_enabled: bool = False
+    user_group_fallback_text: str = ""
 
 
 @dataclass
@@ -82,6 +87,8 @@ class PluginConfig:
             retry_enabled=bool(notif_raw.get("retry_enabled", True)),
             max_retries=int(notif_raw.get("max_retries", 5)),
             retry_interval_seconds=int(notif_raw.get("retry_interval_seconds", 60)),
+            user_group_fallback_enabled=bool(notif_raw.get("user_group_fallback_enabled", False)),
+            user_group_fallback_text=str(notif_raw.get("user_group_fallback_text", "")).strip(),
         )
 
         # Parse security

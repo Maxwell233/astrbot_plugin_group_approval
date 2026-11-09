@@ -2,16 +2,26 @@ name: Tests
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, "fix/**" ]
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
+  # Fast, hermetic unit/service test job. AstrBot is NOT installed here, so
+  # tests/test_framework_handler_order.py is collected and skipped automatically
+  # (pytest.importorskip("astrbot") at module level).
   test:
-    runs-on: ubuntu-latest
+    name: Unit tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.12"]
+        include:
+          - { os: ubuntu-latest, python-version: "3.12" }
+          - { os: ubuntu-latest, python-version: "3.13" }
+          - { os: windows-latest, python-version: "3.12" }
 
     steps:
       - name: Checkout code
@@ -29,10 +39,54 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-asyncio ruff
 
-      - name: Run Ruff Lint
-        run: |
-          ruff check .
+      - name: Run Ruff
+        run: ruff check .
 
-      - name: Run Pytest
+      - name: Run unit/service tests
+        run: python -m pytest -q -p no:cacheprovider
+
+  # Real AstrBot framework-registry tests: install the actual framework and run
+  # ONLY tests/test_framework_handler_order.py (real decorators, real global
+  # star_handlers_registry, real AstrMessageEvent / stop_event semantics).
+  #
+  # This job is intentionally BLOCKING (no continue-on-error): the local PyPI
+  # install of AstrBot==4.29.4 takes ~50s and resolves on macOS arm64 / Python
+  # 3.13, so a framework-ordering regression must fail CI rather than be ignored.
+  # Do not claim this job is green until it has actually run on GitHub.
+  framework-integration:
+    name: Real AstrBot framework integration (AstrBot 4.29.4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install framework test dependencies
         run: |
-          pytest -v
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "AstrBot==4.29.4"
+          pip install pytest pytest-asyncio
+
+      - name: Verify real AstrBot is importable
+        run: |
+          python -c "import astrbot; print('AstrBot', astrbot.__version__)"
+          python -c "from astrbot.core.star.star_handler import star_handlers_registry; print(type(star_handlers_registry))"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test Dashboard Bot targeting
+        run: node --test tests/dashboard_bot_scope.test.cjs
+
+      - name: Run real-framework component tests
+        run: python -m pytest tests/test_framework_handler_order.py -q -p no:cacheprovider

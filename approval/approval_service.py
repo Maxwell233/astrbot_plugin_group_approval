@@ -6,6 +6,7 @@ import asyncio
 import logging
 import random
 import time
+import uuid
 
 from .audit_service import AuditService
 from .config import PluginConfig
@@ -168,6 +169,7 @@ class ApprovalService:
         if row is None:
             return None
 
+        keys = row.keys() if hasattr(row, "keys") else ()
         grant = Grant(
             id=row["id"],
             bot_self_id=row["bot_self_id"],
@@ -183,6 +185,9 @@ class ApprovalService:
             suspend_reason=row["suspend_reason"],
             revoked_by=row["revoked_by"],
             revoked_at=row["revoked_at"],
+            grant_type=row["grant_type"] if "grant_type" in keys else "LEVEL_APPROVAL",
+            is_level_exempt=bool(row["is_level_exempt"]) if "is_level_exempt" in keys else False,
+            revision=int(row["revision"]) if "revision" in keys else 0,
         )
         return grant
 
@@ -238,9 +243,9 @@ class ApprovalService:
             return False, "当前群尚未开启 Bot 使用准入机制", None
 
         # 2. Check blacklist
-        is_banned, ban_reason = await self.is_blacklisted(b_id, g_id, u_id)
+        is_banned, _ = await self.is_blacklisted(b_id, g_id, u_id)
         if is_banned:
-            return False, f"申请被拒绝：{ban_reason}", None
+            return False, "申请被拒绝：您当前在黑名单中", None
 
         # 3. Check existing active grant
         grant = await self.get_active_grant(b_id, g_id, u_id)
@@ -256,10 +261,11 @@ class ApprovalService:
 
         # 5. Check reject cooldown
         now = int(time.time())
+
         cooldown_sec = self.config.application.reject_cooldown_hours * 3600
         recent_reject = await self.db.fetchone(
             """
-            SELECT reviewed_at, review_note FROM applications
+            SELECT reviewed_at FROM applications
             WHERE bot_self_id = ? AND group_id = ? AND user_id = ? AND status = 'REJECTED'
             ORDER BY reviewed_at DESC LIMIT 1
             """,
@@ -271,11 +277,12 @@ class ApprovalService:
                 hours_left = max(1, int((cooldown_sec - passed) / 3600))
                 return (
                     False,
-                    f"申请冷却中：您最近的申请曾被拒绝（原因：{recent_reject['review_note'] or '未说明'}），请在 {hours_left} 小时后再试",
+                    f"申请冷却中：您最近的申请曾被拒绝，请在 {hours_left} 小时后再试",
                     None,
                 )
 
-        # 6. Query real member level from NapCat with force_refresh=True
+        # 6. Query real member level from NapCat with force_refresh=True (network I/O
+        #    happens strictly before the write transaction).
         lvl_res = await self.level_service.get_group_member_level(
             bot_id=b_id,
             group_id=g_id,
@@ -294,28 +301,70 @@ class ApprovalService:
                 None,
             )
 
-        # 8. Create application record
+        # 8. Create application record atomically with the rate-limit reservation, the
+        #    audit entry and the admin outbox notifications.
+        rate_key = f"rate:user:{b_id}:{g_id}:{u_id}"
+        rate_limit = getattr(self.config.application, "rate_limit_per_hour", 5)
+        exp_sec = self.config.application.expire_hours * 3600
+        expires_at = now + exp_sec
+
+        failure: tuple[bool, str, Application | None] | None = None
+        app_id = ""
         async with self._action_lock:
-            # Re-check under lock
-            pending = await self.get_pending_application(b_id, g_id, u_id)
-            if pending is not None:
-                return False, f"您已有待审核的申请（编号：{pending.id}）", pending
+            async with self.db.transaction():
+                # Re-check pending under the write lock (unique index also guards this).
+                pending = await self.get_pending_application(b_id, g_id, u_id)
+                if pending is not None:
+                    failure = (False, f"您已有待审核的申请（编号：{pending.id}）", pending)
+                elif rate_limit > 0 and not await self.check_and_increment_rate_limit(
+                    rate_key, rate_limit, window_seconds=3600
+                ):
+                    failure = (
+                        False,
+                        f"申请过于频繁：每小时最多提交 {rate_limit} 次申请，请稍后再试",
+                        None,
+                    )
+                else:
+                    app_id = await self._generate_app_id()
+                    await self.db.execute(
+                        """
+                        INSERT INTO applications (
+                            id, bot_self_id, group_id, user_id, level_at_application,
+                            status, reason, created_at, expires_at
+                        ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
+                        """,
+                        (app_id, b_id, g_id, u_id, lvl_res.level, reason, now, expires_at),
+                    )
+                    await self.audit.log(
+                        actor_id=u_id,
+                        actor_type="USER",
+                        bot_self_id=b_id,
+                        group_id=g_id,
+                        target_user_id=u_id,
+                        action="APPLICATION_SUBMITTED",
+                        old_state=None,
+                        new_state="PENDING",
+                        request_id=app_id,
+                        details={"level": lvl_res.level, "min_level": policy.min_level, "reason": reason},
+                    )
+                    admin_recipients = (
+                        list(set(self.config.owner_qq_ids + self.config.reviewer_qq_ids))
+                        if self.config.notifications.reviewer_private_message
+                        else []
+                    )
+                    await self.notifications.notify_admins_of_application(
+                        app_id=app_id,
+                        user_id=u_id,
+                        group_id=g_id,
+                        level=lvl_res.level,
+                        min_level=policy.min_level,
+                        recipients=admin_recipients,
+                        bot_self_id=b_id,
+                        fallback_group=self.config.notifications.fallback_group_id,
+                    )
 
-            app_id = await self._generate_app_id()
-            exp_sec = self.config.application.expire_hours * 3600
-            expires_at = now + exp_sec
-
-            sql = """
-            INSERT INTO applications (
-                id, bot_self_id, group_id, user_id, level_at_application,
-                status, reason, created_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
-            """
-            await self.db.execute(
-                sql,
-                (app_id, b_id, g_id, u_id, lvl_res.level, reason, now, expires_at),
-            )
-            await self.db.commit()
+        if failure is not None:
+            return failure
 
         app = Application(
             id=app_id,
@@ -327,32 +376,6 @@ class ApprovalService:
             reason=reason,
             created_at=now,
             expires_at=expires_at,
-        )
-
-        # 9. Audit log
-        await self.audit.log(
-            actor_id=u_id,
-            actor_type="USER",
-            bot_self_id=b_id,
-            group_id=g_id,
-            target_user_id=u_id,
-            action="APPLICATION_SUBMITTED",
-            old_state=None,
-            new_state="PENDING",
-            request_id=app_id,
-            details={"level": lvl_res.level, "min_level": policy.min_level, "reason": reason},
-        )
-
-        # 10. Notify admins
-        admin_recipients = list(set(self.config.owner_qq_ids + self.config.reviewer_qq_ids))
-        await self.notifications.notify_admins_of_application(
-            app_id=app_id,
-            user_id=u_id,
-            group_id=g_id,
-            level=lvl_res.level,
-            min_level=policy.min_level,
-            recipients=admin_recipients,
-            fallback_group=self.config.notifications.fallback_group_id,
         )
 
         return (
@@ -367,28 +390,43 @@ class ApprovalService:
         actor_role: str,
         application_id: str,
         note: str = "",
+        *,
+        expected_bot_self_id: str | None = None,
     ) -> tuple[bool, str]:
-        """Approve an application with atomic SQLite transaction and concurrency protection."""
+        """Approve an application atomically.
+
+        A successful approval atomically performs, inside ONE explicit SQLite
+        transaction: re-validate the application (status + expiry), update it to
+        APPROVED, upsert the grant, write the audit log and enqueue the user
+        notification in the outbox. Any failure rolls all of it back.
+
+        Network I/O (the live group-level lookup) is performed *before* the write
+        transaction opens, so a slow NapCat API call never holds the SQLite write lock.
+        """
         app_id = str(application_id).strip()
-        now = int(time.time())
 
         async with self._action_lock:
-            # 1. Fetch application
+            # 1. Read-only snapshot for validation and for the network level lookup.
             row = await self.db.fetchone("SELECT * FROM applications WHERE id = ?", (app_id,))
-            if row is None:
-                return False, f"申请编号 {app_id} 不存在"
+            if row is None or (expected_bot_self_id is not None and row["bot_self_id"] != expected_bot_self_id):
+                return False, f"未找到申请编号 {app_id}。"
 
             current_status = row["status"]
             if current_status != "PENDING":
                 return False, f"该申请已被处理（当前状态：{current_status}）"
 
+            now = int(time.time())
+            exp_at = int(row["expires_at"])
+            if exp_at > 0 and exp_at <= now:
+                await self._mark_application_expired(app_id)
+                return False, f"该申请已于 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(exp_at))} 过期失效，无法批准"
+
             bot_self_id = row["bot_self_id"]
             group_id = row["group_id"]
             user_id = row["user_id"]
 
-            policy = await self.get_group_policy(bot_self_id, group_id)
-
-            # 2. Force re-check current member level and group membership before granting
+            # 2. Force re-check current member level and group membership before granting.
+            #    This is network I/O and must stay outside the write transaction.
             lvl_res = await self.level_service.get_group_member_level(
                 bot_id=bot_self_id,
                 group_id=group_id,
@@ -402,95 +440,130 @@ class ApprovalService:
                     f"批准失败：无法获取用户当前群成员信息（可能已退群，错误码：{lvl_res.error_code}）",
                 )
 
-            if lvl_res.level < policy.min_level:
-                return (
-                    False,
-                    f"批准失败：用户当前群等级 (LV{lvl_res.level}) 低于本群门槛 (LV{policy.min_level})",
-                )
-
-            # 3. Calculate grant expiration
-            grant_exp = 0
-            if policy.grant_duration_seconds > 0:
-                grant_exp = now + policy.grant_duration_seconds
-
             grant_id = f"G{app_id.removeprefix('A')}"
 
-            # 4. Atomic transaction update
+            # 4. Single atomic transaction: Application + Grant + Audit + Outbox.
+            #    The try/except is OUTSIDE the transaction context: an exception first
+            #    rolls the transaction back, then is converted into the documented
+            #    (False, message) service contract instead of leaking a traceback to QQ.
+            failure: str | None = None
             try:
-                # Update application
-                await self.db.execute(
-                    """
-                    UPDATE applications
-                    SET status = 'APPROVED', reviewed_at = ?, reviewer_id = ?, review_note = ?
-                    WHERE id = ? AND status = 'PENDING'
-                    """,
-                    (now, str(actor_id).strip(), note, app_id),
-                )
+                async with self.db.transaction():
+                    # Re-validate under the write lock: the row may have changed while the
+                    # network level lookup above was in flight.
+                    fresh = await self.db.fetchone(
+                        "SELECT status, expires_at FROM applications WHERE id = ? AND bot_self_id = ?",
+                        (app_id, bot_self_id),
+                    )
+                    policy = await self.get_group_policy(bot_self_id, group_id)
+                    blacklisted, _ = await self.is_blacklisted(bot_self_id, group_id, user_id)
+                    now = int(time.time())
+                    if fresh is None:
+                        failure = f"申请编号 {app_id} 不存在"
+                    elif fresh["status"] != "PENDING":
+                        failure = f"该申请已被处理（当前状态：{fresh['status']}）"
+                    elif int(fresh["expires_at"]) > 0 and int(fresh["expires_at"]) <= now:
+                        await self.db.execute(
+                            "UPDATE applications SET status = 'EXPIRED' WHERE id = ? AND status = 'PENDING'",
+                            (app_id,),
+                        )
+                        failure = "该申请已过期失效，无法批准"
+                    elif not policy.enabled:
+                        failure = "批准失败：该群的准入已禁用"
+                    elif blacklisted:
+                        failure = "批准失败：用户当前在黑名单中"
+                    elif lvl_res.level < policy.min_level:
+                        failure = (
+                            f"批准失败：用户当前群等级 (LV{lvl_res.level}) 低于本群门槛 (LV{policy.min_level})"
+                        )
+                    else:
+                        grant_exp = now + policy.grant_duration_seconds if policy.grant_duration_seconds > 0 else 0
+                        cursor = await self.db.execute(
+                            """
+                            UPDATE applications
+                            SET status = 'APPROVED', reviewed_at = ?, reviewer_id = ?, review_note = ?
+                            WHERE id = ? AND status = 'PENDING'
+                            """,
+                            (now, str(actor_id).strip(), note, app_id),
+                        )
+                        if cursor.rowcount != 1:
+                            failure = "该申请状态已被其他操作变更，批准失败"
+                        else:
+                            await self.db.execute(
+                                """
+                                INSERT INTO grants (
+                                    id, bot_self_id, group_id, user_id, status, source_application_id,
+                                    approved_by, approved_at, expires_at, last_verified_level, last_verified_at,
+                                    suspend_reason, revoked_by, revoked_at, grant_type, is_level_exempt
+                                ) VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'LEVEL_APPROVAL', 0)
+                                ON CONFLICT(bot_self_id, group_id, user_id) DO UPDATE SET
+                                    id = excluded.id,
+                                    status = 'ACTIVE',
+                                    source_application_id = excluded.source_application_id,
+                                    approved_by = excluded.approved_by,
+                                    approved_at = excluded.approved_at,
+                                    expires_at = excluded.expires_at,
+                                    last_verified_level = excluded.last_verified_level,
+                                    last_verified_at = excluded.last_verified_at,
+                                    suspend_reason = NULL,
+                                    revoked_by = NULL,
+                                    revoked_at = NULL,
+                                    grant_type = 'LEVEL_APPROVAL',
+                                    is_level_exempt = 0,
+                                    revision = revision + 1
+                                """,
+                                (
+                                    grant_id,
+                                    bot_self_id,
+                                    group_id,
+                                    user_id,
+                                    app_id,
+                                    str(actor_id).strip(),
+                                    now,
+                                    grant_exp,
+                                    lvl_res.level,
+                                    now,
+                                ),
+                            )
 
-                # Upsert grant
-                sql_grant = """
-                INSERT INTO grants (
-                    id, bot_self_id, group_id, user_id, status, source_application_id,
-                    approved_by, approved_at, expires_at, last_verified_level, last_verified_at,
-                    suspend_reason, revoked_by, revoked_at
-                ) VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
-                ON CONFLICT(bot_self_id, group_id, user_id) DO UPDATE SET
-                    id = excluded.id,
-                    status = 'ACTIVE',
-                    source_application_id = excluded.source_application_id,
-                    approved_by = excluded.approved_by,
-                    approved_at = excluded.approved_at,
-                    expires_at = excluded.expires_at,
-                    last_verified_level = excluded.last_verified_level,
-                    last_verified_at = excluded.last_verified_at,
-                    suspend_reason = NULL,
-                    revoked_by = NULL,
-                    revoked_at = NULL
-                """
-                await self.db.execute(
-                    sql_grant,
-                    (
-                        grant_id,
-                        bot_self_id,
-                        group_id,
-                        user_id,
-                        app_id,
-                        str(actor_id).strip(),
-                        now,
-                        grant_exp,
-                        lvl_res.level,
-                        now,
-                    ),
-                )
-                await self.db.commit()
+                            await self.audit.log(
+                                actor_id=str(actor_id),
+                                actor_type=actor_role,
+                                bot_self_id=bot_self_id,
+                                group_id=group_id,
+                                target_user_id=user_id,
+                                action="APPLICATION_APPROVED",
+                                old_state="PENDING",
+                                new_state="APPROVED",
+                                request_id=app_id,
+                                details={"grant_id": grant_id, "note": note, "verified_level": lvl_res.level},
+                            )
+
+                            # Outbox row only; delivery happens after commit via the worker.
+                            await self.notifications.notify_user_result(
+                                user_id=user_id,
+                                group_id=group_id,
+                                approved=True,
+                                note=note,
+                                bot_self_id=bot_self_id,
+                                event_id=app_id,
+                            )
             except Exception as e:
-                await self.db.rollback()
-                logger.error(f"Transaction failed during approve_application {app_id}: {e}")
+                logger.exception("Atomic approval transaction failed for %s", app_id)
                 return False, f"数据库事务异常：{e}"
 
-        # 5. Audit log
-        await self.audit.log(
-            actor_id=str(actor_id),
-            actor_type=actor_role,
-            bot_self_id=bot_self_id,
-            group_id=group_id,
-            target_user_id=user_id,
-            action="APPLICATION_APPROVED",
-            old_state="PENDING",
-            new_state="APPROVED",
-            request_id=app_id,
-            details={"grant_id": grant_id, "note": note, "verified_level": lvl_res.level},
-        )
-
-        # 6. Notify user
-        await self.notifications.notify_user_result(
-            user_id=user_id,
-            group_id=group_id,
-            approved=True,
-            note=note,
-        )
+            if failure is not None:
+                return False, failure
 
         return True, f"已成功批准申请 {app_id}，用户 {user_id} 已获得本群 Bot 使用权限！"
+
+    async def _mark_application_expired(self, app_id: str) -> None:
+        """Idempotently mark a pending application as EXPIRED in its own transaction."""
+        async with self.db.transaction():
+            await self.db.execute(
+                "UPDATE applications SET status = 'EXPIRED' WHERE id = ? AND status = 'PENDING'",
+                (app_id,),
+            )
 
     async def reject_application(
         self,
@@ -498,55 +571,84 @@ class ApprovalService:
         actor_role: str,
         application_id: str,
         reason: str = "",
+        *,
+        expected_bot_self_id: str | None = None,
     ) -> tuple[bool, str]:
         """Reject an application."""
         app_id = str(application_id).strip()
-        now = int(time.time())
 
         async with self._action_lock:
             row = await self.db.fetchone("SELECT * FROM applications WHERE id = ?", (app_id,))
-            if row is None:
-                return False, f"申请编号 {app_id} 不存在"
+            if row is None or (expected_bot_self_id is not None and row["bot_self_id"] != expected_bot_self_id):
+                return False, f"未找到申请编号 {app_id}。"
 
             current_status = row["status"]
             if current_status != "PENDING":
                 return False, f"该申请已被处理（当前状态：{current_status}）"
 
+            # Real-time expiration check (expires_at <= now)
+            now = int(time.time())
+            exp_at = int(row["expires_at"])
+            if exp_at > 0 and exp_at <= now:
+                await self._mark_application_expired(app_id)
+                return False, "该申请已过期失效，无需拒绝"
+
             bot_self_id = row["bot_self_id"]
             group_id = row["group_id"]
             user_id = row["user_id"]
 
-            await self.db.execute(
-                """
-                UPDATE applications
-                SET status = 'REJECTED', reviewed_at = ?, reviewer_id = ?, review_note = ?
-                WHERE id = ? AND status = 'PENDING'
-                """,
-                (now, str(actor_id).strip(), reason, app_id),
-            )
-            await self.db.commit()
+            failure: str | None = None
+            async with self.db.transaction():
+                fresh = await self.db.fetchone(
+                    "SELECT status, expires_at FROM applications WHERE id = ? AND bot_self_id = ?",
+                        (app_id, bot_self_id),
+                )
+                now = int(time.time())
+                if fresh is None:
+                    failure = f"申请编号 {app_id} 不存在"
+                elif fresh["status"] != "PENDING":
+                    failure = f"该申请已被处理（当前状态：{fresh['status']}）"
+                elif int(fresh["expires_at"]) > 0 and int(fresh["expires_at"]) <= now:
+                    await self.db.execute(
+                        "UPDATE applications SET status = 'EXPIRED' WHERE id = ? AND status = 'PENDING'",
+                        (app_id,),
+                    )
+                    failure = "该申请已过期失效，无需拒绝"
+                else:
+                    cursor = await self.db.execute(
+                        """
+                        UPDATE applications
+                        SET status = 'REJECTED', reviewed_at = ?, reviewer_id = ?, review_note = ?
+                        WHERE id = ? AND status = 'PENDING'
+                        """,
+                        (now, str(actor_id).strip(), reason, app_id),
+                    )
+                    if cursor.rowcount != 1:
+                        failure = "该申请状态已被其他操作变更，拒绝失败"
+                    else:
+                        await self.audit.log(
+                            actor_id=str(actor_id),
+                            actor_type=actor_role,
+                            bot_self_id=bot_self_id,
+                            group_id=group_id,
+                            target_user_id=user_id,
+                            action="APPLICATION_REJECTED",
+                            old_state="PENDING",
+                            new_state="REJECTED",
+                            request_id=app_id,
+                            details={"reason": reason},
+                        )
+                        await self.notifications.notify_user_result(
+                            user_id=user_id,
+                            group_id=group_id,
+                            approved=False,
+                            note=reason,
+                            bot_self_id=bot_self_id,
+                            event_id=app_id,
+                        )
 
-        # Audit log
-        await self.audit.log(
-            actor_id=str(actor_id),
-            actor_type=actor_role,
-            bot_self_id=bot_self_id,
-            group_id=group_id,
-            target_user_id=user_id,
-            action="APPLICATION_REJECTED",
-            old_state="PENDING",
-            new_state="REJECTED",
-            request_id=app_id,
-            details={"reason": reason},
-        )
-
-        # Notify user
-        await self.notifications.notify_user_result(
-            user_id=user_id,
-            group_id=group_id,
-            approved=False,
-            note=reason,
-        )
+            if failure is not None:
+                return False, failure
 
         return True, f"已拒绝申请 {app_id}（原因：{reason or '未说明'}）"
 
@@ -561,23 +663,28 @@ class ApprovalService:
             if app is None:
                 return False, "您在当前群没有正在等待审核的申请"
 
-            await self.db.execute(
-                "UPDATE applications SET status = 'CANCELLED' WHERE id = ? AND status = 'PENDING'",
-                (app.id,),
-            )
-            await self.db.commit()
+            cancelled = False
+            async with self.db.transaction():
+                cursor = await self.db.execute(
+                    "UPDATE applications SET status = 'CANCELLED' WHERE id = ? AND status = 'PENDING'",
+                    (app.id,),
+                )
+                cancelled = cursor.rowcount > 0
+                if cancelled:
+                    await self.audit.log(
+                        actor_id=u_id,
+                        actor_type="USER",
+                        bot_self_id=b_id,
+                        group_id=g_id,
+                        target_user_id=u_id,
+                        action="APPLICATION_CANCELLED",
+                        old_state="PENDING",
+                        new_state="CANCELLED",
+                        request_id=app.id,
+                    )
 
-        await self.audit.log(
-            actor_id=u_id,
-            actor_type="USER",
-            bot_self_id=b_id,
-            group_id=g_id,
-            target_user_id=u_id,
-            action="APPLICATION_CANCELLED",
-            old_state="PENDING",
-            new_state="CANCELLED",
-            request_id=app.id,
-        )
+        if not cancelled:
+            return False, "该申请状态已变更，取消失败"
         return True, f"您的申请（编号：{app.id}）已成功取消"
 
     async def revoke_grant(
@@ -601,27 +708,37 @@ class ApprovalService:
                 return False, f"用户 {u_id} 在群 {g_id} 并没有有效的授权记录"
 
             old_state = grant.status.value
-            await self.db.execute(
-                """
-                UPDATE grants
-                SET status = 'REVOKED', revoked_by = ?, revoked_at = ?, suspend_reason = ?
-                WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
-                """,
-                (str(actor_id).strip(), now, reason, b_id, g_id, u_id),
-            )
-            await self.db.commit()
+            revoked = False
+            async with self.db.transaction():
+                # Revision-guarded revoke: administrator revoke outranks any automatic
+                # transition. If a background check changed the row after we read it we
+                # re-read and fail rather than clobbering the newer state.
+                cursor = await self.db.execute(
+                    """
+                    UPDATE grants
+                    SET status = 'REVOKED', revoked_by = ?, revoked_at = ?, suspend_reason = ?,
+                        revision = revision + 1
+                    WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
+                      AND status IN ('ACTIVE', 'SUSPENDED') AND revision = ?
+                    """,
+                    (str(actor_id).strip(), now, reason, b_id, g_id, u_id, grant.revision),
+                )
+                revoked = cursor.rowcount > 0
+                if revoked:
+                    await self.audit.log(
+                        actor_id=str(actor_id),
+                        actor_type=actor_role,
+                        bot_self_id=b_id,
+                        group_id=g_id,
+                        target_user_id=u_id,
+                        action="GRANT_REVOKED",
+                        old_state=old_state,
+                        new_state="REVOKED",
+                        details={"reason": reason},
+                    )
 
-        await self.audit.log(
-            actor_id=str(actor_id),
-            actor_type=actor_role,
-            bot_self_id=b_id,
-            group_id=g_id,
-            target_user_id=u_id,
-            action="GRANT_REVOKED",
-            old_state=old_state,
-            new_state="REVOKED",
-            details={"reason": reason},
-        )
+        if not revoked:
+            return False, f"撤销失败：用户 {u_id} 的授权状态已被其他操作变更，请刷新后重试"
         return True, f"已成功撤销用户 {u_id} 在群 {g_id} 的使用权限"
 
     async def grant_manually(
@@ -633,55 +750,89 @@ class ApprovalService:
         user_id: str,
         duration_days: int = 0,
         note: str = "",
+        is_level_exempt: bool = False,
     ) -> tuple[bool, str]:
         """Manually grant access without an application."""
         b_id = str(bot_self_id).strip()
         g_id = str(group_id).strip()
         u_id = str(user_id).strip()
-        now = int(time.time())
 
-        # Check blacklist
-        is_banned, ban_reason = await self.is_blacklisted(b_id, g_id, u_id)
-        if is_banned:
-            return False, f"手动授权失败：该用户处于黑名单中（{ban_reason}）"
+        if is_level_exempt and actor_role != "OWNER":
+            return False, "权限不足：仅机器人主人(OWNER)可以授予免等级检查权限"
 
-        exp_at = (now + duration_days * 86400) if duration_days > 0 else 0
-        grant_id = f"G_MANUAL_{int(time.time()) % 100000}"
+        grant_id = f"G_MANUAL_{uuid.uuid4().hex[:12]}"
+        grant_type = "LEVEL_EXEMPTION" if is_level_exempt else "OWNER_MANUAL"
 
         async with self._action_lock:
-            sql = """
-            INSERT INTO grants (
-                id, bot_self_id, group_id, user_id, status, source_application_id,
-                approved_by, approved_at, expires_at, last_verified_level, last_verified_at
-            ) VALUES (?, ?, ?, ?, 'ACTIVE', 'MANUAL', ?, ?, ?, 999, ?)
-            ON CONFLICT(bot_self_id, group_id, user_id) DO UPDATE SET
-                status = 'ACTIVE',
-                source_application_id = 'MANUAL',
-                approved_by = excluded.approved_by,
-                approved_at = excluded.approved_at,
-                expires_at = excluded.expires_at,
-                last_verified_at = excluded.last_verified_at,
-                suspend_reason = NULL,
-                revoked_by = NULL,
-                revoked_at = NULL
-            """
-            await self.db.execute(
-                sql,
-                (grant_id, b_id, g_id, u_id, str(actor_id).strip(), now, exp_at, now),
+            # Force a live membership check before opening the SQLite write transaction.
+            lvl_res = await self.level_service.get_group_member_level(
+                bot_id=b_id, group_id=g_id, user_id=u_id, force_refresh=True,
             )
-            await self.db.commit()
+            if not lvl_res.success or not lvl_res.is_member:
+                return False, "手动授权失败：无法核验用户当前群成员身份或等级"
+            verified_at = int(time.time())
 
-        await self.audit.log(
-            actor_id=str(actor_id),
-            actor_type=actor_role,
-            bot_self_id=b_id,
-            group_id=g_id,
-            target_user_id=u_id,
-            action="MANUAL_GRANT",
-            old_state=None,
-            new_state="ACTIVE",
-            details={"duration_days": duration_days, "note": note},
-        )
+            async with self.db.transaction():
+                is_banned, ban_reason = await self.is_blacklisted(b_id, g_id, u_id)
+                if is_banned:
+                    return False, f"手动授权失败：该用户处于黑名单中（{ban_reason}）"
+                policy = await self.get_group_policy(b_id, g_id)
+                if not policy.enabled:
+                    return False, "手动授权失败：该群的准入已禁用"
+                if not is_level_exempt and lvl_res.level < policy.min_level:
+                    return False, f"手动授权失败：当前群等级 LV{lvl_res.level} 低于门槛 LV{policy.min_level}"
+
+                now = int(time.time())
+                exp_at = now + duration_days * 86400 if duration_days > 0 else 0
+                sql = """
+                INSERT INTO grants (
+                    id, bot_self_id, group_id, user_id, status, source_application_id,
+                    approved_by, approved_at, expires_at, last_verified_level, last_verified_at,
+                    grant_type, is_level_exempt
+                ) VALUES (?, ?, ?, ?, 'ACTIVE', 'MANUAL', ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(bot_self_id, group_id, user_id) DO UPDATE SET
+                    id = excluded.id,
+                    status = 'ACTIVE',
+                    source_application_id = 'MANUAL',
+                    approved_by = excluded.approved_by,
+                    approved_at = excluded.approved_at,
+                    expires_at = excluded.expires_at,
+                    last_verified_level = excluded.last_verified_level,
+                    last_verified_at = excluded.last_verified_at,
+                    suspend_reason = NULL,
+                    revoked_by = NULL,
+                    revoked_at = NULL,
+                    grant_type = excluded.grant_type,
+                    is_level_exempt = excluded.is_level_exempt,
+                    revision = revision + 1
+                """
+                await self.db.execute(
+                    sql,
+                    (
+                        grant_id,
+                        b_id,
+                        g_id,
+                        u_id,
+                        str(actor_id).strip(),
+                        now,
+                        exp_at,
+                        lvl_res.level,
+                        verified_at,
+                        grant_type,
+                        1 if is_level_exempt else 0,
+                    ),
+                )
+                await self.audit.log(
+                    actor_id=str(actor_id),
+                    actor_type=actor_role,
+                    bot_self_id=b_id,
+                    group_id=g_id,
+                    target_user_id=u_id,
+                    action="MANUAL_GRANT",
+                    old_state=None,
+                    new_state="ACTIVE",
+                    details={"grant_id": grant_id, "duration_days": duration_days, "note": note},
+                )
         return True, f"已手动向用户 {u_id} 授予群 {g_id} 的 Bot 使用权限（有效期：{'永久' if duration_days == 0 else f'{duration_days}天'}）"
 
     async def ban_user(
@@ -703,34 +854,42 @@ class ApprovalService:
         exp_at = (now + duration_days * 86400) if duration_days > 0 else 0
 
         async with self._action_lock:
-            sql = """
-            INSERT INTO blacklist (bot_self_id, group_id, user_id, reason, created_by, created_at, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(bot_self_id, group_id, user_id) DO UPDATE SET
-                reason = excluded.reason,
-                created_by = excluded.created_by,
-                created_at = excluded.created_at,
-                expires_at = excluded.expires_at
-            """
-            await self.db.execute(sql, (b_id, g_id, u_id, reason, str(actor_id).strip(), now, exp_at))
+            async with self.db.transaction():
+                sql = """
+                INSERT INTO blacklist (bot_self_id, group_id, user_id, reason, created_by, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(bot_self_id, group_id, user_id) DO UPDATE SET
+                    reason = excluded.reason,
+                    created_by = excluded.created_by,
+                    created_at = excluded.created_at,
+                    expires_at = excluded.expires_at
+                """
+                await self.db.execute(sql, (b_id, g_id, u_id, reason, str(actor_id).strip(), now, exp_at))
 
-            # Revoke grant if active
-            await self.db.execute(
-                "UPDATE grants SET status = 'REVOKED', revoked_by = ?, revoked_at = ?, suspend_reason = 'BLACKLISTED' WHERE bot_self_id = ? AND group_id = ? AND user_id = ?",
-                (str(actor_id).strip(), now, b_id, g_id, u_id),
-            )
-            await self.db.commit()
+                # Revoke grant if active/suspended. Banning outranks automatic restore, and
+                # the revision counter is bumped so a level check that read the old row
+                # cannot overwrite this revoke.
+                await self.db.execute(
+                    """
+                    UPDATE grants
+                    SET status = 'REVOKED', revoked_by = ?, revoked_at = ?, suspend_reason = 'BLACKLISTED',
+                        revision = revision + 1
+                    WHERE bot_self_id = ? AND (group_id = ? OR ? = 'ALL') AND user_id = ?
+                      AND status IN ('ACTIVE', 'SUSPENDED')
+                    """,
+                    (str(actor_id).strip(), now, b_id, g_id, g_id, u_id),
+                )
+                await self.audit.log(
+                    actor_id=str(actor_id),
+                    actor_type=actor_role,
+                    bot_self_id=b_id,
+                    group_id=g_id,
+                    target_user_id=u_id,
+                    action="USER_BANNED",
+                    new_state="BLACKLISTED",
+                    details={"reason": reason, "duration_days": duration_days},
+                )
 
-        await self.audit.log(
-            actor_id=str(actor_id),
-            actor_type=actor_role,
-            bot_self_id=b_id,
-            group_id=g_id,
-            target_user_id=u_id,
-            action="USER_BANNED",
-            new_state="BLACKLISTED",
-            details={"reason": reason, "duration_days": duration_days},
-        )
         return True, f"已将用户 {u_id} 加入群 {g_id} 黑名单"
 
     async def unban_user(
@@ -741,45 +900,192 @@ class ApprovalService:
         group_id: str,
         user_id: str,
     ) -> tuple[bool, str]:
-        """Remove user from blacklist."""
+        """Remove user from blacklist. Separate group unban from global unban."""
         b_id = str(bot_self_id).strip()
         g_id = str(group_id).strip()
+        if g_id.upper() == "ALL":
+            g_id = "ALL"
         u_id = str(user_id).strip()
+        scope_desc = "全局" if g_id == "ALL" else f"群 {g_id}"
 
         async with self._action_lock:
-            cursor = await self.db.execute(
-                "DELETE FROM blacklist WHERE bot_self_id = ? AND (group_id = ? OR group_id = 'ALL') AND user_id = ?",
-                (b_id, g_id, u_id),
+            async with self.db.transaction():
+                cursor = await self.db.execute(
+                    "DELETE FROM blacklist WHERE bot_self_id = ? AND group_id = ? AND user_id = ?",
+                    (b_id, g_id, u_id),
+                )
+                if cursor.rowcount == 0:
+                    return False, f"用户 {u_id} 不在{scope_desc}的黑名单中"
+
+                await self.audit.log(
+                    actor_id=str(actor_id),
+                    actor_type=actor_role,
+                    bot_self_id=b_id,
+                    group_id=g_id,
+                    target_user_id=u_id,
+                    action="USER_UNBANNED",
+                    old_state="BLACKLISTED",
+                    new_state=None,
+                )
+        return True, f"已将用户 {u_id} 从{scope_desc}黑名单中移除"
+
+    async def check_and_increment_rate_limit(
+        self, key: str, max_count: int, window_seconds: int = 3600
+    ) -> bool:
+        """Atomically check and increment a fixed-window rate limit.
+
+        The read and the increment run inside one IMMEDIATE transaction, so two
+        concurrent applications cannot both read a below-limit count and both pass.
+        Re-entrant: when called from inside an outer transaction it joins it instead of
+        deadlocking, and the outer caller owns commit/rollback.
+        """
+        now = int(time.time())
+        async with self.db.transaction():
+            row = await self.db.fetchone(
+                "SELECT count, window_start FROM rate_limits WHERE key = ?",
+                (key,),
             )
-            await self.db.commit()
+            if row is None or (now - int(row["window_start"])) >= window_seconds:
+                await self.db.execute(
+                    """
+                    INSERT INTO rate_limits (key, count, window_start) VALUES (?, 1, ?)
+                    ON CONFLICT(key) DO UPDATE SET count = 1, window_start = excluded.window_start
+                    """,
+                    (key, now),
+                )
+                return True
 
-        if cursor.rowcount == 0:
-            return False, f"用户 {u_id} 不在群 {g_id} 的黑名单中"
+            if int(row["count"]) >= max_count:
+                return False
 
-        await self.audit.log(
-            actor_id=str(actor_id),
-            actor_type=actor_role,
-            bot_self_id=b_id,
-            group_id=g_id,
-            target_user_id=u_id,
-            action="USER_UNBANNED",
-            old_state="BLACKLISTED",
-            new_state=None,
+            await self.db.execute(
+                "UPDATE rate_limits SET count = count + 1 WHERE key = ?",
+                (key,),
+            )
+            return True
+
+    async def add_reviewer(self, qq_id: str, added_by: str = "") -> tuple[bool, str]:
+        """Persist a reviewer to SQLite and memory.
+
+        An explicit ADDED override is recorded so the decision survives restarts even if
+        the reviewer is not listed in the static config file.
+        """
+        u_id = str(qq_id).strip()
+        if not u_id:
+            return False, "审核员 QQ 号不能为空"
+        now = int(time.time())
+        if u_id not in self.config.reviewer_qq_ids:
+            self.config.reviewer_qq_ids.append(u_id)
+
+        async with self.db.transaction():
+            await self.db.execute(
+                """
+                INSERT INTO reviewers (qq_id, added_by, added_at) VALUES (?, ?, ?)
+                ON CONFLICT(qq_id) DO UPDATE SET added_by = excluded.added_by, added_at = excluded.added_at
+                """,
+                (u_id, str(added_by).strip(), now),
+            )
+            await self._set_reviewer_override(u_id, "ADDED", added_by, now)
+        return True, f"已成功将 QQ {u_id} 添加为审核员"
+
+    async def remove_reviewer(self, qq_id: str) -> tuple[bool, str]:
+        """Remove a reviewer from SQLite and memory, persistently.
+
+        A REMOVED override is recorded so a reviewer deleted by the owner cannot be
+        re-created at the next startup from a stale ``reviewer_qq_ids`` config entry.
+        """
+        u_id = str(qq_id).strip()
+        if not u_id:
+            return False, "审核员 QQ 号不能为空"
+        now = int(time.time())
+        if u_id in self.config.reviewer_qq_ids:
+            self.config.reviewer_qq_ids.remove(u_id)
+
+        async with self.db.transaction():
+            await self.db.execute("DELETE FROM reviewers WHERE qq_id = ?", (u_id,))
+            await self._set_reviewer_override(u_id, "REMOVED", "OWNER", now)
+        return True, f"已成功将 QQ {u_id} 从审核员名单中移除"
+
+    async def _set_reviewer_override(self, qq_id: str, action: str, changed_by: str, now: int) -> None:
+        await self.db.execute(
+            """
+            INSERT INTO reviewer_overrides (qq_id, action, changed_by, changed_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(qq_id) DO UPDATE SET
+                action = excluded.action,
+                changed_by = excluded.changed_by,
+                changed_at = excluded.changed_at
+            """,
+            (qq_id, action, str(changed_by).strip(), now),
         )
-        return True, f"已将用户 {u_id} 从黑名单中移除"
+
+    async def _removed_reviewer_ids(self) -> set[str]:
+        rows = await self.db.fetchall("SELECT qq_id FROM reviewer_overrides WHERE action = 'REMOVED'")
+        return {str(r["qq_id"]).strip() for r in rows}
+
+    async def is_reviewer(self, user_id: str) -> bool:
+        """Check if a QQ user is a reviewer or owner.
+
+        Precedence: owner > explicit REMOVED override > explicit ADDED override >
+        config seed > reviewers table.
+        """
+        u_id = str(user_id).strip()
+        if self.config.is_owner(u_id):
+            return True
+        override = await self.db.fetchone(
+            "SELECT action FROM reviewer_overrides WHERE qq_id = ?", (u_id,)
+        )
+        if override is not None:
+            return override["action"] == "ADDED"
+        if self.config.is_reviewer(u_id):
+            return True
+        row = await self.db.fetchone("SELECT qq_id FROM reviewers WHERE qq_id = ?", (u_id,))
+        return row is not None
+
+    async def list_reviewers(self) -> list[str]:
+        """List all effective reviewer QQ IDs (excluding owners' overrides is not needed)."""
+        rows = await self.db.fetchall("SELECT qq_id FROM reviewers")
+        db_reviewers = {str(r["qq_id"]).strip() for r in rows}
+        added_rows = await self.db.fetchall("SELECT qq_id FROM reviewer_overrides WHERE action = 'ADDED'")
+        added = {str(r["qq_id"]).strip() for r in added_rows}
+        removed = await self._removed_reviewer_ids()
+        combined = (set(self.config.reviewer_qq_ids) | db_reviewers | added) - removed
+        return sorted(x for x in combined if x)
+
+    async def sync_reviewers_from_db(self) -> None:
+        """Reconcile the in-memory reviewer list with persistent state at startup.
+
+        The config file is a seed, not an authority: if an owner removed a reviewer, the
+        REMOVED override wins and that reviewer is dropped from the in-memory list here
+        even if the config file still lists them.
+        """
+        try:
+            rows = await self.db.fetchall("SELECT qq_id FROM reviewers")
+            db_ids = {str(r["qq_id"]).strip() for r in rows if str(r["qq_id"]).strip()}
+            added_rows = await self.db.fetchall("SELECT qq_id FROM reviewer_overrides WHERE action = 'ADDED'")
+            added = {str(r["qq_id"]).strip() for r in added_rows}
+            removed = await self._removed_reviewer_ids()
+            merged = (set(self.config.reviewer_qq_ids) | db_ids | added) - removed
+            self.config.reviewer_qq_ids[:] = sorted(x for x in merged if x)
+        except Exception as e:
+            logger.warning(f"Could not sync reviewers from db: {e}")
 
     async def clean_expired(self) -> tuple[int, int]:
-        """Expire stale applications and expired grants."""
+        """Expire stale applications and expired grants (expires_at <= now).
+
+        Only ACTIVE grants may expire; a REVOKED or SUSPENDED grant is never touched.
+        The revision counter is bumped so an in-flight level check cannot resurrect it.
+        """
         now = int(time.time())
-        # Expire pending applications past expires_at
-        c1 = await self.db.execute(
-            "UPDATE applications SET status = 'EXPIRED' WHERE status = 'PENDING' AND expires_at > 0 AND expires_at < ?",
-            (now,),
-        )
-        # Expire active grants past expires_at
-        c2 = await self.db.execute(
-            "UPDATE grants SET status = 'EXPIRED' WHERE status = 'ACTIVE' AND expires_at > 0 AND expires_at < ?",
-            (now,),
-        )
-        await self.db.commit()
+        async with self.db.transaction():
+            # Expire pending applications past expires_at
+            c1 = await self.db.execute(
+                "UPDATE applications SET status = 'EXPIRED' WHERE status = 'PENDING' AND expires_at > 0 AND expires_at <= ?",
+                (now,),
+            )
+            # Expire active grants past expires_at
+            c2 = await self.db.execute(
+                "UPDATE grants SET status = 'EXPIRED', revision = revision + 1 WHERE status = 'ACTIVE' AND expires_at > 0 AND expires_at <= ?",
+                (now,),
+            )
         return c1.rowcount, c2.rowcount

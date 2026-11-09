@@ -22,6 +22,7 @@ class MockNapCatClient(NapCatClient):
     def __init__(self) -> None:
         super().__init__()
         # Key: (group_id, user_id) -> dict(level=..., role=..., is_member=..., error=...)
+        self.verified_bot_ids = ["10001"]
         self.members: dict[tuple[str, str], dict[str, Any]] = {}
         self.sent_private_messages: list[tuple[str, str]] = []
         self.sent_group_messages: list[tuple[str, str]] = []
@@ -48,7 +49,9 @@ class MockNapCatClient(NapCatClient):
         self,
         group_id: str,
         user_id: str,
+        bot_self_id: str | None = None,
         no_cache: bool = True,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         if self.timeout_on_next:
             self.timeout_on_next = False
@@ -89,11 +92,29 @@ class MockNapCatClient(NapCatClient):
             },
         }
 
-    async def send_private_msg(self, user_id: str, message: str) -> dict[str, Any]:
+    async def list_bots(self) -> list[str]:
+        return list(self.verified_bot_ids)
+
+    async def verify_bot(self, bot_self_id: str) -> bool:
+        return bot_self_id in self.verified_bot_ids
+
+    async def send_private_msg(
+        self,
+        user_id: str,
+        message: str,
+        bot_self_id: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         self.sent_private_messages.append((str(user_id), message))
         return {"status": "ok", "retcode": 0, "data": {"message_id": 123}}
 
-    async def send_group_msg(self, group_id: str, message: str) -> dict[str, Any]:
+    async def send_group_msg(
+        self,
+        group_id: str,
+        message: str,
+        bot_self_id: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         self.sent_group_messages.append((str(group_id), message))
         return {"status": "ok", "retcode": 0, "data": {"message_id": 456}}
 
@@ -166,3 +187,35 @@ def test_config() -> PluginConfig:
             "keep_audit_days": 90,
         },
     })
+
+
+@pytest.fixture
+def access_system(temp_db: Database, mock_napcat: MockNapCatClient, test_config: PluginConfig):
+    from approval.access_service import AccessService
+    from approval.approval_service import ApprovalService
+    from approval.audit_service import AuditService
+    from approval.level_service import LevelService
+    from approval.notification_service import NotificationService
+
+    audit = AuditService(temp_db)
+    notif = NotificationService(temp_db, mock_napcat)
+    lvl = LevelService(mock_napcat)
+    approval = ApprovalService(temp_db, lvl, audit, notif, test_config)
+    access = AccessService(temp_db, approval, lvl, audit, test_config)
+    return access, approval, temp_db, mock_napcat, test_config
+
+
+@pytest.fixture
+def web_system(temp_db: Database, mock_napcat: MockNapCatClient, test_config: PluginConfig):
+    from approval.approval_service import ApprovalService
+    from approval.audit_service import AuditService
+    from approval.level_service import LevelService
+    from approval.notification_service import NotificationService
+    from approval.web_api import WebApiHandler
+
+    audit = AuditService(temp_db)
+    notif = NotificationService(temp_db, mock_napcat)
+    lvl = LevelService(mock_napcat)
+    approval = ApprovalService(temp_db, lvl, audit, notif, test_config)
+    web = WebApiHandler(temp_db, approval, audit, test_config, client=mock_napcat)
+    return web, approval, temp_db, mock_napcat, test_config

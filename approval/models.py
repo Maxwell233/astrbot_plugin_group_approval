@@ -107,6 +107,8 @@ class Grant:
     group_id: str
     user_id: str
     status: GrantStatus = GrantStatus.ACTIVE
+    grant_type: str = "LEVEL_APPROVAL"  # "LEVEL_APPROVAL", "OWNER_MANUAL", "LEVEL_EXEMPTION"
+    is_level_exempt: bool = False
     source_application_id: str | None = None
     approved_by: str = ""
     approved_at: int = field(default_factory=lambda: int(time.time()))
@@ -116,11 +118,39 @@ class Grant:
     suspend_reason: str | None = None
     revoked_by: str | None = None
     revoked_at: int | None = None
+    # Optimistic-concurrency counter. Every state transition increments it; automatic
+    # transitions must condition on the revision they read so they can never overwrite
+    # an administrator's concurrent revoke/ban.
+    revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["status"] = self.status.value if isinstance(self.status, GrantStatus) else self.status
         return data
+
+
+@dataclass
+class ReviewerRecord:
+    """Persistent reviewer entry."""
+
+    qq_id: str
+    added_by: str = ""
+    added_at: int = field(default_factory=lambda: int(time.time()))
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RateLimitRecord:
+    """Record for sliding window rate limits."""
+
+    key: str
+    count: int = 0
+    window_start: int = field(default_factory=lambda: int(time.time()))
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass

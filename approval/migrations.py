@@ -108,6 +108,8 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_key TEXT NOT NULL,
     recipient_id TEXT NOT NULL,
+    bot_self_id TEXT NOT NULL DEFAULT '',
+    fallback_group TEXT NOT NULL DEFAULT '',
     channel TEXT NOT NULL DEFAULT 'private',
     payload TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'PENDING',
@@ -122,6 +124,26 @@ CREATE INDEX IF NOT EXISTS idx_outbox_pending ON notification_outbox (status, ne
 """
 
 
+MIGRATION_V2_SQL = """
+-- Persistent Reviewers table
+CREATE TABLE IF NOT EXISTS reviewers (
+    qq_id TEXT PRIMARY KEY,
+    added_by TEXT NOT NULL,
+    added_at INTEGER NOT NULL
+);
+
+-- Application rate limiting table
+CREATE TABLE IF NOT EXISTS rate_limits (
+    key TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    window_start INTEGER NOT NULL
+);
+
+-- NOTE: the unique event_key index is created programmatically in apply_v2() AFTER
+-- de-duplicating any legacy rows, so upgrading an old database can never abort here.
+"""
+
+
 async def apply_v1(db: aiosqlite.Connection) -> None:
     await db.executescript(MIGRATION_V1_SQL)
     await db.execute(
@@ -131,8 +153,141 @@ async def apply_v1(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def apply_v2(db: aiosqlite.Connection) -> None:
+    # 1. Execute new tables
+    await db.executescript(MIGRATION_V2_SQL)
+
+    # 2. Make the outbox event_key unique, tolerating legacy duplicates. A plain
+    #    CREATE UNIQUE INDEX on an old database that already contains duplicate event_keys
+    #    would abort the whole migration and leave the plugin unusable after upgrade.
+    await db.execute(
+        """
+        DELETE FROM notification_outbox
+        WHERE id NOT IN (
+            SELECT MIN(id) FROM notification_outbox GROUP BY event_key
+        )
+        """
+    )
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_outbox_event_key ON notification_outbox (event_key)"
+    )
+
+    # 3. Check and add columns to grants table if not existing
+    async with db.execute("PRAGMA table_info(grants)") as cursor:
+        cols = [r[1] for r in await cursor.fetchall()]
+
+    if "grant_type" not in cols:
+        await db.execute("ALTER TABLE grants ADD COLUMN grant_type TEXT NOT NULL DEFAULT 'LEVEL_APPROVAL'")
+    if "is_level_exempt" not in cols:
+        await db.execute("ALTER TABLE grants ADD COLUMN is_level_exempt INTEGER NOT NULL DEFAULT 0")
+
+    await db.execute(
+        "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (2, ?)",
+        (int(time.time()),),
+    )
+    await db.commit()
+
+
+MIGRATION_V4_SQL = """
+-- No structural change: migration V4 is applied programmatically because SQLite
+-- cannot add a column with a conditional IF NOT EXISTS clause.
+"""
+
+
+MIGRATION_V5_SQL = """
+-- Persistent reviewer overrides. The static config file (reviewer_qq_ids) is a seed,
+-- not the source of truth: an owner's add/remove decision is recorded here so a
+-- removed reviewer cannot reappear after a restart from a stale config file.
+CREATE TABLE IF NOT EXISTS reviewer_overrides (
+    qq_id TEXT PRIMARY KEY,
+    action TEXT NOT NULL CHECK (action IN ('ADDED', 'REMOVED')),
+    changed_by TEXT NOT NULL DEFAULT '',
+    changed_at INTEGER NOT NULL
+);
+"""
+
+
+async def apply_v6(db: aiosqlite.Connection) -> None:
+    """Add privacy-safe fallback payload and worker-claim bookkeeping to the outbox.
+
+    ``fallback_payload`` stores the only text that may be sent to a group when private
+    delivery fails (empty = no group fallback), so an approval reason/note can never be
+    dumped into a public group. ``claimed_at`` lets concurrent workers claim rows
+    atomically and lets a restarted worker recover abandoned claims.
+    """
+    async with db.execute("PRAGMA table_info(notification_outbox)") as cursor:
+        cols = [r[1] for r in await cursor.fetchall()]
+
+    if "fallback_payload" not in cols:
+        await db.execute(
+            "ALTER TABLE notification_outbox ADD COLUMN fallback_payload TEXT NOT NULL DEFAULT ''"
+        )
+    if "claimed_at" not in cols:
+        await db.execute(
+            "ALTER TABLE notification_outbox ADD COLUMN claimed_at INTEGER NOT NULL DEFAULT 0"
+        )
+
+    await db.execute(
+        "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (6, ?)",
+        (int(time.time()),),
+    )
+    await db.commit()
+
+
+async def apply_v5(db: aiosqlite.Connection) -> None:
+    await db.executescript(MIGRATION_V5_SQL)
+    await db.execute(
+        "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (5, ?)",
+        (int(time.time()),),
+    )
+    await db.commit()
+
+
+async def apply_v4(db: aiosqlite.Connection) -> None:
+    """Add optimistic-concurrency revision counter to grants.
+
+    Every grant state transition increments ``revision`` and conditions on the
+    revision (or on the expected current status) that the caller observed, so a
+    background level check can never overwrite an administrator's revoke/ban that
+    committed in the meantime.
+    """
+    async with db.execute("PRAGMA table_info(grants)") as cursor:
+        cols = [r[1] for r in await cursor.fetchall()]
+
+    if "revision" not in cols:
+        await db.execute("ALTER TABLE grants ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+
+    await db.execute(
+        "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (4, ?)",
+        (int(time.time()),),
+    )
+    await db.commit()
+
+
+async def apply_v3(db: aiosqlite.Connection) -> None:
+    # Check and add multi-bot and fallback columns to notification_outbox if missing
+    async with db.execute("PRAGMA table_info(notification_outbox)") as cursor:
+        cols = [r[1] for r in await cursor.fetchall()]
+
+    if "bot_self_id" not in cols:
+        await db.execute("ALTER TABLE notification_outbox ADD COLUMN bot_self_id TEXT NOT NULL DEFAULT ''")
+    if "fallback_group" not in cols:
+        await db.execute("ALTER TABLE notification_outbox ADD COLUMN fallback_group TEXT NOT NULL DEFAULT ''")
+
+    await db.execute(
+        "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (3, ?)",
+        (int(time.time()),),
+    )
+    await db.commit()
+
+
 MIGRATIONS: list[tuple[int, Callable[[aiosqlite.Connection], Any]]] = [
     (1, apply_v1),
+    (2, apply_v2),
+    (3, apply_v3),
+    (4, apply_v4),
+    (5, apply_v5),
+    (6, apply_v6),
 ]
 
 

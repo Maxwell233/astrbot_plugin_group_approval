@@ -1,14 +1,17 @@
 """AstrBot Plugin Group Approval (群等级准入与管理员审批)."""
 
-__version__ = "1.0.0"
+__version__ = "0.1.1"
+__status__ = "Development / 调试开发版"
 __author__ = "Maxwell233"
 
 from .access_service import AccessService
 from .approval_service import ApprovalService
 from .audit_service import AuditService
+from .auth_service import AuthorizationService
 from .commands import CommandDispatcher
 from .config import PluginConfig
 from .database import Database
+from .diagnostics import HandlerDiagnostics
 from .gate import AdmissionGate
 from .level_service import LevelService
 from .models import (
@@ -36,6 +39,7 @@ __all__ = [
     "ApprovalService",
     "AuditLogEntry",
     "AuditService",
+    "AuthorizationService",
     "BlacklistEntry",
     "CommandDispatcher",
     "Database",
@@ -43,6 +47,7 @@ __all__ = [
     "GrantStatus",
     "GroupMemberLevelResult",
     "GroupPolicy",
+    "HandlerDiagnostics",
     "LevelService",
     "NapCatClient",
     "NotificationService",
