@@ -107,38 +107,43 @@ class AccessService:
                     force_refresh=True,
                 )
                 if lvl_res.success and lvl_res.is_member and lvl_res.level >= policy.min_level:
-                    # Automatically restore grant (only if currently SUSPENDED, never revive REVOKED or EXPIRED)
-                    cursor = await self.db.execute(
-                        """
-                        UPDATE grants
-                        SET status = 'ACTIVE', last_verified_level = ?, last_verified_at = ?, suspend_reason = NULL
-                        WHERE bot_self_id = ? AND group_id = ? AND user_id = ? AND status = 'SUSPENDED'
-                        """,
-                        (lvl_res.level, now, b_id, g_id, u_id),
-                    )
-                    await self.db.commit()
-                    if cursor.rowcount > 0:
-                        await self.audit.log(
-                            actor_id="SYSTEM",
-                            actor_type="SYSTEM",
-                            bot_self_id=b_id,
-                            group_id=g_id,
-                            target_user_id=u_id,
-                            action="GRANT_AUTOMATICALLY_RESTORED",
-                            old_state="SUSPENDED",
-                            new_state="ACTIVE",
-                            details={"recovered_level": lvl_res.level, "min_level": policy.min_level},
+                    # Automatically restore grant (only if currently SUSPENDED, never revive
+                    # REVOKED or EXPIRED). The revision condition guarantees this automatic
+                    # transition cannot overwrite an administrator revoke/ban that committed
+                    # after we read the grant.
+                    async with self.db.transaction():
+                        cursor = await self.db.execute(
+                            """
+                            UPDATE grants
+                            SET status = 'ACTIVE', last_verified_level = ?, last_verified_at = ?,
+                                suspend_reason = NULL, revision = revision + 1
+                            WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
+                              AND status = 'SUSPENDED' AND revision = ?
+                            """,
+                            (lvl_res.level, now, b_id, g_id, u_id, grant.revision),
                         )
+                        if cursor.rowcount > 0:
+                            await self.audit.log(
+                                actor_id="SYSTEM",
+                                actor_type="SYSTEM",
+                                bot_self_id=b_id,
+                                group_id=g_id,
+                                target_user_id=u_id,
+                                action="GRANT_AUTOMATICALLY_RESTORED",
+                                old_state="SUSPENDED",
+                                new_state="ACTIVE",
+                                details={"recovered_level": lvl_res.level, "min_level": policy.min_level},
+                            )
+                    if cursor.rowcount > 0:
                         grant.status = GrantStatus.ACTIVE
                         grant.last_verified_level = lvl_res.level
                         grant.last_verified_at = now
+                        grant.revision += 1
                     else:
-                        # Grant was not in SUSPENDED state (e.g. revoked or expired concurrently)
-                        return AccessDecision(
-                            allowed=False,
-                            reason="GRANT_NOT_ACTIVE",
-                            minimum_level=policy.min_level,
-                        )
+                        # Grant was not in the exact state we observed (e.g. revoked or
+                        # expired concurrently, or another automatic transition won).
+                        # Administrator revoke outranks automatic restore, so deny.
+                        return await self._deny_changed_state(b_id, g_id, u_id, policy.min_level)
                 else:
                     return AccessDecision(
                         allowed=False,
@@ -169,21 +174,30 @@ class AccessService:
 
         # 8. Check grant expiration (expires_at <= now)
         if grant.expires_at > 0 and now >= grant.expires_at:
-            await self.db.execute(
-                "UPDATE grants SET status = 'EXPIRED' WHERE bot_self_id = ? AND group_id = ? AND user_id = ? AND status = 'ACTIVE'",
-                (b_id, g_id, u_id),
-            )
-            await self.db.commit()
-            await self.audit.log(
-                actor_id="SYSTEM",
-                actor_type="SYSTEM",
-                bot_self_id=b_id,
-                group_id=g_id,
-                target_user_id=u_id,
-                action="GRANT_EXPIRED",
-                old_state="ACTIVE",
-                new_state="EXPIRED",
-            )
+            async with self.db.transaction():
+                cursor = await self.db.execute(
+                    """
+                    UPDATE grants
+                    SET status = 'EXPIRED', revision = revision + 1
+                    WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
+                      AND status = 'ACTIVE' AND revision = ?
+                    """,
+                    (b_id, g_id, u_id, grant.revision),
+                )
+                if cursor.rowcount > 0:
+                    await self.audit.log(
+                        actor_id="SYSTEM",
+                        actor_type="SYSTEM",
+                        bot_self_id=b_id,
+                        group_id=g_id,
+                        target_user_id=u_id,
+                        action="GRANT_EXPIRED",
+                        old_state="ACTIVE",
+                        new_state="EXPIRED",
+                    )
+            if cursor.rowcount == 0:
+                # Concurrent transition won; report the real current state, never allow.
+                return await self._deny_changed_state(b_id, g_id, u_id, policy.min_level)
             return AccessDecision(
                 allowed=False,
                 reason="GRANT_EXPIRED",
@@ -192,8 +206,10 @@ class AccessService:
                 last_verified_at=grant.last_verified_at,
             )
 
-        # 9. Verify level recheck validity if interval elapsed (bypassed if grant is level-exempt)
-        if not grant.is_level_exempt and policy.recheck_interval_seconds > 0 and (now - grant.last_verified_at > policy.recheck_interval_seconds):
+        # 9. Re-verify membership/level if the recheck interval elapsed.
+        #    Level exemption only exempts the *minimum level threshold*; it must NOT exempt
+        #    QQ group membership, otherwise a user who left the group keeps access forever.
+        if policy.recheck_interval_seconds > 0 and (now - grant.last_verified_at > policy.recheck_interval_seconds):
             lvl_res = await self.level_service.get_group_member_level(
                 bot_id=b_id,
                 group_id=g_id,
@@ -211,29 +227,38 @@ class AccessService:
                     last_verified_at=grant.last_verified_at,
                 )
 
-            # Check if current level has fallen below minimum
-            if lvl_res.level < policy.min_level:
-                await self.db.execute(
-                    """
-                    UPDATE grants
-                    SET status = 'SUSPENDED', suspend_reason = 'LEVEL_BELOW_MINIMUM',
-                        last_verified_level = ?, last_verified_at = ?
-                    WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
-                    """,
-                    (lvl_res.level, now, b_id, g_id, u_id),
-                )
-                await self.db.commit()
-                await self.audit.log(
-                    actor_id="SYSTEM",
-                    actor_type="SYSTEM",
-                    bot_self_id=b_id,
-                    group_id=g_id,
-                    target_user_id=u_id,
-                    action="GRANT_SUSPENDED",
-                    old_state="ACTIVE",
-                    new_state="SUSPENDED",
-                    details={"current_level": lvl_res.level, "min_level": policy.min_level},
-                )
+            # Check if current level has fallen below minimum (skipped for level exemption).
+            if not grant.is_level_exempt and lvl_res.level < policy.min_level:
+                # Conditional transition: only an ACTIVE grant at the revision we read may
+                # be suspended. Without the status/revision guard a level check that races
+                # with an administrator revoke would downgrade REVOKED to SUSPENDED, which
+                # a later automatic restore could then revive.
+                async with self.db.transaction():
+                    cursor = await self.db.execute(
+                        """
+                        UPDATE grants
+                        SET status = 'SUSPENDED', suspend_reason = 'LEVEL_BELOW_MINIMUM',
+                            last_verified_level = ?, last_verified_at = ?, revision = revision + 1
+                        WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
+                          AND status = 'ACTIVE' AND revision = ?
+                        """,
+                        (lvl_res.level, now, b_id, g_id, u_id, grant.revision),
+                    )
+                    if cursor.rowcount > 0:
+                        await self.audit.log(
+                            actor_id="SYSTEM",
+                            actor_type="SYSTEM",
+                            bot_self_id=b_id,
+                            group_id=g_id,
+                            target_user_id=u_id,
+                            action="GRANT_SUSPENDED",
+                            old_state="ACTIVE",
+                            new_state="SUSPENDED",
+                            details={"current_level": lvl_res.level, "min_level": policy.min_level},
+                        )
+                if cursor.rowcount == 0:
+                    # An administrator revoke/ban (or another transition) won the race.
+                    return await self._deny_changed_state(b_id, g_id, u_id, policy.min_level)
                 return AccessDecision(
                     allowed=False,
                     reason="LEVEL_BELOW_MINIMUM",
@@ -243,18 +268,24 @@ class AccessService:
                     last_verified_at=now,
                 )
 
-            # Level is satisfactory, update verification timestamp and level
-            await self.db.execute(
-                """
-                UPDATE grants
-                SET last_verified_level = ?, last_verified_at = ?
-                WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
-                """,
-                (lvl_res.level, now, b_id, g_id, u_id),
-            )
-            await self.db.commit()
+            # Level is satisfactory, update verification timestamp and level.
+            # Conditional on the grant still being ACTIVE at the revision we read so a
+            # concurrent revoke is never overwritten by a routine re-check.
+            async with self.db.transaction():
+                cursor = await self.db.execute(
+                    """
+                    UPDATE grants
+                    SET last_verified_level = ?, last_verified_at = ?, revision = revision + 1
+                    WHERE bot_self_id = ? AND group_id = ? AND user_id = ?
+                      AND status = 'ACTIVE' AND revision = ?
+                    """,
+                    (lvl_res.level, now, b_id, g_id, u_id, grant.revision),
+                )
+            if cursor.rowcount == 0:
+                return await self._deny_changed_state(b_id, g_id, u_id, policy.min_level)
             grant.last_verified_level = lvl_res.level
             grant.last_verified_at = now
+            grant.revision += 1
 
         # 10. All checks passed: Grant ACTIVE
         return AccessDecision(
@@ -264,4 +295,23 @@ class AccessService:
             current_level=grant.last_verified_level,
             minimum_level=policy.min_level,
             last_verified_at=grant.last_verified_at,
+        )
+
+    async def _deny_changed_state(
+        self, bot_id: str, group_id: str, user_id: str, minimum_level: int
+    ) -> AccessDecision:
+        """Fail closed after a conditional grant transition lost a concurrency race.
+
+        The conditional UPDATE did not match because another coroutine changed the grant
+        between our read and our write (typically an administrator revoke or ban, which
+        outranks automatic restoration). We re-read the row to report the real status and
+        always deny access.
+        """
+        current = await self.approval.get_active_grant(bot_id, group_id, user_id)
+        return AccessDecision(
+            allowed=False,
+            reason="GRANT_STATE_CHANGED",
+            grant_status=current.status.value if current is not None else None,
+            minimum_level=minimum_level,
+            last_verified_at=current.last_verified_at if current is not None else 0,
         )
