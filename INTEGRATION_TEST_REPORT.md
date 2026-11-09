@@ -9,7 +9,8 @@
 > [!WARNING]
 > **版本与验证范围说明**：本项目仍处于早期开发与调试阶段，**不发布正式稳定版 Release**。
 > 本报告严格区分四类测试与真实环境验收（见第 1 节）。**真实 Windows + NapCat + QQ 群联调未执行**；
-> GitHub Actions 工作流已配置，但**尚未在 GitHub 实际运行**，因此在它真正跑通前不得声称“CI 已通过”。
+> GitHub Actions 已**实际运行并通过**（commit `e296b25`，[run 42675991825](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/runs/42675991825)）：
+> `Unit tests (Python 3.12)`、`Unit tests (Python 3.13)`、`Real AstrBot framework integration (AstrBot 4.29.4)` 均为 success。
 
 ---
 
@@ -128,7 +129,7 @@ node --check views/dashboard/app.js
 | GroupGuardian 真实联动（安装 + 补丁 + 真实消息） | **未实测** | 补丁内容有契约测试；真实注册表顺序用代理 Handler 验证（c 级）；未运行真实 GroupGuardian |
 | LivingMemory 真实联动/画像 | **未实测 / 无法验证** | 仅上游 LivingMemory 2.10.0 源码静态核对；`stop_event()` 无法阻止其采集 |
 | WebUI 真实 Dashboard iframe 桥接 | **未实测** | 前端仅 `node --check` 语法检查 |
-| GitHub Actions CI | **未实测** | 工作流已配置；未在 GitHub 运行，**不得声称 CI 已通过** |
+| GitHub Actions CI | **已实测通过** | 3 个 job 均 success（commit `e296b25`）；[run](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/runs/42675991825)。本轮 push 后的 CI 结果见 PR 页面 |
 
 ---
 
@@ -180,7 +181,7 @@ node --check views/dashboard/app.js
 4. 真实 GroupGuardian 安装 + 应用 `patches/group_guardian_priority.patch` 后的实际执行顺序与审核效果。
 5. 真实 LivingMemory 运行时的消息采集与长期记忆生成（本插件不宣称能阻止，仅记录限制）。
 6. 真实 WebUI Dashboard 中 Plugin View Bridge 的调用与导出下载。
-7. GitHub Actions 两个 job 的实际运行结果（在 GitHub 跑过之前不得声明“CI 已通过”）。
+7. GitHub Actions 实际运行结果：commit `e296b25` 的 3 个 job 全部 success（[run](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/runs/42675991825)）。
 
 ---
 

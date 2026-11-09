@@ -162,6 +162,6 @@ fail-closed 是固定行为）。
 | GroupGuardian 真实安装+补丁联调 | **未实测**（补丁契约测试 + 真实注册表顺序验证） |
 | LivingMemory 真实运行行为 | **未实测 / 无法验证** |
 | WebUI 真实浏览器桥接 | **未实测**（仅 `node --check` 语法检查） |
-| GitHub Actions CI | **未实测**（工作流已配置，未在 GitHub 运行） |
+| GitHub Actions CI | **已实测通过**（commit `e296b25`，3 个 job 均 success；[run](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/runs/42675991825)） |
 
 > 任何“已在真实环境验证”的表述都必须等真实 Windows + NapCat + QQ 群联调完成后才能使用。

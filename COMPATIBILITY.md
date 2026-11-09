@@ -250,7 +250,7 @@ LivingMemory 侧缓解，或接受该残留风险。**未在真实运行环境�
 | GroupGuardian 真实联动（安装+打补丁+真实消息） | **未实测** | 仅源码核对 + 真实注册表顺序用代理 Handler 断言；补丁内容有单元测试 |
 | LivingMemory 真实联动（真实采集/画像） | **未实测 / 无法验证** | 仅上游源码静态阅读；无运行时追踪 |
 | WebUI 在真实 Dashboard iframe 中的桥接 | **未实测** | 前端代码按 4.26+ 桥契约编写；无浏览器实测 |
-| GitHub Actions CI | **未实测** | 工作流已配置但尚未在 GitHub 实际运行 |
+| GitHub Actions CI | **已实测通过** | commit `e296b25`：3 个 job（3.12 / 3.13 单元测试 + 真实 AstrBot 4.29.4 框架测试）均 success；[run](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/runs/42675991825) |
 
 ---
 
@@ -261,5 +261,5 @@ LivingMemory 侧缓解，或接受该残留风险。**未在真实运行环境�
 3. 真实 NapCat/QQ 的 API 行为、超时、风控对审批通知到达率的影响。
 4. AstrBot StarManager 对插件的真实加载、热重载、并发消息分发。
 5. WebUI 桥接在真实浏览器/Dashboard 中的表现。
-6. CI 在 GitHub 上的实际结果（不得声称“CI 已通过”，直到它真的跑过）。
+6. GitHub Actions 已实际运行并通过（commit `e296b25`；[run](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/runs/42675991825)）；仍不代表真实 NapCat/QQ 环境已验证。
 7. 真实 Windows 生产环境与 AstrBot Launcher 常驻行为。

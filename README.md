@@ -180,7 +180,8 @@ OWNER；QQ 侧 Owner/Reviewer 列表**不**赋予 Dashboard 权限；无 `bot_se
 
 ## 🧪 自动化测试与质量保障
 
-> **CI 状态：工作流已配置，但尚未在 GitHub 上实际运行；“CI 已通过”只能在 GitHub 跑过之后声明。**
+> **CI 状态：已通过**（commit `e296b25`，run [42675991825](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/runs/42675991825)）：
+> `Unit tests (Python 3.12)`、`Unit tests (Python 3.13)`、`Real AstrBot framework integration (AstrBot 4.29.4)` 三个 job 均为 `success`。
 
 本地实际结果（2026-11-09，本机 macOS / Python 3.13.17）：
 
