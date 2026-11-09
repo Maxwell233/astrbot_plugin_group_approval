@@ -28,19 +28,45 @@
 
 ---
 
-## 3. GroupGuardian 兼容保障
+## 3. GroupGuardian 兼容与审核顺序保障
 
 - **核心目标**：内容安全审核必须覆盖全群，绝不可被准入插件中断。
-- **优先级冲突与防御架构**：
-  - 上游 `GroupGuardian` 默认注册未指定优先级时为 0。为了防止被 priority=50 的准入闸门提前拦截，Group Approval 采取了**双重防护**：
-    1. **内置动态提升**：在插件启动时自动扫描上下文，将所有 `GroupGuardian` 审核 Handler 优先级动态提升至 `priority = 100`。
-    2. **上游补丁建议**：建议 GroupGuardian 官方在主消息过滤器中显式设置 `@filter.event_message_type(..., priority=100)`。
-- **优先级布局**：
-  - `GroupGuardian` 运行于 `priority = 100`（安全内容审计第一防线）。
-  - `Group Approval Gate` 运行于 `priority = 50`（准入授权判定第二防线）。
-  - 业务插件（签到、运势、小猪、AI）运行于 `priority = 0`。
-- **审核时序**：
+- **AstrBot 优先级机制深度剖析**：
+  - AstrBot 在插件加载注册阶段通过 Handler 的 `extras_configs["priority"]` 进行排序。如果在运行时动态修改 Handler 实例上的属性（如 `handler.priority = 100`），由于内部事件分发链已在启动阶段按降序排定，该修改**无法改变**实际执行顺序。
+  - 因此，Group Approval 坚决移除了无效的运行时 monkey-patch 逻辑，采用**标准上游补丁声明 + 运行期只读诊断警告**的双轨防御方案。
+- **推荐上游补丁 (zcj-ui/astrbot_plugin_group_guardian)**：
+  在 GroupGuardian 主审核 Handler 的过滤器装饰器中显式指定 `priority=100`：
+  ```python
+  @filter.event_message_type(
+      filter.EventMessageType.ALL,
+      priority=100,
+  )
+  async def audit_group_message(self, event: AstrMessageEvent):
+      # 内容审核逻辑
+  ```
+- **运行期 Handler 诊断服务 (HandlerDiagnostics)**：
+  Group Approval 内置只读诊断服务，通过检查 AstrBot 注册表中的 `extras_configs["priority"]`，实时评估 GroupGuardian 与 Group Approval (priority=50) 的相对优先次序：
+  - 若 GroupGuardian 优先级 $\ge 100$：诊断状态为 `OPTIMAL`（顺序安全）。
+  - 若 GroupGuardian 优先级 $\le 50$：诊断状态为 `WARNING`，并在 WebUI 显著标黄告警，提示管理员安装补丁版本。
+  - 若未检测到 GroupGuardian：诊断状态为 `NOT_INSTALLED`。
+- **执行时序保证**：
   未获批成员发送的所有消息（包括文字、图片、表情）会最先送达 GroupGuardian 进行安全与合规检测，若触发违规行为立即执行撤回、禁言或告警。随后才由 Group Approval 在 priority=50 拦截并阻止其调用 Bot 业务。未授权用户的消息绝不会穿透至普通插件。
+
+---
+
+## 4. WebUI 身份认证与服务端授权防御
+
+- **杜绝伪造 HTTP 标头**：
+  - 严禁信任客户端传入的 `X-AstrBot-User`、`X-User-Id` 或 `Authorization-User` 请求头。任何网络调用方均可随意构造此类标头伪造管理员身份。
+  - Group Approval 仅读取 Quart / AstrBot 官方 Dashboard 经过校验的上下文（`request.username` 或服务端 session）。
+  - 未经身份验证的请求一律由网关层直接拒绝并返回 HTTP 401 Unauthorized。
+- **服务端强授权校验**：
+  - 严禁信任前端或客户端 JSON 传入的 `actor_role: "OWNER"`。
+  - 系统由 `AuthorizationService` 在服务端统一将当前登录账号与数据库审核员名单及配置文件 Owner 列表做权限比对，动态赋予 `OWNER`、`REVIEWER` 或 `DASHBOARD_USER` 角色。
+  - 特权操作（如免等级特权授权、黑名单操作、策略变更、日志导出）严格限定只有真实 `OWNER` 方可执行；`REVIEWER` 仅允许执行日常审批与拒绝。
+- **多 Bot 隔离与路由**：
+  - 杜绝 `"default"` 占位符退化。所有群策略、授权凭证、通知出件箱严格携带真实的 `bot_self_id`。
+  - 跨 Bot 实例间策略与授权彻底隔离，杜绝多账号环境下的越权访问。
 
 ---
 
