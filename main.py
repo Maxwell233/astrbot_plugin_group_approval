@@ -10,19 +10,34 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .approval import (
-    AccessService,
-    AdmissionGate,
-    ApprovalService,
-    AuditService,
-    CommandDispatcher,
-    Database,
-    LevelService,
-    NapCatClient,
-    NotificationService,
-    PluginConfig,
-    WebApiHandler,
-)
+try:
+    from .approval import (
+        AccessService,
+        AdmissionGate,
+        ApprovalService,
+        AuditService,
+        CommandDispatcher,
+        Database,
+        LevelService,
+        NapCatClient,
+        NotificationService,
+        PluginConfig,
+        WebApiHandler,
+    )
+except ImportError:
+    from approval import (  # type: ignore
+        AccessService,
+        AdmissionGate,
+        ApprovalService,
+        AuditService,
+        CommandDispatcher,
+        Database,
+        LevelService,
+        NapCatClient,
+        NotificationService,
+        PluginConfig,
+        WebApiHandler,
+    )
 
 logger = logging.getLogger("astrbot_plugin_group_approval")
 
@@ -72,6 +87,53 @@ except ImportError:
         return data
 
     request = Any  # type: ignore
+
+
+def _get_query_param(req: Any, name: str, default: Any = None) -> Any:
+    """Fetch query parameter supporting modern request.query and legacy request.args."""
+    query = getattr(req, "query", None)
+    if query and hasattr(query, "get"):
+        val = query.get(name)
+        if val is not None:
+            return val
+    args = getattr(req, "args", None)
+    if args and hasattr(args, "get"):
+        return args.get(name, default)
+    return default
+
+
+async def _get_request_json(req: Any) -> dict[str, Any]:
+    """Parse request JSON payload supporting await request.json(default={}) and get_json()."""
+    if hasattr(req, "json"):
+        try:
+            res = req.json(default={}) if callable(req.json) else req.json
+            if asyncio.iscoroutine(res):
+                res = await res
+            if isinstance(res, dict):
+                return res
+        except Exception:
+            pass
+    if hasattr(req, "get_json"):
+        try:
+            res = req.get_json()
+            if asyncio.iscoroutine(res):
+                res = await res
+            if isinstance(res, dict):
+                return res
+        except Exception:
+            pass
+    return {}
+
+
+def _get_request_operator(req: Any) -> str:
+    """Extract authenticated dashboard user ID from request headers or auth context."""
+    headers = getattr(req, "headers", None)
+    if headers and hasattr(headers, "get"):
+        for header_name in ("X-AstrBot-User", "X-User-Id", "X-Username", "Authorization-User"):
+            val = headers.get(header_name)
+            if val:
+                return str(val).strip()
+    return "dashboard_admin"
 
 
 class GroupApprovalPlugin(Star):
@@ -151,12 +213,49 @@ class GroupApprovalPlugin(Star):
             await self.db.init()
             # Clean expired records on boot
             await self.approval_service.clean_expired()
+            # Sync persistent reviewers from database
+            await self.approval_service.sync_reviewers_from_db()
+            # Promote GroupGuardian handler priority if loaded
+            self._promote_group_guardian_priority()
             # Start persistent outbox notification retry worker
             if self.plugin_config.notifications.retry_enabled:
                 self.notification_service.start_worker()
-            logger.info("GroupApprovalPlugin initialized successfully.")
+            logger.info("GroupApprovalPlugin v0.1.1 initialized successfully.")
         except Exception as e:
             logger.error(f"Failed to initialize GroupApprovalPlugin: {e}", exc_info=True)
+
+    def _promote_group_guardian_priority(self) -> None:
+        """Dynamically elevate GroupGuardian handlers to priority 100 so content audit precedes access gate."""
+        if self.context is None:
+            return
+        promoted = 0
+        try:
+            candidates = []
+            for attr in ("handlers", "star_manager", "event_manager", "star_handlers"):
+                obj = getattr(self.context, attr, None)
+                if obj is not None:
+                    candidates.append(obj)
+
+            for target in candidates:
+                handlers = getattr(target, "handlers", target)
+                if isinstance(handlers, (list, tuple)):
+                    for h in handlers:
+                        name = str(getattr(h, "name", "") or getattr(h, "__name__", "") or str(h)).lower()
+                        if "group_guardian" in name or "groupguardian" in name or "guardian" in name:
+                            if hasattr(h, "priority") and getattr(h, "priority") < 100:
+                                h.priority = 100
+                                promoted += 1
+                elif isinstance(handlers, dict):
+                    for k, v in handlers.items():
+                        name = str(k).lower()
+                        if "group_guardian" in name or "groupguardian" in name or "guardian" in name:
+                            if hasattr(v, "priority") and getattr(v, "priority") < 100:
+                                v.priority = 100
+                                promoted += 1
+            if promoted > 0:
+                logger.info(f"Dynamically promoted {promoted} GroupGuardian handler(s) to priority 100.")
+        except Exception as e:
+            logger.debug(f"GroupGuardian priority scan note: {e}")
 
     async def terminate(self) -> None:
         """Clean up background workers and close database connections upon unloading."""
@@ -180,6 +279,7 @@ class GroupApprovalPlugin(Star):
             return handler
 
         routes = [
+            (f"/{PLUGIN_NAME}/bots", self._web_bots, ["GET"], "List connected bots"),
             (f"/{PLUGIN_NAME}/dashboard", self._web_dashboard, ["GET"], "Dashboard metrics"),
             (f"/{PLUGIN_NAME}/applications", self._web_applications, ["GET"], "List applications"),
             (f"/{PLUGIN_NAME}/applications/approve", self._web_approve, ["POST"], "Approve application"),
@@ -201,56 +301,65 @@ class GroupApprovalPlugin(Star):
                 logger.warning(f"Could not register web route {path}: {e}")
 
     # --- Web Route Handlers ---
+    async def _web_bots(self) -> dict[str, Any]:
+        return await self.web_api.list_bots(context=self.context)
+
     async def _web_dashboard(self) -> dict[str, Any]:
         return await self.web_api.get_dashboard_stats()
 
     async def _web_applications(self) -> dict[str, Any]:
-        gid = getattr(request, "args", {}).get("group_id")
-        status = getattr(request, "args", {}).get("status")
-        uid = getattr(request, "args", {}).get("user_id")
+        gid = _get_query_param(request, "group_id")
+        status = _get_query_param(request, "status")
+        uid = _get_query_param(request, "user_id")
         return await self.web_api.list_applications(group_id=gid, status=status, user_id=uid)
 
     async def _web_approve(self) -> dict[str, Any]:
-        data = await request.get_json() if hasattr(request, "get_json") else {}
-        return await self.web_api.approve_application(data or {})
+        data = await _get_request_json(request)
+        operator = _get_request_operator(request)
+        return await self.web_api.approve_application(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
 
     async def _web_reject(self) -> dict[str, Any]:
-        data = await request.get_json() if hasattr(request, "get_json") else {}
-        return await self.web_api.reject_application(data or {})
+        data = await _get_request_json(request)
+        operator = _get_request_operator(request)
+        return await self.web_api.reject_application(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
 
     async def _web_users(self) -> dict[str, Any]:
-        gid = getattr(request, "args", {}).get("group_id")
-        uid = getattr(request, "args", {}).get("user_id")
-        status = getattr(request, "args", {}).get("status")
+        gid = _get_query_param(request, "group_id")
+        uid = _get_query_param(request, "user_id")
+        status = _get_query_param(request, "status")
         return await self.web_api.list_users(group_id=gid, user_id=uid, status=status)
 
     async def _web_manual_grant(self) -> dict[str, Any]:
-        data = await request.get_json() if hasattr(request, "get_json") else {}
-        return await self.web_api.manual_grant(data or {})
+        data = await _get_request_json(request)
+        operator = _get_request_operator(request)
+        return await self.web_api.manual_grant(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
 
     async def _web_revoke_grant(self) -> dict[str, Any]:
-        data = await request.get_json() if hasattr(request, "get_json") else {}
-        return await self.web_api.revoke_grant(data or {})
+        data = await _get_request_json(request)
+        operator = _get_request_operator(request)
+        return await self.web_api.revoke_grant(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
 
     async def _web_ban(self) -> dict[str, Any]:
-        data = await request.get_json() if hasattr(request, "get_json") else {}
-        return await self.web_api.ban_user(data or {})
+        data = await _get_request_json(request)
+        operator = _get_request_operator(request)
+        return await self.web_api.ban_user(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
 
     async def _web_unban(self) -> dict[str, Any]:
-        data = await request.get_json() if hasattr(request, "get_json") else {}
-        return await self.web_api.unban_user(data or {})
+        data = await _get_request_json(request)
+        operator = _get_request_operator(request)
+        return await self.web_api.unban_user(data, actor_id=operator, actor_role="DASHBOARD_ADMIN")
 
     async def _web_groups(self) -> dict[str, Any]:
         return await self.web_api.list_groups()
 
     async def _web_update_group(self) -> dict[str, Any]:
-        data = await request.get_json() if hasattr(request, "get_json") else {}
-        return await self.web_api.update_group_policy(data or {})
+        data = await _get_request_json(request)
+        return await self.web_api.update_group_policy(data)
 
     async def _web_audit_logs(self) -> dict[str, Any]:
-        gid = getattr(request, "args", {}).get("group_id")
-        uid = getattr(request, "args", {}).get("user_id")
-        action = getattr(request, "args", {}).get("action")
+        gid = _get_query_param(request, "group_id")
+        uid = _get_query_param(request, "user_id")
+        action = _get_query_param(request, "action")
         return await self.web_api.list_audit_logs(group_id=gid, user_id=uid, action=action)
 
     # --- Priority 50 Admission Gate ---
@@ -260,6 +369,10 @@ class GroupApprovalPlugin(Star):
 
         Runs at priority=50, after GroupGuardian (100) and before normal plugins (0).
         """
+        # Ignore non-message events (e.g. notices, requests, lifecycle events)
+        if getattr(event, "message_obj", None) is None:
+            return
+
         bot_self_id = str(event.get_self_id() or getattr(getattr(event, "message_obj", None), "self_id", "default")).strip()
         group_id = event.get_group_id()
         user_id = str(event.get_sender_id() or "").strip()
@@ -304,6 +417,7 @@ class GroupApprovalPlugin(Star):
         reason = getattr(event, "message_str", "").replace("/申请使用", "").replace("申请使用", "").strip()
 
         reply = await self.dispatcher.handle_apply(bot_self_id, group_id, user_id, reason)
+        event.stop_event()
         yield event.plain_result(reply)
 
     @filter.command("我的权限")
@@ -313,6 +427,7 @@ class GroupApprovalPlugin(Star):
         user_id = str(event.get_sender_id() or "").strip()
 
         reply = await self.dispatcher.handle_my_status(bot_self_id, group_id, user_id)
+        event.stop_event()
         yield event.plain_result(reply)
 
     @filter.command("申请状态")
@@ -322,6 +437,7 @@ class GroupApprovalPlugin(Star):
         user_id = str(event.get_sender_id() or "").strip()
 
         reply = await self.dispatcher.handle_application_status(bot_self_id, group_id, user_id)
+        event.stop_event()
         yield event.plain_result(reply)
 
     @filter.command("取消申请")
@@ -331,6 +447,7 @@ class GroupApprovalPlugin(Star):
         user_id = str(event.get_sender_id() or "").strip()
 
         reply = await self.dispatcher.handle_cancel_application(bot_self_id, group_id, user_id)
+        event.stop_event()
         yield event.plain_result(reply)
 
     @filter.command("使用规则")
@@ -339,6 +456,7 @@ class GroupApprovalPlugin(Star):
         group_id = event.get_group_id() or ""
 
         reply = await self.dispatcher.handle_rules(bot_self_id, group_id)
+        event.stop_event()
         yield event.plain_result(reply)
 
     # --- Administrator Commands (/ga ...) ---
@@ -358,4 +476,5 @@ class GroupApprovalPlugin(Star):
             group_id=group_id,
             args=args,
         )
+        event.stop_event()
         yield event.plain_result(reply)

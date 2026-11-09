@@ -184,8 +184,8 @@ class AccessService:
                 last_verified_at=grant.last_verified_at,
             )
 
-        # 9. Verify level recheck validity if interval elapsed
-        if policy.recheck_interval_seconds > 0 and (now - grant.last_verified_at > policy.recheck_interval_seconds):
+        # 9. Verify level recheck validity if interval elapsed (bypassed if grant is level-exempt)
+        if not grant.is_level_exempt and policy.recheck_interval_seconds > 0 and (now - grant.last_verified_at > policy.recheck_interval_seconds):
             lvl_res = await self.level_service.get_group_member_level(
                 bot_id=b_id,
                 group_id=g_id,
