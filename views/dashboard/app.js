@@ -1,5 +1,6 @@
 /**
  * Frontend script for AstrBot Group Approval WebUI dashboard.
+ * Version: 0.1.1 (Early Development & Debugging)
  */
 
 const PLUGIN_NAME = "astrbot_plugin_group_approval";
@@ -7,13 +8,42 @@ const PLUGIN_NAME = "astrbot_plugin_group_approval";
 // Bridge SDK resolution with graceful HTTP fallback
 const bridge = window.AstrBotPluginPage || window.AstrBotPluginView;
 
-async function apiCall(endpoint, method = "GET", payload = null) {
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function getSelectedBotId() {
+  const sel = document.getElementById("global-bot-select");
+  return sel ? sel.value.trim() : "default";
+}
+
+async function apiCall(endpoint, method = "GET", payload = null, queryParams = null) {
+  const qParams = queryParams ? { ...queryParams } : {};
+  const currentBot = getSelectedBotId();
+  if (currentBot && !qParams.bot_self_id) {
+    qParams.bot_self_id = currentBot;
+  }
+
   if (bridge && typeof bridge.ready === "function") {
     try {
       if (method.toUpperCase() === "GET") {
-        return await bridge.apiGet(endpoint);
+        if (typeof bridge.apiGet === "function") {
+          return await bridge.apiGet(endpoint, qParams);
+        }
       } else {
-        return await bridge.apiPost(endpoint, payload || {});
+        if (typeof bridge.apiPost === "function") {
+          const body = payload ? { ...payload } : {};
+          if (currentBot && !body.bot_self_id) {
+            body.bot_self_id = currentBot;
+          }
+          return await bridge.apiPost(endpoint, body);
+        }
       }
     } catch (e) {
       console.warn("Bridge SDK call failed, falling back to fetch:", e);
@@ -21,13 +51,22 @@ async function apiCall(endpoint, method = "GET", payload = null) {
   }
 
   // Standard fetch fallback
-  const url = `/api/plug/${PLUGIN_NAME}/${endpoint}`;
+  let url = `/api/plug/${PLUGIN_NAME}/${endpoint}`;
+  const qs = new URLSearchParams(qParams).toString();
+  if (qs) {
+    url += (url.includes("?") ? "&" : "?") + qs;
+  }
+
   const options = {
     method,
     headers: { "Content-Type": "application/json" },
   };
   if (payload && method.toUpperCase() !== "GET") {
-    options.body = JSON.stringify(payload);
+    const body = { ...payload };
+    if (currentBot && !body.bot_self_id) {
+      body.bot_self_id = currentBot;
+    }
+    options.body = JSON.stringify(body);
   }
 
   const res = await fetch(url, options);
@@ -52,7 +91,7 @@ function renderStatusTag(status) {
     CANCELLED: '<span class="tag tag-expired">已取消</span>',
     EXPIRED: '<span class="tag tag-expired">已过期</span>',
   };
-  return map[s] || `<span class="tag">${s}</span>`;
+  return map[s] || `<span class="tag">${escapeHtml(s)}</span>`;
 }
 
 // State
@@ -72,8 +111,31 @@ document.addEventListener("DOMContentLoaded", async () => {
   initModals();
   initFilters();
 
+  await loadBots();
   await loadDashboard();
 });
+
+async function loadBots() {
+  try {
+    const res = await apiCall("bots");
+    const select = document.getElementById("global-bot-select");
+    if (!select) return;
+    const bots = res?.data?.bots || ["default"];
+    select.innerHTML = "";
+    bots.forEach((b) => {
+      const opt = document.createElement("option");
+      opt.value = b;
+      opt.textContent = `Bot: ${b}`;
+      select.appendChild(opt);
+    });
+    select.addEventListener("change", () => {
+      const activeTab = document.querySelector(".nav-tab.active");
+      if (activeTab) activeTab.click();
+    });
+  } catch (e) {
+    console.warn("Could not load bots:", e);
+  }
+}
 
 function initTabs() {
   const tabs = document.querySelectorAll(".nav-tab");
@@ -127,13 +189,13 @@ function initModals() {
     if (currentAction.type === "approve") {
       const res = await apiCall("applications/approve", "POST", {
         application_id: currentAction.id,
-        note: note || "WebUI管理员批准",
+        note: note || "管理员批准",
       });
       alert(res.message || (res.status === "ok" ? "批准成功" : "批准失败"));
     } else if (currentAction.type === "reject") {
       const res = await apiCall("applications/reject", "POST", {
         application_id: currentAction.id,
-        reason: note || "WebUI管理员拒绝",
+        reason: note || "管理员拒绝",
       });
       alert(res.message || (res.status === "ok" ? "拒绝成功" : "拒绝失败"));
     }
@@ -160,6 +222,7 @@ function initModals() {
 
   groupSave?.addEventListener("click", async () => {
     const payload = {
+      bot_self_id: getSelectedBotId(),
       group_id: document.getElementById("group-form-id").value.trim(),
       enabled: document.getElementById("group-form-enabled").value === "true",
       min_level: parseInt(document.getElementById("group-form-level").value, 10),
@@ -212,17 +275,17 @@ async function loadDashboard() {
       .map(
         (a) => `
       <tr>
-        <td><strong>${a.id}</strong></td>
-        <td>${a.group_id}</td>
-        <td>${a.user_id}</td>
-        <td>LV${a.level}</td>
+        <td><strong>${escapeHtml(a.id)}</strong></td>
+        <td>${escapeHtml(a.group_id)}</td>
+        <td>${escapeHtml(a.user_id)}</td>
+        <td>LV${escapeHtml(a.level)}</td>
         <td>${formatDate(a.created_at)}</td>
         <td>${renderStatusTag(a.status)}</td>
         <td>
           ${
             a.status === "PENDING"
-              ? `<button class="btn btn-sm btn-success btn-action-approve" data-id="${a.id}">批准</button>
-                 <button class="btn btn-sm btn-danger btn-action-reject" data-id="${a.id}">拒绝</button>`
+              ? `<button class="btn btn-sm btn-success btn-action-approve" data-id="${escapeHtml(a.id)}">批准</button>
+                 <button class="btn btn-sm btn-danger btn-action-reject" data-id="${escapeHtml(a.id)}">拒绝</button>`
               : "-"
           }
         </td>
@@ -247,14 +310,14 @@ async function loadApplications() {
   tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">加载中...</td></tr>';
 
   try {
-    const query = new URLSearchParams();
-    if (gid) query.append("group_id", gid);
-    if (uid) query.append("user_id", uid);
-    if (status) query.append("status", status);
+    const params = {};
+    if (gid) params.group_id = gid;
+    if (uid) params.user_id = uid;
+    if (status) params.status = status;
 
-    const res = await apiCall(`applications?${query.toString()}`);
+    const res = await apiCall("applications", "GET", null, params);
     if (!res || res.status !== "ok") {
-      tbody.innerHTML = `<tr><td colspan="9" class="text-center text-muted">加载失败: ${res?.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" class="text-center text-muted">加载失败: ${escapeHtml(res?.message)}</td></tr>`;
       return;
     }
 
@@ -268,19 +331,19 @@ async function loadApplications() {
       .map(
         (a) => `
       <tr>
-        <td><strong>${a.id}</strong></td>
-        <td>${a.group_id}</td>
-        <td>${a.user_id}</td>
-        <td>LV${a.level_at_application}</td>
-        <td>${a.reason || "-"}</td>
+        <td><strong>${escapeHtml(a.id)}</strong></td>
+        <td>${escapeHtml(a.group_id)}</td>
+        <td>${escapeHtml(a.user_id)}</td>
+        <td>LV${escapeHtml(a.level_at_application)}</td>
+        <td>${escapeHtml(a.reason || "-")}</td>
         <td>${formatDate(a.created_at)}</td>
         <td>${renderStatusTag(a.status)}</td>
-        <td>${a.review_note || "-"}</td>
+        <td>${escapeHtml(a.review_note || "-")}</td>
         <td>
           ${
             a.status === "PENDING"
-              ? `<button class="btn btn-sm btn-success btn-action-approve" data-id="${a.id}">批准</button>
-                 <button class="btn btn-sm btn-danger btn-action-reject" data-id="${a.id}">拒绝</button>`
+              ? `<button class="btn btn-sm btn-success btn-action-approve" data-id="${escapeHtml(a.id)}">批准</button>
+                 <button class="btn btn-sm btn-danger btn-action-reject" data-id="${escapeHtml(a.id)}">拒绝</button>`
               : `<span class="text-muted">已处理</span>`
           }
         </td>
@@ -327,14 +390,14 @@ async function loadUsers() {
   tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">加载中...</td></tr>';
 
   try {
-    const query = new URLSearchParams();
-    if (gid) query.append("group_id", gid);
-    if (uid) query.append("user_id", uid);
-    if (status) query.append("status", status);
+    const params = {};
+    if (gid) params.group_id = gid;
+    if (uid) params.user_id = uid;
+    if (status) params.status = status;
 
-    const res = await apiCall(`users?${query.toString()}`);
+    const res = await apiCall("users", "GET", null, params);
     if (!res || res.status !== "ok") {
-      tbody.innerHTML = `<tr><td colspan="9" class="text-center text-muted">加载失败: ${res?.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" class="text-center text-muted">加载失败: ${escapeHtml(res?.message)}</td></tr>`;
       return;
     }
 
@@ -348,21 +411,21 @@ async function loadUsers() {
       .map(
         (g) => `
       <tr>
-        <td><code>${g.id}</code></td>
-        <td>${g.group_id}</td>
-        <td><strong>${g.user_id}</strong></td>
+        <td><code>${escapeHtml(g.id)}</code></td>
+        <td>${escapeHtml(g.group_id)}</td>
+        <td><strong>${escapeHtml(g.user_id)}</strong></td>
         <td>${renderStatusTag(g.status)}</td>
-        <td>LV${g.last_verified_level}</td>
+        <td>LV${escapeHtml(g.last_verified_level)}</td>
         <td>${g.expires_at === 0 ? "永久" : formatDate(g.expires_at)}</td>
-        <td>${g.approved_by || "-"}</td>
+        <td>${escapeHtml(g.approved_by || "-")}</td>
         <td>${formatDate(g.last_verified_at)}</td>
         <td>
           ${
             g.status === "ACTIVE"
-              ? `<button class="btn btn-sm btn-danger btn-revoke" data-gid="${g.group_id}" data-uid="${g.user_id}">撤销</button>`
+              ? `<button class="btn btn-sm btn-danger btn-revoke" data-gid="${escapeHtml(g.group_id)}" data-uid="${escapeHtml(g.user_id)}">撤销</button>`
               : ""
           }
-          <button class="btn btn-sm btn-secondary btn-ban" data-gid="${g.group_id}" data-uid="${g.user_id}">拉黑</button>
+          <button class="btn btn-sm btn-secondary btn-ban" data-gid="${escapeHtml(g.group_id)}" data-uid="${escapeHtml(g.user_id)}">拉黑</button>
         </td>
       </tr>
     `
@@ -375,7 +438,7 @@ async function loadUsers() {
         const res = await apiCall("users/revoke", "POST", {
           group_id: btn.dataset.gid,
           user_id: btn.dataset.uid,
-          reason: "WebUI手动撤销",
+          reason: "管理员手动撤销",
         });
         alert(res.message || "操作完成");
         loadUsers();
@@ -408,7 +471,7 @@ async function loadGroups() {
   try {
     const res = await apiCall("groups");
     if (!res || res.status !== "ok") {
-      tbody.innerHTML = `<tr><td colspan="9" class="text-center text-muted">加载失败: ${res?.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" class="text-center text-muted">加载失败: ${escapeHtml(res?.message)}</td></tr>`;
       return;
     }
 
@@ -422,16 +485,16 @@ async function loadGroups() {
       .map(
         (g) => `
       <tr>
-        <td><strong>${g.group_id}</strong></td>
+        <td><strong>${escapeHtml(g.group_id)}</strong></td>
         <td>${g.enabled ? '<span class="tag tag-active">开启</span>' : '<span class="tag tag-expired">关闭</span>'}</td>
-        <td><strong style="color: var(--primary)">LV${g.min_level}</strong></td>
+        <td><strong style="color: var(--primary)">LV${escapeHtml(g.min_level)}</strong></td>
         <td>${g.approval_required ? "是" : "否"}</td>
         <td>${g.grant_duration_seconds === 0 ? "永久" : g.grant_duration_seconds / 86400 + " 天"}</td>
-        <td>${g.recheck_interval_seconds}s</td>
+        <td>${escapeHtml(g.recheck_interval_seconds)}s</td>
         <td>${g.restore_policy === "automatic" ? "自动重新激活" : "手动重新审批"}</td>
         <td>${g.group_admin_bypass ? "豁免" : "不豁免"}</td>
         <td>
-          <button class="btn btn-sm btn-secondary btn-edit-group" data-group='${JSON.stringify(g)}'>编辑</button>
+          <button class="btn btn-sm btn-secondary btn-edit-group" data-group='${escapeHtml(JSON.stringify(g))}'>编辑</button>
         </td>
       </tr>
     `
@@ -467,14 +530,14 @@ async function loadAuditLogs() {
   tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted">加载中...</td></tr>';
 
   try {
-    const query = new URLSearchParams();
-    if (gid) query.append("group_id", gid);
-    if (uid) query.append("user_id", uid);
-    if (action) query.append("action", action);
+    const params = {};
+    if (gid) params.group_id = gid;
+    if (uid) params.user_id = uid;
+    if (action) params.action = action;
 
-    const res = await apiCall(`audit_logs?${query.toString()}`);
+    const res = await apiCall("audit_logs", "GET", null, params);
     if (!res || res.status !== "ok") {
-      tbody.innerHTML = `<tr><td colspan="8" class="text-center text-muted">加载失败: ${res?.message}</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="8" class="text-center text-muted">加载失败: ${escapeHtml(res?.message)}</td></tr>`;
       return;
     }
 
@@ -489,13 +552,13 @@ async function loadAuditLogs() {
         (l) => `
       <tr>
         <td>${formatDate(l.timestamp)}</td>
-        <td><strong>${l.actor_id}</strong></td>
-        <td><span class="tag">${l.actor_type}</span></td>
-        <td>${l.group_id || "-"}</td>
-        <td>${l.target_user_id || "-"}</td>
-        <td><code>${l.action}</code></td>
-        <td>${l.old_state ? `${l.old_state} ➔ ${l.new_state}` : l.new_state || "-"}</td>
-        <td><small style="color:var(--text-muted)">${l.details_json || "{}"}</small></td>
+        <td><strong>${escapeHtml(l.actor_id)}</strong></td>
+        <td><span class="tag">${escapeHtml(l.actor_type)}</span></td>
+        <td>${escapeHtml(l.group_id || "-")}</td>
+        <td>${escapeHtml(l.target_user_id || "-")}</td>
+        <td><code>${escapeHtml(l.action)}</code></td>
+        <td>${escapeHtml(l.old_state ? `${l.old_state} ➔ ${l.new_state}` : l.new_state || "-")}</td>
+        <td><small style="color:var(--text-muted)">${escapeHtml(l.details_json || "{}")}</small></td>
       </tr>
     `
       )
@@ -506,5 +569,6 @@ async function loadAuditLogs() {
 }
 
 function exportAudit(format) {
-  window.open(`/api/plug/${PLUGIN_NAME}/audit_logs/export?format=${format}`, "_blank");
+  const currentBot = getSelectedBotId();
+  window.open(`/api/plug/${PLUGIN_NAME}/audit_logs/export?format=${format}&bot_self_id=${encodeURIComponent(currentBot)}`, "_blank");
 }

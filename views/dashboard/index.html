@@ -15,11 +15,14 @@
         <span class="icon">🛡️</span>
         <div>
           <h1>群等级准入与管理员审批</h1>
-          <p class="subtitle">AstrBot Group Approval Control Center</p>
+          <p class="subtitle">AstrBot Group Approval Control Center (v0.1.1 早期调试版)</p>
         </div>
       </div>
       <div class="header-status">
-        <span class="status-badge live" id="system-status">系统运行中</span>
+        <select id="global-bot-select" class="input-select" style="max-width: 170px; height: 36px; padding: 4px 8px; font-size: 13px;">
+          <option value="default">Bot: default</option>
+        </select>
+        <span class="status-badge live" id="system-status">系统调试中 (v0.1.1)</span>
         <button class="btn btn-secondary" id="btn-refresh">🔄 刷新数据</button>
       </div>
     </header>

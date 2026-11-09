@@ -35,6 +35,35 @@ class WebApiHandler:
     def err(self, message: str, retcode: int = 400) -> dict[str, Any]:
         return {"status": "error", "retcode": retcode, "message": message}
 
+    async def list_bots(self, context: Any = None) -> dict[str, Any]:
+        """Return connected and known bot IDs."""
+        bots: set[str] = set()
+        if context is not None:
+            pm = getattr(context, "platform_manager", None)
+            if pm is not None:
+                get_insts = getattr(pm, "get_insts", None)
+                if callable(get_insts):
+                    try:
+                        for inst in get_insts():
+                            bid = str(getattr(inst, "self_id", None) or "").strip()
+                            if bid:
+                                bots.add(bid)
+                    except Exception:
+                        pass
+        # Also query known bot IDs from group_policies and grants
+        p_rows = await self.db.fetchall("SELECT DISTINCT bot_self_id FROM group_policies")
+        for r in p_rows:
+            if r["bot_self_id"]:
+                bots.add(r["bot_self_id"])
+        g_rows = await self.db.fetchall("SELECT DISTINCT bot_self_id FROM grants")
+        for r in g_rows:
+            if r["bot_self_id"]:
+                bots.add(r["bot_self_id"])
+
+        if not bots:
+            bots.add("default")
+        return self.ok({"bots": sorted(list(bots))})
+
     async def get_dashboard_stats(self) -> dict[str, Any]:
         """Summary metrics for the dashboard view."""
         g_row = await self.db.fetchone("SELECT COUNT(*) FROM group_policies WHERE enabled = 1")
@@ -122,17 +151,23 @@ class WebApiHandler:
         data = [dict(r) for r in rows]
         return self.ok({"applications": data, "count": len(data)})
 
-    async def approve_application(self, payload: dict[str, Any], actor_id: str = "WebUI") -> dict[str, Any]:
+    async def approve_application(
+        self,
+        payload: dict[str, Any],
+        actor_id: str = "dashboard_admin",
+        actor_role: str = "DASHBOARD_ADMIN",
+    ) -> dict[str, Any]:
         """API handler to approve an application."""
         app_id = str(payload.get("application_id", "")).strip()
-        note = str(payload.get("note", "WebUI管理员批准")).strip()
+        note = str(payload.get("note", "Dashboard管理员批准")).strip()
 
         if not app_id:
             return self.err("缺少 application_id 参数")
 
+        act_id = actor_id if actor_id and actor_id != "WebUI" else "dashboard_admin"
         success, msg = await self.approval.approve_application(
-            actor_id=actor_id,
-            actor_role="REVIEWER",
+            actor_id=act_id,
+            actor_role=actor_role,
             application_id=app_id,
             note=note,
         )
@@ -140,17 +175,23 @@ class WebApiHandler:
             return self.err(msg)
         return self.ok({"message": msg, "application_id": app_id})
 
-    async def reject_application(self, payload: dict[str, Any], actor_id: str = "WebUI") -> dict[str, Any]:
+    async def reject_application(
+        self,
+        payload: dict[str, Any],
+        actor_id: str = "dashboard_admin",
+        actor_role: str = "DASHBOARD_ADMIN",
+    ) -> dict[str, Any]:
         """API handler to reject an application."""
         app_id = str(payload.get("application_id", "")).strip()
-        reason = str(payload.get("reason", "WebUI管理员拒绝")).strip()
+        reason = str(payload.get("reason", "Dashboard管理员拒绝")).strip()
 
         if not app_id:
             return self.err("缺少 application_id 参数")
 
+        act_id = actor_id if actor_id and actor_id != "WebUI" else "dashboard_admin"
         success, msg = await self.approval.reject_application(
-            actor_id=actor_id,
-            actor_role="REVIEWER",
+            actor_id=act_id,
+            actor_role=actor_role,
             application_id=app_id,
             reason=reason,
         )
@@ -195,43 +236,57 @@ class WebApiHandler:
         data = [dict(r) for r in rows]
         return self.ok({"grants": data, "count": len(data)})
 
-    async def manual_grant(self, payload: dict[str, Any], actor_id: str = "WebUI") -> dict[str, Any]:
+    async def manual_grant(
+        self,
+        payload: dict[str, Any],
+        actor_id: str = "dashboard_admin",
+        actor_role: str = "DASHBOARD_ADMIN",
+    ) -> dict[str, Any]:
         """API handler for manual grant."""
         group_id = str(payload.get("group_id", "")).strip()
         user_id = str(payload.get("user_id", "")).strip()
         bot_self_id = str(payload.get("bot_self_id", "default")).strip()
         duration_days = int(payload.get("duration_days", 0))
-        note = str(payload.get("note", "WebUI手动授权")).strip()
+        note = str(payload.get("note", "Dashboard手动授权")).strip()
+        is_level_exempt = bool(payload.get("is_level_exempt", False))
 
         if not group_id or not user_id:
             return self.err("缺少 group_id 或 user_id 参数")
 
+        act_id = actor_id if actor_id and actor_id != "WebUI" else "dashboard_admin"
         success, msg = await self.approval.grant_manually(
-            actor_id=actor_id,
-            actor_role="REVIEWER",
+            actor_id=act_id,
+            actor_role="OWNER" if actor_role == "DASHBOARD_ADMIN" else actor_role,
             bot_self_id=bot_self_id,
             group_id=group_id,
             user_id=user_id,
             duration_days=duration_days,
             note=note,
+            is_level_exempt=is_level_exempt,
         )
         if not success:
             return self.err(msg)
         return self.ok({"message": msg})
 
-    async def revoke_grant(self, payload: dict[str, Any], actor_id: str = "WebUI") -> dict[str, Any]:
+    async def revoke_grant(
+        self,
+        payload: dict[str, Any],
+        actor_id: str = "dashboard_admin",
+        actor_role: str = "DASHBOARD_ADMIN",
+    ) -> dict[str, Any]:
         """API handler to revoke a grant."""
         group_id = str(payload.get("group_id", "")).strip()
         user_id = str(payload.get("user_id", "")).strip()
         bot_self_id = str(payload.get("bot_self_id", "default")).strip()
-        reason = str(payload.get("reason", "WebUI撤销授权")).strip()
+        reason = str(payload.get("reason", "Dashboard撤销授权")).strip()
 
         if not group_id or not user_id:
             return self.err("缺少 group_id 或 user_id 参数")
 
+        act_id = actor_id if actor_id and actor_id != "WebUI" else "dashboard_admin"
         success, msg = await self.approval.revoke_grant(
-            actor_id=actor_id,
-            actor_role="REVIEWER",
+            actor_id=act_id,
+            actor_role=actor_role,
             bot_self_id=bot_self_id,
             group_id=group_id,
             user_id=user_id,
@@ -241,20 +296,26 @@ class WebApiHandler:
             return self.err(msg)
         return self.ok({"message": msg})
 
-    async def ban_user(self, payload: dict[str, Any], actor_id: str = "WebUI") -> dict[str, Any]:
+    async def ban_user(
+        self,
+        payload: dict[str, Any],
+        actor_id: str = "dashboard_admin",
+        actor_role: str = "DASHBOARD_ADMIN",
+    ) -> dict[str, Any]:
         """API handler to blacklist a user."""
         group_id = str(payload.get("group_id", "ALL")).strip()
         user_id = str(payload.get("user_id", "")).strip()
         bot_self_id = str(payload.get("bot_self_id", "default")).strip()
-        reason = str(payload.get("reason", "WebUI拉黑")).strip()
+        reason = str(payload.get("reason", "Dashboard拉黑")).strip()
         days = int(payload.get("duration_days", 0))
 
         if not user_id:
             return self.err("缺少 user_id 参数")
 
+        act_id = actor_id if actor_id and actor_id != "WebUI" else "dashboard_admin"
         success, msg = await self.approval.ban_user(
-            actor_id=actor_id,
-            actor_role="OWNER",
+            actor_id=act_id,
+            actor_role="OWNER" if actor_role == "DASHBOARD_ADMIN" else actor_role,
             bot_self_id=bot_self_id,
             group_id=group_id,
             user_id=user_id,
@@ -263,7 +324,12 @@ class WebApiHandler:
         )
         return self.ok({"message": msg})
 
-    async def unban_user(self, payload: dict[str, Any], actor_id: str = "WebUI") -> dict[str, Any]:
+    async def unban_user(
+        self,
+        payload: dict[str, Any],
+        actor_id: str = "dashboard_admin",
+        actor_role: str = "DASHBOARD_ADMIN",
+    ) -> dict[str, Any]:
         """API handler to unban user."""
         group_id = str(payload.get("group_id", "ALL")).strip()
         user_id = str(payload.get("user_id", "")).strip()
@@ -272,9 +338,10 @@ class WebApiHandler:
         if not user_id:
             return self.err("缺少 user_id 参数")
 
+        act_id = actor_id if actor_id and actor_id != "WebUI" else "dashboard_admin"
         success, msg = await self.approval.unban_user(
-            actor_id=actor_id,
-            actor_role="OWNER",
+            actor_id=act_id,
+            actor_role="OWNER" if actor_role == "DASHBOARD_ADMIN" else actor_role,
             bot_self_id=bot_self_id,
             group_id=group_id,
             user_id=user_id,
