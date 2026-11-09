@@ -22,11 +22,21 @@
         <select id="global-bot-select" class="input-select" style="max-width: 170px; height: 36px; padding: 4px 8px; font-size: 13px;">
           <option value="">全部 Bot</option>
         </select>
-        <span class="status-badge" id="handler-diag-badge" style="cursor: pointer;" title="点击查看 Handler 优先级诊断">🔍 检查审核链</span>
+        <span class="bot-hint" id="bot-hint" hidden></span>
+        <span class="status-badge" id="handler-diag-badge" title="GroupGuardian 审核优先级的真实诊断结果">🔍 检查审核链</span>
         <span class="status-badge live" id="system-status">系统调试中 (v0.1.1)</span>
         <button class="btn btn-secondary" id="btn-refresh">🔄 刷新数据</button>
       </div>
     </header>
+
+    <div class="diag-banner" id="diag-banner" role="status" aria-live="polite" hidden>
+      <span class="diag-banner-icon" id="diag-banner-icon">🛡️</span>
+      <div class="diag-banner-body">
+        <strong id="diag-banner-title">审核链状态</strong>
+        <p id="diag-banner-message"></p>
+        <p id="diag-banner-recommendations" class="diag-banner-rec" hidden></p>
+      </div>
+    </div>
 
     <nav class="app-nav">
       <button class="nav-tab active" data-tab="tab-overview">📊 运行概览</button>
@@ -278,6 +288,45 @@
         <div class="modal-footer">
           <button class="btn btn-secondary" id="modal-btn-cancel">取消</button>
           <button class="btn btn-primary" id="modal-btn-confirm">确认执行</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal: Manual Grant -->
+    <div class="modal" id="modal-grant">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h3>手动添加用户授权</h3>
+          <button class="modal-close" id="modal-grant-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-row">
+            <label>群号：</label>
+            <input type="text" id="grant-form-group" class="input-text" placeholder="例如：123456789" inputmode="numeric" />
+          </div>
+          <div class="form-row">
+            <label>用户 QQ：</label>
+            <input type="text" id="grant-form-user" class="input-text" placeholder="例如：10001" inputmode="numeric" />
+          </div>
+          <div class="form-row">
+            <label>授权有效期（天，0为永久）：</label>
+            <input type="number" id="grant-form-days" class="input-text" value="0" min="0" />
+          </div>
+          <div class="form-row">
+            <label>豁免群等级检查：</label>
+            <select id="grant-form-exempt" class="input-select">
+              <option value="false">否（按群等级要求）</option>
+              <option value="true">是（手动豁免等级）</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label>备注：</label>
+            <input type="text" id="grant-form-note" class="input-text" placeholder="手动授权原因（可选）" />
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="modal-grant-cancel">取消</button>
+          <button class="btn btn-primary" id="modal-grant-save">确认授权</button>
         </div>
       </div>
     </div>
