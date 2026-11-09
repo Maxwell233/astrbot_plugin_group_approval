@@ -222,7 +222,7 @@ class CommandDispatcher:
         subargs = args[1:]
 
         is_owner = self.config.is_owner(sender_id)
-        is_reviewer = self.config.is_reviewer(sender_id)
+        is_reviewer = await self.approval.is_reviewer(sender_id)
 
         if not is_reviewer:
             return "权限不足：您不是 Group Approval 审核员或 Owner。"
@@ -298,10 +298,16 @@ class CommandDispatcher:
 
         if subcmd == "grant":
             if len(subargs) < 2:
-                return "用法：/ga grant <群号> <QQ> [天数, 默认0永久]"
+                return "用法：/ga grant <群号> <QQ> [天数, 默认0永久] [--exempt]"
             t_gid = subargs[0]
             t_uid = subargs[1]
-            days = int(subargs[2]) if len(subargs) > 2 and subargs[2].isdigit() else 0
+            days = 0
+            is_exempt = False
+            for extra in subargs[2:]:
+                if extra.isdigit():
+                    days = int(extra)
+                elif extra.lower() in ("--exempt", "-e", "exempt", "免等级"):
+                    is_exempt = True
             success, msg = await self.approval.grant_manually(
                 actor_id=sender_id,
                 actor_role="OWNER",
@@ -309,7 +315,8 @@ class CommandDispatcher:
                 group_id=t_gid,
                 user_id=t_uid,
                 duration_days=days,
-                note="Owner手动授权",
+                note="Owner手动授权" + (" (免等级检查)" if is_exempt else ""),
+                is_level_exempt=is_exempt,
             )
             return msg
 
@@ -333,7 +340,7 @@ class CommandDispatcher:
 
         elif subcmd == "unban":
             if len(subargs) < 2:
-                return "用法：/ga unban <群号> <QQ>"
+                return "用法：/ga unban <群号|all> <QQ>"
             t_gid = subargs[0]
             t_uid = subargs[1]
             success, msg = await self.approval.unban_user(
@@ -346,19 +353,24 @@ class CommandDispatcher:
             return msg
 
         elif subcmd == "reviewer":
+            if not subargs:
+                return "用法：/ga reviewer add <QQ>、/ga reviewer remove <QQ> 或 /ga reviewer list"
+            action = subargs[0].lower()
+            if action == "list":
+                reviewers = await self.approval.list_reviewers()
+                if not reviewers:
+                    return "当前未配置任何审核员。"
+                return f"【审核员列表（共 {len(reviewers)} 人）】\n" + "\n".join(f"• QQ: {q}" for q in reviewers)
             if len(subargs) < 2:
                 return "用法：/ga reviewer add <QQ> 或 /ga reviewer remove <QQ>"
-            action = subargs[0].lower()
             t_uid = subargs[1]
             if action == "add":
-                if t_uid not in self.config.reviewer_qq_ids:
-                    self.config.reviewer_qq_ids.append(t_uid)
-                return f"已将 QQ {t_uid} 添加为审核员。"
+                ok, msg = await self.approval.add_reviewer(t_uid, added_by=sender_id)
+                return msg
             elif action == "remove":
-                if t_uid in self.config.reviewer_qq_ids:
-                    self.config.reviewer_qq_ids.remove(t_uid)
-                return f"已将 QQ {t_uid} 移出审核员名单。"
-            return "未知子命令，仅支持 add 或 remove。"
+                ok, msg = await self.approval.remove_reviewer(t_uid)
+                return msg
+            return "未知子命令，仅支持 add、remove 或 list。"
 
         elif subcmd == "level":
             if len(subargs) < 2 or not subargs[1].isdigit():

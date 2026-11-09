@@ -107,6 +107,8 @@ class Grant:
     group_id: str
     user_id: str
     status: GrantStatus = GrantStatus.ACTIVE
+    grant_type: str = "LEVEL_APPROVAL"  # "LEVEL_APPROVAL", "OWNER_MANUAL", "LEVEL_EXEMPTION"
+    is_level_exempt: bool = False
     source_application_id: str | None = None
     approved_by: str = ""
     approved_at: int = field(default_factory=lambda: int(time.time()))
@@ -121,6 +123,30 @@ class Grant:
         data = asdict(self)
         data["status"] = self.status.value if isinstance(self.status, GrantStatus) else self.status
         return data
+
+
+@dataclass
+class ReviewerRecord:
+    """Persistent reviewer entry."""
+
+    qq_id: str
+    added_by: str = ""
+    added_at: int = field(default_factory=lambda: int(time.time()))
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class RateLimitRecord:
+    """Record for sliding window rate limits."""
+
+    key: str
+    count: int = 0
+    window_start: int = field(default_factory=lambda: int(time.time()))
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass

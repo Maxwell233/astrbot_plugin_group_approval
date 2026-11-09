@@ -122,6 +122,26 @@ CREATE INDEX IF NOT EXISTS idx_outbox_pending ON notification_outbox (status, ne
 """
 
 
+MIGRATION_V2_SQL = """
+-- Persistent Reviewers table
+CREATE TABLE IF NOT EXISTS reviewers (
+    qq_id TEXT PRIMARY KEY,
+    added_by TEXT NOT NULL,
+    added_at INTEGER NOT NULL
+);
+
+-- Application rate limiting table
+CREATE TABLE IF NOT EXISTS rate_limits (
+    key TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    window_start INTEGER NOT NULL
+);
+
+-- Ensure unique event_key on notification_outbox to prevent duplicate enqueue
+CREATE UNIQUE INDEX IF NOT EXISTS uq_outbox_event_key ON notification_outbox (event_key);
+"""
+
+
 async def apply_v1(db: aiosqlite.Connection) -> None:
     await db.executescript(MIGRATION_V1_SQL)
     await db.execute(
@@ -131,8 +151,29 @@ async def apply_v1(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def apply_v2(db: aiosqlite.Connection) -> None:
+    # 1. Execute new tables and unique constraints
+    await db.executescript(MIGRATION_V2_SQL)
+
+    # 2. Check and add columns to grants table if not existing
+    async with db.execute("PRAGMA table_info(grants)") as cursor:
+        cols = [r[1] for r in await cursor.fetchall()]
+
+    if "grant_type" not in cols:
+        await db.execute("ALTER TABLE grants ADD COLUMN grant_type TEXT NOT NULL DEFAULT 'LEVEL_APPROVAL'")
+    if "is_level_exempt" not in cols:
+        await db.execute("ALTER TABLE grants ADD COLUMN is_level_exempt INTEGER NOT NULL DEFAULT 0")
+
+    await db.execute(
+        "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (2, ?)",
+        (int(time.time()),),
+    )
+    await db.commit()
+
+
 MIGRATIONS: list[tuple[int, Callable[[aiosqlite.Connection], Any]]] = [
     (1, apply_v1),
+    (2, apply_v2),
 ]
 
 

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 import aiosqlite
 
@@ -18,6 +19,7 @@ class Database:
         self.db_path = str(db_path)
         self._conn: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
+        self._tx_lock = asyncio.Lock()
 
     async def init(self) -> None:
         """Initialize connection, pragmas, and run schema migrations."""
@@ -46,6 +48,19 @@ class Database:
             await self.init()
         assert self._conn is not None
         return self._conn
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Execute an atomic write transaction with BEGIN IMMEDIATE and explicit rollback."""
+        async with self._tx_lock:
+            conn = await self.get_connection()
+            await conn.execute("BEGIN IMMEDIATE;")
+            try:
+                yield conn
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def close(self) -> None:
         """Close connection cleanly."""
