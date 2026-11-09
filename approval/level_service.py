@@ -9,7 +9,11 @@ import time
 from typing import Any
 
 from .models import GroupMemberLevelResult
-from .napcat_client import NapCatClient, normalize_onebot_response
+from .napcat_client import (
+    BOT_IDENTITY_ERROR_CODES,
+    NapCatClient,
+    normalize_onebot_response,
+)
 
 logger = logging.getLogger("astrbot_plugin_group_approval.level")
 
@@ -159,6 +163,21 @@ class LevelService:
             logger.warning(
                 f"NapCat get_group_member_info failed for bot={bot_id}, group={group_id}, user={user_id}: {err_msg} (retcode={retcode})"
             )
+            # Fail closed on bot-identity resolution: surface a stable error code
+            # instead of a generic retcode so callers can distinguish "bot not
+            # connected/verified" from protocol-level member lookup failures.
+            error_text = str(err_msg or "")
+            identity_error = next(
+                (code for code in BOT_IDENTITY_ERROR_CODES if error_text.startswith(code)),
+                None,
+            )
+            if identity_error is not None:
+                logger.error(
+                    f"Refusing level lookup for unverified bot {bot_id!r}: {error_text[:200]}"
+                )
+                error_code = identity_error
+            else:
+                error_code = f"RETCODE_{retcode}" if retcode != 0 else error_text
             return GroupMemberLevelResult(
                 success=False,
                 level=0,
@@ -166,7 +185,7 @@ class LevelService:
                 is_member=False,
                 group_id=group_id,
                 user_id=user_id,
-                error_code=f"RETCODE_{retcode}" if retcode != 0 else err_msg,
+                error_code=error_code,
                 raw_data={"error_msg": err_msg, "retcode": retcode},
             )
 
