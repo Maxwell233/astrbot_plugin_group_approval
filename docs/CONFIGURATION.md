@@ -3,7 +3,8 @@
 ## AstrBot 插件配置
 
 - `enabled` 默认开启，启用时安装 AstrBot 4.29.4 原生聊天兼容层。
-- `owner_qq_ids` 配置 QQ Owner。`reviewer_qq_ids` 是初始审核员，之后可由 Owner 私聊管理。
+- `owner_qq_ids` 配置 QQ Owner。开启 `inherit_astrbot_admins` 后，AstrBot 全局 `admins_id` 中的数字 ID 也按 QQ Owner 识别。开关默认关闭，只在这些数字 ID 都是可信 QQ 号时开启。会话级管理员和 QQ 群管理员不用于此判定。
+- `reviewer_qq_ids` 是初始审核员，之后可由 Owner 私聊管理。要接收私聊审核通知，请将 QQ 明确加入插件的 Owner 或审核员列表。
 - `private_chat.admin_commands_enabled` 控制所有 QQ `/ga` 管理命令。Dashboard 使用独立的 AstrBot 管理员认证。
 - `application.query_limit` 默认 3，`application.query_window_seconds` 默认 60。每个 Bot、用户、域在窗口内可发起的申请等级核验次数独立计数，NapCat 查询失败或等级不够也计数。已有授权或仍需审批的待审申请通常直接返回状态。
 - `application.rate_limit_per_hour` 默认 5，仅限制每个 Bot、用户、域每小时新建的待审申请数。

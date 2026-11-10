@@ -115,7 +115,10 @@ class ScopeCommands:
             rows = [f"{a['id']} {LABELS[a['scope']]} {a['status']}" for a in data["applications"][:8]]
             return "\n".join(rows) or "暂无申请记录。"
         states = {g["scope"]: g["status"] for g in data["grants"]}
-        return "\n".join(f"{LABELS[s]} AI：{states.get(s, '未授权')}" for s in SCOPES)
+        status = "\n".join(f"{LABELS[s]} AI：{states.get(s, '未授权')}" for s in SCOPES)
+        if command == "我的权限" and is_private:
+            return f"当前 Bot QQ：{bot}\n你的 QQ：{user}\n{status}"
+        return status
 
     async def admin(self, bot: str, user: str, private: bool, args: list[str]) -> str:
         if not self.service.config.private_chat.admin_commands_enabled:

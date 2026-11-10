@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,9 +40,13 @@ class PluginConfig:
     private_chat: PrivateChatConfig = field(default_factory=PrivateChatConfig)
     notifications: NotificationConfig = field(default_factory=NotificationConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
+    inherit_astrbot_admins: bool = False
+    astrbot_admin_qq_ids: Callable[[], set[str]] | None = field(default=None, repr=False)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> PluginConfig:
+    def from_dict(
+        cls, data: dict[str, Any] | None, *, astrbot_admin_qq_ids: Callable[[], set[str]] | None = None,
+    ) -> PluginConfig:
         data = data or {}
         application = data.get("application") or {}
         private = data.get("private_chat") or {}
@@ -63,7 +68,13 @@ class PluginConfig:
                 retry_interval_seconds=max(1, int(notifications.get("retry_interval_seconds", 60))),
             ),
             security=SecurityConfig(keep_audit_days=max(0, int(security.get("keep_audit_days", 90)))),
+            inherit_astrbot_admins=data.get("inherit_astrbot_admins") is True,
+            astrbot_admin_qq_ids=astrbot_admin_qq_ids,
         )
 
     def is_owner(self, user: str) -> bool:
-        return str(user).strip() in self.owner_qq_ids
+        user = str(user).strip()
+        if user in self.owner_qq_ids:
+            return True
+        return (self.inherit_astrbot_admins and self.astrbot_admin_qq_ids is not None
+                and user in self.astrbot_admin_qq_ids())

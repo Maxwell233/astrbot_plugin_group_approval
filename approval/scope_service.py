@@ -230,7 +230,8 @@ class ScopeService:
         if settings.owner_bypass and self.config.is_owner(user):
             async with self.db.transaction():
                 current = await self.settings(bot)
-                if current.owner_bypass and not await self._restricted(bot, user, scope):
+                if (current.owner_bypass and not await self._restricted(bot, user, scope)
+                        and self.config.is_owner(user)):
                     return None
         grant = await self.grant(bot, user, scope)
         if not grant or grant["status"] != "ACTIVE":

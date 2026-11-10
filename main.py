@@ -89,6 +89,22 @@ except ImportError:
 
     request = Any  # type: ignore
 
+
+def _astrbot_admin_qq_ids(context: Any) -> set[str]:
+    if context is None:
+        return set()
+    try:
+        # With no UMO, AstrBot returns the global/default configuration.
+        config = context.get_config()
+    except Exception:
+        logger.warning("Could not read AstrBot global admin IDs")
+        return set()
+    admins = config.get("admins_id") if isinstance(config, dict) else None
+    if not isinstance(admins, list):
+        return set()
+    return {qq for item in admins if valid_qq(qq := str(item).strip())}
+
+
 class GroupApprovalPlugin(Star):
     """Group Approval Star Plugin."""
 
@@ -98,7 +114,7 @@ class GroupApprovalPlugin(Star):
 
         # 1. Parse configuration
         raw_cfg = getattr(config, "to_dict", lambda: config)() if config else {}
-        self.plugin_config = PluginConfig.from_dict(raw_cfg)
+        self.plugin_config = PluginConfig.from_dict(raw_cfg, astrbot_admin_qq_ids=lambda: _astrbot_admin_qq_ids(context))
 
         data_dir = StarTools.get_data_dir(PLUGIN_NAME) if ASTRBOT_AVAILABLE else Path("data") / PLUGIN_NAME
         self.db = Database(data_dir / "group_approval.db")
@@ -313,7 +329,7 @@ class GroupApprovalPlugin(Star):
             yield event.plain_result(reply)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    @filter.command("我的权限")
+    @filter.command("我的权限", alias={"/我的权限"})
     async def cmd_my_status(self, event: AstrMessageEvent):
         reply = await self._command(event, "我的权限")
         if reply is not None:

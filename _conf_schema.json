@@ -9,6 +9,12 @@
     "type": "list",
     "default": []
   },
+  "inherit_astrbot_admins": {
+    "description": "将 AstrBot 全局管理员中的 QQ 号作为 Owner",
+    "hint": "仅当全局管理员列表中的数字 ID 都是你信任的 QQ 号时开启。Owner 聊天仍需授权或开启 Bot 的聊天豁免。",
+    "type": "bool",
+    "default": false
+  },
   "reviewer_qq_ids": {
     "description": "初始审核员 QQ 号列表",
     "type": "list",

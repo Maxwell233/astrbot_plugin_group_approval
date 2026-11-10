@@ -48,7 +48,7 @@
 | 黑名单 | `/ga ban <QQ> <group\|private\|all>`、`/ga unban <QQ> <group\|private\|all>` |
 | 查询 | `/ga user <QQ>`、`/ga status` |
 
-Owner 与 Reviewer 的管理资格不自动授予 AI 聊天。两类豁免由 Owner 分别授予或解除。只有双重豁免可以完全跳过主群资格核验。Dashboard 也可查看申请、授权来源、最近等级核验和审计记录。
+可以在插件设置中开启「将 AstrBot 全局管理员中的 QQ 号作为 Owner」。Owner 与 Reviewer 的管理资格不自动授予 AI 聊天。两类豁免由 Owner 分别授予或解除。只有双重豁免可以完全跳过主群资格核验。Dashboard 也可查看申请、授权来源、最近等级核验和审计记录。
 
 - [配置说明](docs/CONFIGURATION.md)
 - [Owner 私聊与申请指令排查](docs/TROUBLESHOOTING.md)

@@ -86,3 +86,59 @@ async def test_fail_closed_on_napcat_disconnect(integration):
     napcat.network_error_on_next = True
     assert "无法核验" in await plugin._check_native_chat(event())
     assert (await plugin.scopes.grant(BOT, USER, "GROUP"))["status"] == "ACTIVE"
+
+
+async def test_opt_in_owner_inheritance_uses_current_global_astrbot_admin_ids(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    global_config = {"admins_id": [USER, int(OWNER), "astrbot", "０１２３４", True]}
+    get_config = Mock(return_value=global_config)
+    context = SimpleNamespace(get_config=get_config)
+    monkeypatch.setattr(main, "ASTRBOT_AVAILABLE", True)
+    monkeypatch.setattr(main, "StarTools", SimpleNamespace(get_data_dir=lambda *_: tmp_path))
+    plugin = main.GroupApprovalPlugin(context=context, config={"inherit_astrbot_admins": True})
+    monkeypatch.setattr(plugin.napcat, "has_verified_bot", AsyncMock(return_value=True))
+
+    await plugin.db.init()
+    try:
+        admin_command = event(private=True, user=USER, text="ga status")
+        assert "主群" in await plugin._command(admin_command, "ga")
+        assert plugin.plugin_config.is_owner(OWNER)
+        assert not plugin.plugin_config.is_owner("astrbot")
+        assert not plugin.plugin_config.is_owner("０１２３４")
+        assert not plugin.plugin_config.is_owner("True")
+        assert all(not call.args and not call.kwargs for call in get_config.call_args_list)
+
+        chat = event(private=True, user=USER)
+        assert "Owner 原生聊天豁免" in await plugin._check_native_chat(chat)
+        await plugin.scopes.configure(BOT, USER, owner_bypass=True)
+        assert await plugin._check_native_chat(chat) is None
+        assert await plugin._check_native_chat(event(bot="22222", private=True, user=USER))
+
+        global_config["admins_id"] = []
+        admin_command.role = "admin"
+        assert "需要 Owner" in await plugin._command(admin_command, "ga")
+        assert "尚无" in await plugin._check_native_chat(chat)
+    finally:
+        await plugin.db.close()
+
+
+def test_astrbot_admins_do_not_replace_explicit_owners_when_inheritance_is_disabled(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    get_config = Mock(return_value={"admins_id": [USER]})
+    context = SimpleNamespace(get_config=get_config)
+    monkeypatch.setattr(main, "ASTRBOT_AVAILABLE", True)
+    monkeypatch.setattr(main, "StarTools", SimpleNamespace(get_data_dir=lambda *_: tmp_path))
+    plugin = main.GroupApprovalPlugin(context=context, config={"owner_qq_ids": [OWNER]})
+    assert plugin.plugin_config.is_owner(OWNER)
+    assert not plugin.plugin_config.is_owner(USER)
+    get_config.assert_not_called()
+
+
+async def test_permission_command_displays_identity_only_in_private(integration):
+    plugin, _ = integration
+    private = await plugin._command(event(private=True, text="/我的权限"), "我的权限")
+    assert private.splitlines()[:2] == [f"当前 Bot QQ：{BOT}", f"你的 QQ：{USER}"]
+    group = await plugin._command(event(text="/我的权限"), "我的权限")
+    assert BOT not in group and USER not in group

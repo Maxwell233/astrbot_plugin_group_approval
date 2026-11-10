@@ -52,3 +52,24 @@ async def test_dashboard_cannot_use_another_bots_application_id(dashboard_plugin
     monkeypatch.setattr(main, "request", Request("dashboard-admin", payload))
     assert (await dashboard_plugin._web_action())["status"] == "error"
     assert (await dashboard_plugin.scopes.application("11111", "L123456789abc"))["status"] == "PENDING"
+
+
+async def test_dashboard_private_grant_matches_bot_and_sender_of_live_chat(dashboard_plugin, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from tests.test_integration import event
+
+    payload = {
+        "bot_self_id": "11111", "action": "grant", "user_id": "30001", "scope": "PRIVATE",
+        "level_exempt": True, "membership_exempt": True,
+    }
+    monkeypatch.setattr(main, "request", Request("dashboard-admin", payload))
+    assert (await dashboard_plugin._web_action())["status"] == "ok"
+    grant, = (await dashboard_plugin._web_state())["data"]["grants"]
+    assert (grant["bot_self_id"], grant["user_id"], grant["scope"], grant["status"]) == (
+        "11111", "30001", "PRIVATE", "ACTIVE",
+    )
+    monkeypatch.setattr(dashboard_plugin.napcat, "has_verified_bot", AsyncMock(return_value=True))
+    assert await dashboard_plugin._check_native_chat(event(user="30001", private=True)) is None
+    assert "尚无" in await dashboard_plugin._check_native_chat(event(bot="22222", user="30001", private=True))
+    assert "尚无" in await dashboard_plugin._check_native_chat(event(user="30002", private=True))
