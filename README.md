@@ -18,7 +18,7 @@
 | GROUP | 在同一个 QQ Bot 所在的群里使用原生 AI 聊天 | 主群 LV10 | 开启 |
 | PRIVATE | 与该 QQ Bot 私聊进行原生 AI 聊天 | 主群 LV20 | 开启 |
 
-每个 QQ Bot 单独配置一个主群。申请、批准和后续资格复核都查主群。获批的 GROUP 用户在其他群聊天时仍使用这个主群的等级。两个授权域各自撤销和恢复，授权没有到期日。等级缓存默认 300 秒。
+每个 QQ Bot 单独配置一个主群。申请、批准和后续资格复核都查主群。获批的 GROUP 用户在其他群聊天时仍使用这个主群的等级。两个授权域各自撤销和恢复，授权没有到期日。等级缓存默认 300 秒。申请需要查询主群等级时，默认每个 Bot、用户、授权域每 60 秒最多查 3 次。
 
 可独立开启 GROUP → PRIVATE 和 PRIVATE → GROUP 的免审批方向。用户须主动申请目标域，满足目标等级，且来源授权仍有效。跨域授予不继承豁免，也不会恢复人工撤销的权限。
 
@@ -26,8 +26,8 @@
 
 1. 将插件安装到 AstrBot 4.29.4 的插件目录，配置 Owner QQ，确认 NapCat 账号已连接。
 2. 打开 Group Approval Dashboard，确认显示「原生聊天准入已启用」。选择 QQ Bot，保存主群和两个授权域的策略。Bot 须已加入主群并能查询群成员等级。
-3. 用测试群账号分别试用未授权的原生聊天和独立插件，再申请并测试 GROUP、PRIVATE。主群变更后第一次使用会重新核验。
-4. GroupGuardian 可按原配置审核全群。旧 GroupGuardian 优先级补丁仍可保留。若旧版应用过 LivingMemory 被动采集补丁，请恢复其上游过滤器再重载。 [兼容性与验证范围](COMPATIBILITY.md)
+3. 用测试群账号分别试用未授权的原生聊天和独立插件，再申请并测试 GROUP、PRIVATE。更换主群会取消旧主群的待审申请。已有授权保留，下一次原生聊天重新核验。
+4. GroupGuardian 可按原配置审核全群。原生聊天准入无需修改 GroupGuardian 或 LivingMemory 的代码。 [兼容性与验证范围](COMPATIBILITY.md)
 
 ## 指令
 
@@ -42,11 +42,12 @@
 | 主群和策略 | `/ga primary-group set <群号>`、`/ga primary-group show`、`/ga level <group\|private> <等级>`、`/ga approval <group\|private> <on\|off>` |
 | 跨域免审 | `/ga cross-grant <group-to-private\|private-to-group> <on\|off>` |
 | 豁免 | 授予时可加 `--level-exempt`、`--membership-exempt`，也可用 `/ga exemptions <QQ> <域> <等级 on/off> <成员 on/off>` |
+| 黑名单 | `/ga ban <QQ> <group\|private\|all>`、`/ga unban <QQ> <group\|private\|all>` |
 | 查询 | `/ga user <QQ>`、`/ga status` |
 
 Owner 与 Reviewer 的管理资格不自动授予 AI 聊天。两类豁免由 Owner 分别授予或解除。只有双重豁免可以完全跳过主群资格核验。Dashboard 也可查看申请、授权来源、最近等级核验和审计记录。
 
 - [配置说明](docs/CONFIGURATION.md)
-- [数据迁移](docs/MIGRATION.md)
+- [首次安装与数据存储](docs/MIGRATION.md)
 - [安全边界](docs/SECURITY.md)
 - [组件测试与验收](INTEGRATION_TEST_REPORT.md)

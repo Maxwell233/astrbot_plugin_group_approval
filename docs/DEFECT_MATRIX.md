@@ -1,5 +1,7 @@
 # 缺陷矩阵（Defect Matrix）— v0.1.1 审计与修复记录
 
+本文记录 0.1.1 的历史审计。当前双域架构和测试见 [0.1.2 验证报告](../INTEGRATION_TEST_REPORT.md)。
+
 > 本文记录 0.1.1 的历史修复。0.1.2 的准入范围、测试与第三方兼容方式见 [新版验证报告](../INTEGRATION_TEST_REPORT.md)。
 
 以下为历史审计记录，基线为 PR #1 head `eba75d8feda2c4513ec7b12136f471ec059d6218`。当前修复和验证见 [本轮测试报告](../INTEGRATION_TEST_REPORT.md)。
