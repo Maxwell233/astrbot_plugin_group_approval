@@ -1,7 +1,6 @@
 """NapCat / OneBot v11 client adapter for AstrBot.
 
-Multi-bot routing is grounded in AstrBot's official platform API (see
-``audit/astrbot-facts.md`` sections f/i):
+Multi-bot routing uses AstrBot's platform API:
 
 - ``context.platform_manager.get_insts()`` (or ``platform_insts``)
 - ``inst.meta().name == "aiocqhttp"`` and ``inst.get_client() -> CQHttp``
@@ -15,8 +14,7 @@ targeted action here forwards ``self_id=<verified QQ>`` explicitly.
 Identity policy (fail closed):
 
 - Reverse-WebSocket accounts must match a routed ``get_login_info`` probe.
-- Registry-less transports can temporarily use identity learned from an inbound event.
-  Dashboard writes always require a fresh login probe.
+- Dashboard writes require a fresh login probe.
 - Unknown ids never fall back to "the first instance".
 - Untargeted calls are only allowed when exactly one aiocqhttp bot is verified.
 """
@@ -29,6 +27,13 @@ import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
+
+try:
+    from aiocqhttp.exceptions import ActionFailed
+except ImportError:  # Standalone service tests do not install AstrBot's OneBot SDK.
+    ACTION_FAILED_ERRORS = ()
+else:
+    ACTION_FAILED_ERRORS = (ActionFailed,)
 
 logger = logging.getLogger("astrbot_plugin_group_approval.napcat")
 
@@ -103,16 +108,6 @@ def normalize_onebot_response(resp: Any) -> tuple[bool, dict[str, Any] | None, s
                     code = -4
                 return False, None, str(msg), code
 
-        # 3. Direct unpacked dictionary returned by some AstrBot adapters
-        # Check for member info dictionary (has user_id, group_id, or level)
-        if "user_id" in resp or "group_id" in resp or "level" in resp:
-            return True, resp, "", 0
-
-        # Empty dictionary in some adapters indicates success with no payload
-        if not resp:
-            return True, {}, "", 0
-
-        # Fallback dictionary
         return True, resp, "", 0
 
     return False, None, f"Unsupported response type: {type(resp)}", -4
@@ -180,13 +175,12 @@ def _resolve_call_action(client: Any) -> Callable[..., Coroutine[Any, Any, Any]]
 
 @dataclass
 class _BotIdentity:
-    """A verified (or event-attested) bot account bound to a platform instance."""
+    """A verified bot account bound to a platform instance."""
 
     self_id: str
     platform_id: str
     instance: Any
     client: Any
-    source: str  # "login_info" (verified) or "event" (attested by OneBot connection)
     verified_at: float
     socket: Any = None
 
@@ -194,12 +188,7 @@ class _BotIdentity:
 class NapCatClient:
     """Adapter for executing OneBot v11 protocol actions via AstrBot platform client."""
 
-    def __init__(
-        self,
-        call_action_fn: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-        timeout: float = 5.0,
-    ):
-        self._custom_call_action = call_action_fn
+    def __init__(self, *, timeout: float = 5.0):
         self.timeout = timeout
         self._context: Any = None
         self._bindings: dict[tuple[str, str], _BotIdentity] = {}
@@ -363,7 +352,6 @@ class NapCatClient:
                     now = time.monotonic()
                     if (
                         previous is not None
-                        and previous.source == "login_info"
                         and previous.socket is socket
                         and now - previous.verified_at < IDENTITY_TTL_SECONDS
                     ):
@@ -374,28 +362,22 @@ class NapCatClient:
                         if sockets is not None and sockets.get(qq) is not socket:
                             continue
                         self._bindings[platform_id, qq] = _BotIdentity(
-                            qq, platform_id, inst, client, "login_info", time.monotonic(), socket
+                            qq, platform_id, inst, client, time.monotonic(), socket
                         )
-                    elif hint is not None and not (
-                        sockets is None and previous is not None and previous.source == "event"
-                        and now - previous.verified_at < IDENTITY_TTL_SECONDS and qq is None
-                    ):
+                    elif hint is not None:
                         self._bindings.pop((platform_id, hint), None)
                         if sockets is None:
                             # A registry-less single-account transport can reconnect as a new QQ.
                             replacement = await self._query_login_info(client)
                             if replacement is not None:
                                 self._bindings[platform_id, replacement] = _BotIdentity(
-                                    replacement, platform_id, inst, client, "login_info", time.monotonic()
+                                    replacement, platform_id, inst, client, time.monotonic()
                                 )
 
             for key, binding in list(self._bindings.items()):
                 sockets = self._reverse_sockets(binding.client)
                 instance = current_instances.get(binding.platform_id)
-                if binding.instance is None:
-                    if time.monotonic() - binding.verified_at < IDENTITY_TTL_SECONDS:
-                        continue
-                elif instance is not None and instance[0] is binding.instance and instance[1] is binding.client:
+                if instance is not None and instance[0] is binding.instance and instance[1] is binding.client:
                     if sockets is None or sockets.get(binding.self_id) is binding.socket:
                         continue
                 self._bindings.pop(key, None)
@@ -447,8 +429,7 @@ class NapCatClient:
         """Confirm an inbound Bot is bound to this AIOCQHTTP instance."""
         if not platform_id:
             return False
-        binding = await self._resolve_verified(bot_self_id, platform_id)
-        return binding is not None and binding.source == "login_info"
+        return await self._resolve_verified(bot_self_id, platform_id) is not None
 
     async def verify_bot(self, bot_self_id: str, *, platform_id: str | None = None) -> bool:
         """Require a fresh routed login probe for an administrative mutation."""
@@ -519,22 +500,6 @@ class NapCatClient:
         Returns:
             (success: bool, data: dict | None, error_msg: str, error_code: int)
         """
-        if self._custom_call_action is not None:
-            # Injected-transport hook kept for backward compatibility.  The
-            # production path below is the official AstrBot platform client.
-            try:
-                raw = await asyncio.wait_for(
-                    self._custom_call_action(action, bot_self_id=bot_self_id, **params),
-                    timeout=self.timeout,
-                )
-                return normalize_onebot_response(raw)
-            except TimeoutError:
-                logger.warning(f"NapCat action '{action}' timed out after {self.timeout}s")
-                return False, None, f"Timeout after {self.timeout}s", -1
-            except Exception as e:
-                logger.error(f"NapCat action '{action}' raised exception: {e}")
-                return False, None, str(e), -2
-
         binding = await self._resolve_verified(bot_self_id, platform_id)
         if binding is None:
             return self._fail_closed(bot_self_id, platform_id)
@@ -564,6 +529,8 @@ class NapCatClient:
                 call_action(action, **routing_params),
                 timeout=self.timeout,
             )
+        except ACTION_FAILED_ERRORS as exc:
+            return normalize_onebot_response(exc.result)
         except TimeoutError:
             self.invalidate_bot_cache(binding.self_id, binding.platform_id)
             logger.warning(f"NapCat action '{action}' timed out after {self.timeout}s")
@@ -579,110 +546,13 @@ class NapCatClient:
         return normalize_onebot_response(raw)
 
     async def list_bots(self) -> list[str]:
-        """Return verified/attested bot QQ ids, sorted ascending.
+        """Return verified bot QQ ids, sorted ascending.
 
         Discovery is lazy: this triggers the first ``get_login_info`` pass if it
         has not happened yet.
         """
         await self._discover()
         return sorted({binding.self_id for binding in self._bindings.values()})
-
-    async def remember_event_identity(self, event: Any) -> str | None:
-        """Learn a bot QQ from an inbound AstrBot event.
-
-        Only registry-less clients need this short-lived compatibility fallback.
-        The payload self_id alone cannot verify a reverse-WebSocket account.
-
-        Returns the learned bot QQ, or None when the event carries no usable
-        identity/client.
-        """
-        if event is None:
-            return None
-        bot_self_id = _normalize_qq(_safe_call(event, "get_self_id"))
-        if bot_self_id is None:
-            return None
-
-        raw_platform_id = _safe_call(event, "get_platform_id")
-        platform_id = str(raw_platform_id).strip() if raw_platform_id else ""
-
-        event_client = getattr(event, "bot", None)
-        client = event_client if event_client is not None and _resolve_call_action(event_client) else None
-
-        instance = self._find_instance(platform_id) if platform_id else None
-        if client is None and instance is not None:
-            client = self._get_instance_client(instance)
-        if client is None:
-            logger.debug(
-                "remember_event_identity: no OneBot client for bot %s (platform_id=%r)",
-                bot_self_id,
-                platform_id,
-            )
-            return None
-
-        if not platform_id:
-            platform_id = f"event:{id(client)}"
-
-        if self._reverse_sockets(client) is not None:
-            return None
-
-        self._bindings[platform_id, bot_self_id] = _BotIdentity(
-            bot_self_id, platform_id, instance, client, "event", time.monotonic()
-        )
-        return bot_self_id
-
-    def _resolve_bot_client(self, bot_self_id: str | None = None) -> Any:
-        """Deprecated, unverified synchronous shim.
-
-        Kept only for backwards compatibility with pre-fix callers that expect a
-        client object.  It performs **no** verification and is never used by
-        :meth:`call_action`; production dispatch goes through
-        :meth:`_resolve_verified` (``get_login_info`` verified, ``self_id``
-        routed).  Prefer :meth:`call_action`/:meth:`list_bots`.
-        """
-        target_bid = str(bot_self_id).strip() if bot_self_id else None
-        # Prefer an already verified binding when the async path populated one.
-        if self._bindings:
-            binding = self._match_binding(target_bid or "", None)
-            if binding is not None:
-                return binding.client if target_bid else binding.instance
-
-        if self._context is None:
-            return None
-
-        platform_manager = getattr(self._context, "platform_manager", None)
-        if platform_manager is not None:
-            get_insts = getattr(platform_manager, "get_insts", None)
-            if callable(get_insts):
-                for inst in get_insts():
-                    platform_name = ""
-                    meta = _safe_call(inst, "meta")
-                    if meta is not None:
-                        name_value = getattr(meta, "name", "")
-                        if isinstance(name_value, str) and name_value:
-                            platform_name = name_value.lower()
-                    if not platform_name:
-                        for attr in ("adapter_type", "platform_name"):
-                            value = getattr(inst, attr, None)
-                            if isinstance(value, str) and value:
-                                platform_name = value.lower()
-                                break
-                    if "aiocqhttp" not in platform_name and "onebot" not in platform_name:
-                        continue
-                    client = getattr(inst, "get_client", lambda: None)()
-                    if client is None:
-                        client = getattr(inst, "bot", None)
-                    if client is None:
-                        continue
-                    if not target_bid:
-                        return client
-                    legacy_self_id = str(
-                        getattr(client, "self_id", None) or getattr(inst, "self_id", None) or ""
-                    ).strip()
-                    if legacy_self_id == target_bid:
-                        return client
-        return None
-
-    # ------------------------------------------------------------ public API
 
     async def get_group_member_info(
         self,
@@ -721,26 +591,6 @@ class NapCatClient:
         }
         return await self.call_action(
             "send_private_msg",
-            bot_self_id=bot_self_id,
-            platform_id=platform_id,
-            **payload,
-        )
-
-    async def send_group_msg(
-        self,
-        group_id: str,
-        message: str,
-        bot_self_id: str | None = None,
-        *,
-        platform_id: str | None = None,
-    ) -> tuple[bool, dict[str, Any] | None, str, int]:
-        """Send message to QQ group via the verified bot account."""
-        payload = {
-            "group_id": int(group_id),
-            "message": message,
-        }
-        return await self.call_action(
-            "send_group_msg",
             bot_self_id=bot_self_id,
             platform_id=platform_id,
             **payload,

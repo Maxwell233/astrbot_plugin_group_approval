@@ -114,27 +114,6 @@ class FakeContext:
         self.platform_manager = FakePlatformManager(instances)
 
 
-class FakeEvent:
-    """Mirror of the AiocqhttpMessageEvent surface used by the plugin."""
-
-    def __init__(
-        self,
-        self_id: str,
-        platform_id: str | None = None,
-        bot: Any = None,
-    ) -> None:
-        self._self_id = self_id
-        self._platform_id = platform_id
-        if bot is not None:
-            self.bot = bot
-
-    def get_self_id(self) -> str:
-        return self._self_id
-
-    def get_platform_id(self):
-        return self._platform_id
-
-
 def make_client(
     instances: list[FakePlatformInstance],
     *,
@@ -187,18 +166,18 @@ async def test_already_unwrapped_response_is_success():
 @pytest.mark.asyncio
 async def test_error_response_returns_failure_tuple():
     transport = FakeCQHttpClient("10001")
-    transport.responses["send_group_msg"] = {
+    transport.responses["send_private_msg"] = {
         "status": "failed",
         "retcode": 10001,
-        "msg": "group not found",
+        "msg": "recipient unavailable",
     }
     client = make_client([FakePlatformInstance("inst-a", transport)])
 
-    ok, data, err, retcode = await client.send_group_msg("90001", "hi", bot_self_id="10001")
+    ok, data, err, retcode = await client.send_private_msg("30001", "hi", bot_self_id="10001")
 
     assert ok is False
     assert data is None
-    assert err == "group not found"
+    assert err == "recipient unavailable"
     assert retcode == 10001
 
 
@@ -274,7 +253,7 @@ async def test_untargeted_send_with_multiple_bots_fails_closed():
         ]
     )
 
-    ok, data, err, retcode = await client.send_group_msg("90001", "hi")
+    ok, data, err, retcode = await client.send_private_msg("30001", "hi")
 
     assert (ok, data, retcode) == (False, None, -3)
     assert err.startswith(ERR_AMBIGUOUS_BOT)
@@ -389,46 +368,6 @@ async def test_disconnect_invalidates_and_rebinds_reconnected_instance():
     # The new connection had to be verified again, and the action went to it.
     assert transport_new.login_calls == 1
     assert_routed_self_id(transport_new, "10001")
-
-
-# --------------------------------------------------------------------------
-# Event-attested identity
-# --------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_remember_event_identity_via_platform_id():
-    transport = FakeCQHttpClient("30003", login_error=True)  # get_login_info unavailable
-    instance = FakePlatformInstance("inst-a", transport)
-    client = make_client([instance])
-    event = FakeEvent(self_id="30003", platform_id="inst-a", bot=transport)
-
-    learned = await client.remember_event_identity(event)
-    assert learned == "30003"
-
-    ok, _data, _err, _retcode = await client.send_private_msg("40004", "hi", bot_self_id="30003")
-    assert ok is True
-    assert_routed_self_id(transport, "30003")
-
-
-@pytest.mark.asyncio
-async def test_remember_event_identity_via_event_bot_without_platform_id():
-    transport = FakeCQHttpClient("30003", login_error=True)
-    client = make_client([])  # no discoverable platform instances
-    event = FakeEvent(self_id="30003", platform_id=None, bot=transport)
-
-    assert await client.remember_event_identity(event) == "30003"
-
-    ok, _data, _err, _retcode = await client.send_group_msg("90001", "hi", bot_self_id="30003")
-    assert ok is True
-    assert_routed_self_id(transport, "30003")
-
-
-@pytest.mark.asyncio
-async def test_remember_event_identity_rejects_missing_self_id():
-    client = make_client([])
-    assert await client.remember_event_identity(FakeEvent(self_id="", platform_id="inst-a")) is None
-    assert await client.remember_event_identity(None) is None
 
 
 # --------------------------------------------------------------------------

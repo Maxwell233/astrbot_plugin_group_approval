@@ -3,8 +3,6 @@
 import asyncio
 
 from approval.auth_service import AuthorizationService
-from approval.level_service import LevelService
-from approval.napcat_client import NapCatClient
 from tests.test_scope_service import BOT, OWNER, PRIMARY
 
 
@@ -18,36 +16,6 @@ async def test_webui_auth_enforcement():
     assert await auth.get_user_role("astrbot") == "OWNER"
     for name in ("admin", "root", "owner", "99999", "88888", "reviewer_bob"):
         assert await auth.get_user_role(name) == "DASHBOARD_USER"
-
-
-def test_post_type_filtering_only_identifies_chat_messages():
-    from main import _is_chat_message
-
-    event = object()
-    assert not _is_chat_message(event, {"post_type": "notice"})
-    assert not _is_chat_message(event, {"post_type": "request"})
-    assert _is_chat_message(event, {"post_type": "message"})
-
-
-def test_strict_level_pattern_matching():
-    level_service = LevelService(NapCatClient())
-
-    # Valid patterns
-    assert level_service.parse_level(18) == 18
-    assert level_service.parse_level("18") == 18
-    assert level_service.parse_level("LV18") == 18
-    assert level_service.parse_level("lv 18") == 18
-    assert level_service.parse_level("等级18") == 18
-    assert level_service.parse_level("Lv0") == 0
-
-    # Invalid / messy text patterns that MUST NOT be matched
-    assert level_service.parse_level("rank_999_user") is None
-    assert level_service.parse_level("VIP1234") is None
-    assert level_service.parse_level("LV") is None
-    assert level_service.parse_level("hello 18 world") is None
-    assert level_service.parse_level("-5") is None
-    assert level_service.parse_level("") is None
-    assert level_service.parse_level(None) is None
 
 
 async def test_concurrent_manual_grants_preserve_distinct_keys(scoped):

@@ -20,9 +20,12 @@ def integration(scoped):
     return plugin, napcat
 
 
-def event(*, bot=BOT, private=False, user=USER, text="hello", post_type="message"):
+def event(*, bot=BOT, private=False, user=USER, text="hello", message_type=None):
     return SimpleNamespace(
-        message_obj={"post_type": post_type}, message_str=text,
+        message_str=text,
+        get_message_type=lambda: message_type or (
+            main.MessageType.FRIEND_MESSAGE if private else main.MessageType.GROUP_MESSAGE
+        ),
         get_self_id=lambda: bot, get_sender_id=lambda: user, get_platform_id=lambda: "adapter-1",
         get_platform_name=lambda: "aiocqhttp", get_group_id=lambda: "" if private else PRIMARY,
         is_private_chat=lambda: private, should_call_llm=lambda flag: None,
@@ -34,6 +37,13 @@ async def test_unauthorized_user_rejected_only_at_native_admission(integration):
     native = event(text="/jrys")
     assert "尚无" in await plugin._check_native_chat(native)
     assert not hasattr(plugin, "on_message_gate")
+
+
+async def test_non_chat_event_is_denied_before_identity_lookup(integration):
+    plugin, _ = integration
+    notice = event(message_type=main.MessageType.OTHER_MESSAGE)
+    assert "会话类型" in await plugin._check_native_chat(notice)
+    plugin.napcat.has_verified_bot.assert_not_awaited()
 
 
 async def test_admission_commands_are_handled_without_llm_grant(integration):

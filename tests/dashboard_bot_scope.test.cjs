@@ -4,8 +4,16 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 function dashboard() {
-  const window = {};
-  window.parent = window;
+  const calls = [];
+  const window = {
+    parent: {},
+    AstrBotPluginView: {
+      async apiPost(path, payload) {
+        calls.push({ path, ...payload });
+        return { message: "已保存" };
+      },
+    },
+  };
   const inputs = new Map();
   const document = {
     addEventListener() {},
@@ -14,16 +22,11 @@ function dashboard() {
       return inputs.get(id);
     },
   };
-  const calls = [];
-  const context = vm.createContext({ window, document, calls });
+  const context = vm.createContext({ window, document });
   vm.runInContext(fs.readFileSync("views/dashboard/app.js", "utf8"), context);
   vm.runInContext(`
     state.verifiedBots = ["10001", "20002"];
     $("global-bot-select").value = "10001";
-    apiCall = async (path, method, payload) => {
-      calls.push({ path, method, ...payload });
-      return {};
-    };
   `, context);
   return { calls, run: (code) => vm.runInContext(code, context) };
 }
@@ -59,4 +62,29 @@ test("policy save stays bound to the Bot whose settings were loaded", async () =
   assert.equal(calls[0].bot_self_id, "20002");
   assert.equal(calls[0].private.min_level, "20");
   assert.equal(calls[0].group.approval_required, true);
+});
+
+test("rejection works in the Dashboard iframe and keeps the row's Bot", async () => {
+  const { calls, run } = dashboard();
+  run(`
+    const dialog = $("reject-dialog");
+    dialog.showModal = () => {};
+    dialog.addEventListener = (name, callback) => { dialog.onClose = callback; };
+    const application = { id: "L123456789abc", bot_self_id: "20002" };
+    function closeRejection(value) {
+      dialog.returnValue = value;
+      dialog.onClose();
+    }
+  `);
+  const cancelled = run('rejectApplication(application)');
+  run('closeRejection("cancel")');
+  await cancelled;
+  assert.equal(calls.length, 0);
+
+  const confirmed = run('rejectApplication(application)');
+  run('$("reject-note").value = "资格不符"; closeRejection("reject")');
+  await confirmed;
+  assert.deepEqual(calls.map(c => [c.action, c.bot_self_id, c.application_id, c.note]), [
+    ["reject", "20002", "L123456789abc", "资格不符"],
+  ]);
 });

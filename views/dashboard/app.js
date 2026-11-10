@@ -1,31 +1,5 @@
-/**
- * Frontend script for the AstrBot Group Approval WebUI dashboard.
- * Version: 0.1.2 (Early Development & Debugging)
- *
- * CANONICAL LOCATION: views/dashboard/ (AstrBot 4.26+ / 4.29.4 prefers "views";
- * "pages/" is only a legacy alias and must not carry a second copy).
- *
- * AstrBot 4.29.4 contract:
- *  - Plugin views are served from views/<view_name>/index.html.
- *  - The bridge is window.AstrBotPluginView (alias window.AstrBotPluginPage);
- *    apiGet/apiPost are forwarded by the dashboard to
- *    /api/v1/plugins/extensions/<plugin_name>/<endpoint>.
- *  - The legacy /api/plug/... route does NOT exist in 4.29.4; the fallback used
- *    here is the correct /api/v1/plugins/extensions/... path.
- *
- * All dynamic data is rendered with DOM APIs (textContent / createElement); no
- * user-controlled value is ever interpolated into innerHTML.
- */
-
-const PLUGIN_NAME = "astrbot_plugin_group_approval";
-const API_ROUTE_PREFIX = `/api/v1/plugins/extensions/${encodeURIComponent(PLUGIN_NAME)}`;
-const REQUEST_TIMEOUT_MS = 30000;
-const BRIDGE_READY_TIMEOUT_MS = 1500;
-
-// The bridge only exists in the dashboard-embedded context (restricted iframe).
-// A direct/standalone load of the view must not postMessage into the void.
-const IS_EMBEDDED = window.parent !== window;
-const BRIDGE = IS_EMBEDDED ? (window.AstrBotPluginView || window.AstrBotPluginPage) : null;
+// AstrBot 4.29.4 serves this view in a sandboxed Dashboard iframe.
+const bridge = window.AstrBotPluginView;
 
 const state = { verifiedBots: [], settingsBot: "", readSequence: 0 };
 
@@ -48,22 +22,9 @@ function el(tag, options = {}) {
   return node;
 }
 
-function cell(content, className) {
-  const td = document.createElement("td");
-  if (className) td.className = className;
-  if (content instanceof Node) {
-    td.appendChild(content);
-  } else {
-    td.textContent = content === undefined || content === null ? "" : String(content);
-  }
-  return td;
-}
-
-function renderTableMessage(tbody, colspan, message, className = "text-center text-muted") {
-  if (!tbody) return;
-  tbody.replaceChildren();
+function renderTableMessage(tbody, colspan, message) {
   const tr = document.createElement("tr");
-  const td = el("td", { text: message, className });
+  const td = el("td", { text: message, className: "text-center text-muted" });
   td.colSpan = colspan;
   tr.appendChild(td);
   tbody.appendChild(tr);
@@ -76,14 +37,9 @@ function formatDate(ts) {
   return new Date(n * 1000).toLocaleString("zh-CN", { hour12: false });
 }
 
-function toast(message, type = "info") {
-  let container = $("toast-container");
-  if (!container) {
-    container = el("div", { attrs: { id: "toast-container", class: "toast-container", "aria-live": "polite" } });
-    document.body.appendChild(container);
-  }
-  const node = el("div", { className: `toast toast-${type}`, text: String(message || "") });
-  container.appendChild(node);
+function toast(message, type) {
+  const node = el("div", { className: `toast toast-${type}`, text: message });
+  $("toast-container").appendChild(node);
   window.setTimeout(() => {
     node.classList.add("toast-hide");
     window.setTimeout(() => node.remove(), 300);
@@ -95,158 +51,8 @@ function toastError(error) {
   toast(message, "error");
 }
 
-// ---------------------------------------------------------------------------
-// API layer: ONE helper, bridge first, correct 4.26+/4.29.4 HTTP fallback.
-// ---------------------------------------------------------------------------
-function normalizeEndpoint(endpoint) {
-  const raw = String(endpoint || "").replace(/^\/+/, "").replace(/\/+$/, "");
-  if (!raw) throw new Error("API endpoint is empty");
-  const parts = raw.split("/");
-  if (parts.some((part) => !part || part === "." || part === "..")) {
-    throw new Error("API endpoint is invalid");
-  }
-  return { path: parts.join("/"), encoded: parts.map((part) => encodeURIComponent(part)).join("/") };
-}
-
-function readDashboardToken() {
-  // The view is a same-origin iframe of the AstrBot dashboard. Only in the embedded
-  // (bridge) context may the dashboard's own bearer token be forwarded.
-  if (!IS_EMBEDDED) return null;
-  try {
-    return window.localStorage.getItem("token");
-  } catch (error) {
-    return null;
-  }
-}
-
-function unwrapApiPayload(payload) {
-  if (
-    payload &&
-    typeof payload === "object" &&
-    !Array.isArray(payload) &&
-    (Object.prototype.hasOwnProperty.call(payload, "status") ||
-      Object.prototype.hasOwnProperty.call(payload, "retcode"))
-  ) {
-    if (payload.status === "error") {
-      const error = new Error(payload.message || payload.error || "接口返回错误");
-      error.retcode = payload.retcode;
-      error.payload = payload;
-      throw error;
-    }
-    const nestedMessage =
-      payload.data && typeof payload.data === "object" && typeof payload.data.message === "string"
-        ? payload.data.message
-        : "";
-    return {
-      status: "ok",
-      retcode: payload.retcode === undefined || payload.retcode === null ? 0 : payload.retcode,
-      message: payload.message || nestedMessage || "",
-      data: payload.data === undefined ? {} : payload.data,
-      raw: payload,
-    };
-  }
-  const message =
-    payload && typeof payload === "object" && typeof payload.message === "string"
-      ? payload.message
-      : "";
-  return {
-    status: "ok",
-    retcode: 0,
-    message,
-    data: payload === undefined ? {} : payload,
-    raw: payload,
-  };
-}
-
-async function apiFetch(encodedPath, method, payload, queryParams) {
-  const url = new URL(`${API_ROUTE_PREFIX}/${encodedPath}`, window.location.origin);
-  Object.entries(queryParams || {}).forEach(([key, value]) => {
-    if (value === undefined || value === null || value === "") return;
-    url.searchParams.set(key, String(value));
-  });
-
-  const headers = {};
-  if (method !== "GET") headers["Content-Type"] = "application/json";
-  const token = readDashboardToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  let response;
-  try {
-    response = await fetch(url.toString(), {
-      method,
-      credentials: "include",
-      headers,
-      signal: controller.signal,
-      body: method === "GET" ? undefined : JSON.stringify(payload || {}),
-    });
-  } catch (error) {
-    if (error && error.name === "AbortError") throw new Error("请求超时，请重试");
-    throw error;
-  } finally {
-    window.clearTimeout(timeout);
-  }
-
-  let data = null;
-  try {
-    data = await response.json();
-  } catch (error) {
-    data = null;
-  }
-  if (!response.ok) {
-    const message =
-      (data && (data.message || data.error)) || `请求失败 (HTTP ${response.status})`;
-    const error = new Error(message);
-    error.status = response.status;
-    error.payload = data;
-    throw error;
-  }
-  return data;
-}
-
-/**
- * Central API helper.
- *
- * - Bridge present (dashboard iframe): window.AstrBotPluginView.apiGet/apiPost.
- *   The dashboard unwraps the plugin's {"status":"ok","data":...} envelope, so
- *   both wrapped and unwrapped payloads are normalised here.
- * - No bridge (standalone/older host): same-origin HTTP to the real 4.26+ route
- *   /api/v1/plugins/extensions/<plugin>/<endpoint>, with cookies and, only in the
- *   embedded dashboard context, the dashboard bearer token.
- */
-async function apiCall(endpoint, method = "GET", payload = null, queryParams = null) {
-  const verb = String(method || "GET").toUpperCase();
-  const target = normalizeEndpoint(endpoint);
-  const params = { ...(queryParams || {}) };
-  const explicitBot = getSelectedBotId();
-  if (verb === "GET" && explicitBot && params.bot_self_id === undefined) {
-    params.bot_self_id = explicitBot;
-  }
-
-  if (BRIDGE) {
-    if (verb === "GET") {
-      if (typeof BRIDGE.apiGet !== "function") throw new Error("AstrBot bridge apiGet 不可用");
-      return unwrapApiPayload(await BRIDGE.apiGet(target.path, params));
-    }
-    if (verb === "POST") {
-      if (typeof BRIDGE.apiPost !== "function") throw new Error("AstrBot bridge apiPost 不可用");
-      return unwrapApiPayload(await BRIDGE.apiPost(target.path, payload || {}));
-    }
-    throw new Error(`Unsupported API method: ${verb}`);
-  }
-
-  if (verb !== "GET" && verb !== "POST") throw new Error(`Unsupported API method: ${verb}`);
-  return unwrapApiPayload(await apiFetch(target.encoded, verb, payload, params));
-}
-
-// ---------------------------------------------------------------------------
-// Bot selection / write-action safety
-// ---------------------------------------------------------------------------
 function getSelectedBotId() {
-  const select = $("global-bot-select");
-  if (!select) return "";
-  const value = String(select.value || "").trim();
+  const value = $("global-bot-select").value;
   return state.verifiedBots.includes(value) ? value : "";
 }
 
@@ -254,8 +60,8 @@ async function mutate(bot, action, payload = {}) {
   if (!state.verifiedBots.includes(String(bot))) {
     throw new Error("请选择已核验的 Bot。");
   }
-  const response = await apiCall("scope/action", "POST", { ...payload, bot_self_id: bot, action });
-  return response.data?.message || response.message || "已保存";
+  const { message } = await bridge.apiPost("scope/action", { ...payload, bot_self_id: bot, action });
+  return message;
 }
 
 function button(label, work) {
@@ -268,8 +74,10 @@ async function runAction(work, node) {
   node.disabled = true;
   try {
     const message = await work();
-    if (message) toast(message, "success");
-    await loadState();
+    if (message) {
+      toast(message, "success");
+      await loadState();
+    }
   } catch (error) {
     toastError(error);
   } finally {
@@ -279,6 +87,18 @@ async function runAction(work, node) {
 
 async function reviewApplication(row, action, note = "") {
   return mutate(row.bot_self_id, action, { application_id: row.id, note });
+}
+
+async function rejectApplication(row) {
+  const dialog = $("reject-dialog");
+  const note = $("reject-note");
+  dialog.returnValue = "";
+  note.value = "";
+  dialog.showModal();
+  await new Promise(resolve => dialog.addEventListener("close", resolve, { once: true }));
+  if (dialog.returnValue === "reject") {
+    return reviewApplication(row, "reject", note.value);
+  }
 }
 
 async function changeGrant(row, action) {
@@ -294,7 +114,7 @@ function renderRows(id, rows, columns, actions) {
   }
   for (const row of rows) {
     const tr = el("tr");
-    for (const column of columns) tr.appendChild(cell(column(row)));
+    for (const column of columns) tr.appendChild(el("td", { text: column(row) }));
     if (actions) {
       const td = el("td");
       for (const action of actions(row)) td.appendChild(action);
@@ -334,8 +154,8 @@ async function saveSettings() {
 }
 
 async function loadBots() {
-  const { data } = await apiCall("bots");
-  state.verifiedBots = Array.isArray(data.verified_bots) ? data.verified_bots.map(String) : [];
+  const data = await bridge.apiGet("bots");
+  state.verifiedBots = data.verified_bots;
   const select = $("global-bot-select");
   const previous = select.value;
   select.replaceChildren(el("option", { text: "选择 QQ Bot", attrs: { value: "" } }));
@@ -356,7 +176,7 @@ async function loadState() {
   state.settingsBot = "";
   if (!bot) return;
   const user = $("user-filter").value.trim();
-  const { data } = await apiCall("scope/state", "GET", null, { bot_self_id: bot, user_id: user });
+  const data = await bridge.apiGet("scope/state", { bot_self_id: bot, user_id: user });
   if (seq !== state.readSequence || bot !== getSelectedBotId()) return;
   renderSettings(bot, data);
   const time = (value) => value ? formatDate(value) : "—";
@@ -369,10 +189,7 @@ async function loadState() {
     row => row.reason, row => row.reviewer_id, row => row.review_note,
   ], row => row.status === "PENDING" ? [
     button("批准", () => reviewApplication(row, "approve")),
-    button("拒绝", () => {
-      const note = window.prompt("拒绝原因", "");
-      return note === null ? undefined : reviewApplication(row, "reject", note);
-    }),
+    button("拒绝", () => rejectApplication(row)),
   ] : []);
   renderRows("grants", data.grants, [
     row => row.user_id, row => row.scope, row => row.status, row => row.source,
@@ -391,6 +208,10 @@ async function loadState() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  if (window.parent === window || !bridge) {
+    $("guard-status").textContent = "请在 AstrBot Dashboard 中打开此页面。";
+    return;
+  }
   $("global-bot-select").addEventListener("change", () => loadState().catch(toastError));
   $("pending-scope").addEventListener("change", () => loadState().catch(toastError));
   $("pending-only").addEventListener("change", () => loadState().catch(toastError));
