@@ -3,7 +3,7 @@
 [![Tests](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/workflows/tests.yml/badge.svg)](https://github.com/Maxwell233/astrbot_plugin_group_approval/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**0.1.4 开发调试版** · Python 3.12+ · AstrBot **4.29.4** · NapCat OneBot v11
+**0.1.3 开发调试版** · Python 3.12+ · AstrBot **4.29.4** · NapCat OneBot v11
 
 ## 项目背景
 

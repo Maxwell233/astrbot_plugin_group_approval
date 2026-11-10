@@ -9,7 +9,7 @@ from .napcat_client import NapCatClient
 from .notification_service import NotificationService
 from .reviewers import ReviewerService
 
-__version__ = "0.1.4"
+__version__ = "0.1.3"
 __status__ = "Development / 调试开发版"
 __author__ = "Maxwell233"
 
