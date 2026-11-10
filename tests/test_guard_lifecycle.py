@@ -5,6 +5,7 @@ import gc
 import importlib
 import weakref
 from functools import wraps
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ pytest.importorskip("astrbot")
 from astrbot.core.pipeline.process_stage.stage import AgentRequestSubStage  # noqa: E402
 
 import approval.native_llm as native  # noqa: E402
+import main  # noqa: E402
 from tests.framework_event import _make_event  # noqa: E402
 
 
@@ -134,11 +136,14 @@ async def test_preexisting_wrapper_restored_and_replacement_reported(stage, monk
 
     @wraps(AgentRequestSubStage.process)
     async def replacement(self, event):
-        yield "unrelated"
+        async for part in earlier(self, event):
+            yield part
 
     monkeypatch.setattr(AgentRequestSubStage, "process", replacement)
     try:
-        assert guard.status != "ACTIVE"
+        assert await drain(agent) == ["part 1", "part 2"]
+        assert len(calls) == 2
+        assert guard.status == "EXTERNAL_METHOD_UNVERIFIED"
         assert not guard.installed
         assert "cannot verify" in caplog.text
     finally:
@@ -146,39 +151,37 @@ async def test_preexisting_wrapper_restored_and_replacement_reported(stage, monk
     assert AgentRequestSubStage.process is replacement
 
 
-async def test_uninstall_drains_checks_and_denies_new_native_work(stage):
+async def test_uninstall_drains_checks_before_closing_database(stage, tmp_path, monkeypatch):
     agent, downstream, calls = stage
     entered, release = asyncio.Event(), asyncio.Event()
-    db_closed = False
     checked = []
+    monkeypatch.setattr(main, "StarTools", SimpleNamespace(get_data_dir=lambda: tmp_path))
 
-    async def check(event):
+    async def check(self, event):
         checked.append(event)
         entered.set()
         await release.wait()
-        assert not db_closed
+        assert self.db._shared_conn is not None
+        assert await self.db.fetchone("SELECT 1 FROM grants") is None
 
-    guard = native.NativeLLMGuard(check)
-    guard.install()
+    monkeypatch.setattr(main.GroupApprovalPlugin, "_check_native_chat", check)
+    plugin = main.GroupApprovalPlugin(config={"notifications": {"retry_enabled": False}})
+    await plugin.initialize()
     request = asyncio.create_task(drain(agent))
     await entered.wait()
 
-    async def close():
-        nonlocal db_closed
-        await guard.uninstall()
-        db_closed = True
-
-    closing = asyncio.create_task(close())
+    closing = asyncio.create_task(plugin.terminate())
     await asyncio.sleep(0)
     try:
-        assert guard.status == "DRAINING"
-        assert not db_closed
+        assert plugin.native_guard.status == "DRAINING"
+        assert plugin.db._shared_conn is not None
         assert await drain(agent) == []
         assert len(checked) == 1
     finally:
         release.set()
-        await asyncio.gather(request, closing)
-    assert db_closed
+        request_result, _ = await asyncio.gather(request, closing)
+    assert request_result == []
+    assert plugin.db._shared_conn is None
     assert AgentRequestSubStage.process is downstream
     assert not calls
 

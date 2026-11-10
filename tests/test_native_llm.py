@@ -185,3 +185,117 @@ async def test_independent_handler_runs_before_default_llm_denial(monkeypatch, n
         assert not event.is_stopped()
     finally:
         await guard.uninstall()
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+async def test_real_third_party_stage_preserves_authorized_stream(monkeypatch, allowed):
+    from unittest.mock import AsyncMock
+
+    from astrbot.core.message.message_event_result import ResultContentType
+    from astrbot.core.pipeline.process_stage.method.agent_sub_stages import third_party
+    from astrbot.core.star.context import Context
+
+    from approval.native_llm import NativeLLMGuard
+
+    steps = []
+
+    class Runtime:
+        def __class_getitem__(cls, _):
+            return cls
+
+        async def reset(self, *, request, streaming, **kwargs):
+            assert request.prompt == "你好"
+            assert streaming
+            steps.append("reset")
+
+        async def step_until_done(self, *, max_step):
+            steps.append("run")
+            for part in ["第一段", "第二段"]:
+                yield SimpleNamespace(type="streaming_delta", data={"chain": MessageChain().message(part)})
+
+        async def close(self):
+            steps.append("close")
+
+        def done(self):
+            return "close" in steps
+
+        def get_final_llm_resp(self):
+            return None
+
+    async def check(event):
+        steps.append("check")
+        return None if allowed else "未授权"
+
+    monkeypatch.setattr(third_party, "DifyAgentRunner", Runtime)
+    monkeypatch.setattr(third_party.Metric, "upload", AsyncMock())
+    monkeypatch.setattr(SessionServiceManager, "should_process_llm_request", AsyncMock(return_value=True))
+    context = SimpleNamespace(
+        astrbot_config={
+            "wake_prefix": [],
+            "provider_settings": {"enable": True, "wake_prefix": "", "streaming_response": True,
+                                  "unsupported_streaming_strategy": "stream"},
+            "agent_runner": {"runner_type": "dify"},
+        },
+        plugin_manager=SimpleNamespace(context=object.__new__(Context)),
+    )
+    stage = AgentRequestSubStage()
+    await stage.initialize(context)
+    assert isinstance(stage.agent_sub_stage, third_party.ThirdPartyAgentSubStage)
+    event = _make_event("你好")
+    monkeypatch.setattr(event, "send", AsyncMock())
+    guard = NativeLLMGuard(check)
+    guard.install()
+    try:
+        stream = []
+        async for _ in stage.process(event):
+            result = event.get_result()
+            assert result.result_content_type == ResultContentType.STREAMING_RESULT
+            stream.extend([chain.chain[0].text async for chain in result.async_stream])
+        assert stream == (["第一段", "第二段"] if allowed else [])
+        assert steps == (["check", "reset", "run", "close"] if allowed else ["check"])
+        assert event.send.await_count == (0 if allowed else 1)
+        if allowed:
+            assert event.get_result().result_content_type == ResultContentType.STREAMING_FINISH
+    finally:
+        await guard.uninstall()
+
+
+@pytest.mark.parametrize("allowed", [False, True])
+async def test_real_local_stage_enters_agent_builder_only_after_authorization(monkeypatch, allowed):
+    from unittest.mock import AsyncMock
+
+    from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal
+
+    from approval.native_llm import NativeLLMGuard
+
+    calls = []
+
+    async def check(event):
+        calls.append("check")
+        return None if allowed else "未授权"
+
+    async def build_agent(**kwargs):
+        calls.append("build")
+
+    monkeypatch.setattr(internal, "build_main_agent", build_agent)
+    monkeypatch.setattr(SessionServiceManager, "should_process_llm_request", AsyncMock(return_value=True))
+    config = {
+        "agent_runner": {"runner_type": "local"},
+        "wake_prefix": [],
+        "provider_settings": {"enable": True, "wake_prefix": "", "streaming_response": True,
+                              "unsupported_streaming_strategy": "stream"},
+    }
+    ctx = SimpleNamespace(conversation_manager=object(), get_config=lambda **kwargs: config)
+    stage = AgentRequestSubStage()
+    await stage.initialize(SimpleNamespace(astrbot_config=config, plugin_manager=SimpleNamespace(context=ctx)))
+    assert isinstance(stage.agent_sub_stage, internal.InternalAgentSubStage)
+    event = _make_event()
+    monkeypatch.setattr(event, "send", AsyncMock())
+    guard = NativeLLMGuard(check)
+    guard.install()
+    try:
+        assert [step async for step in stage.process(event)] == []
+        assert calls == (["check", "build"] if allowed else ["check"])
+        assert event.send.await_count == (0 if allowed else 1)
+    finally:
+        await guard.uninstall()
