@@ -17,6 +17,7 @@ from .notification_service import NotificationService
 Scope = Literal["GROUP", "PRIVATE"]
 SCOPES = ("GROUP", "PRIVATE")
 LABELS = {"GROUP": "群聊", "PRIVATE": "私聊"}
+PRIMARY_CHANGED = "申请所属主群已变更，请用户重新提交申请。"
 
 
 class ScopeError(ValueError):
@@ -146,6 +147,19 @@ class ScopeService:
             )
             if primary_changed:
                 await self.db.execute("DELETE FROM primary_group_levels WHERE bot_self_id = ?", (bot,))
+                cancelled = await self.db.fetchall(
+                    """UPDATE applications_v2 SET status = 'CANCELLED', reviewed_at = ?, reviewer_id = ?,
+                       review_note = ? WHERE bot_self_id = ? AND status = 'PENDING'
+                         AND (primary_revision != ? OR primary_group_id != ?)
+                       RETURNING id, user_id, scope""",
+                    (int(time.time()), actor, PRIMARY_CHANGED, bot, changes["primary_revision"], primary_group_id),
+                )
+                for app in cancelled:
+                    await self._log(
+                        bot, actor, "OWNER", "LLM_APPLICATION_CANCELLED", user=app["user_id"],
+                        scope=app["scope"], primary=before.primary_group_id, app_id=app["id"],
+                        reason=PRIMARY_CHANGED,
+                    )
             await self._log(
                 bot, actor, "OWNER", "LLM_SETTINGS_UPDATED",
                 primary=primary_group_id or before.primary_group_id, previous_primary=before.primary_group_id,
@@ -362,21 +376,39 @@ class ScopeService:
                 )
             return f"{LABELS[scope]}申请已提交，编号 {app_id}。"
 
+    @staticmethod
+    def _require_application_primary(app, settings: Settings) -> None:
+        if (app["primary_revision"] != settings.primary_revision
+                or app["primary_group_id"] != settings.primary_group_id):
+            raise ScopeError(PRIMARY_CHANGED)
+
     async def review(self, bot, app_id, actor, role, *, approve: bool, note: str = "") -> str:
         app = await self.application(bot, app_id)
-        if not app or app["status"] != "PENDING":
+        if not app:
+            raise ScopeError("该 Bot 下没有这条待审申请。")
+        settings = await self.settings(bot)
+        self._require_application_primary(app, settings)
+        if app["status"] != "PENDING":
             raise ScopeError("该 Bot 下没有这条待审申请。")
         scope, user = parse_scope(app["scope"]), app["user_id"]
-        settings = await self.settings(bot)
+        denied = None
         if approve:
             policy = await self.policy(bot, scope)
-            denied = self._qualification(await self._member_level(settings, user, force=True), policy)
-            if denied:
-                raise ScopeError(denied)
+            try:
+                level = await self._member_level(settings, user, force=True)
+            except ScopeError:
+                self._require_application_primary(app, await self.settings(bot))
+                raise
+            denied = self._qualification(level, policy)
         status = "APPROVED" if approve else "REJECTED"
         async with self.db.transaction():
+            current = await self.settings(bot)
+            self._require_application_primary(app, current)
             if approve:
-                await self._ensure_current(settings)
+                if current.revision != settings.revision:
+                    raise ScopeError("Bot 的准入规则已变更，请重试。")
+                if denied:
+                    raise ScopeError(denied)
                 existing = await self.grant(bot, user, scope)
                 if await self._restricted(bot, user, scope) or (existing and existing["status"] == "REVOKED"):
                     raise ScopeError("该用户受人工撤销或黑名单限制。")

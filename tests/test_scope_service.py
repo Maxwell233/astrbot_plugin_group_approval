@@ -353,6 +353,101 @@ async def test_concurrent_failed_applications_cannot_exceed_query_limit(scoped, 
     assert sum("频繁" in str(result) for result in outcomes) == 12
 
 
+async def test_primary_switch_cancels_only_old_pending_and_allows_reapplication(scoped):
+    service, napcat = scoped
+    napcat.set_member(PRIMARY, USER, "25")
+    await service.apply(BOT, USER, "GROUP", "")
+    await service.apply(BOT, USER, "PRIVATE", "")
+    app = (await service.overview(BOT))["applications"][0]
+    napcat.set_member(OTHER_GROUP, BOT, "25")
+    napcat.set_member(OTHER_GROUP, USER, "25")
+    await service.configure(BOT, OWNER, primary_group_id=OTHER_GROUP)
+    assert (await service.application(BOT, app["id"]))["status"] == "CANCELLED"
+    with pytest.raises(ScopeError, match="申请所属主群已变更"):
+        await service.review(BOT, app["id"], REVIEWER, "REVIEWER", approve=True)
+    assert not (await service.overview(BOT))["levels"]
+    assert (await service.grant(BOT, USER, "GROUP"))["status"] == "ACTIVE"
+    await service.apply(BOT, USER, "PRIVATE", "")
+    applications = (await service.overview(BOT))["applications"]
+    assert applications[0]["id"] != app["id"]
+    assert applications[0]["primary_group_id"] == OTHER_GROUP
+
+
+async def test_primary_switch_wins_against_inflight_approval(scoped, monkeypatch):
+    service, napcat = scoped
+    napcat.set_member(PRIMARY, USER, "25")
+    napcat.set_member(OTHER_GROUP, BOT, "25")
+    await service.apply(BOT, USER, "PRIVATE", "")
+    app = (await service.overview(BOT))["applications"][0]
+    lookup = service._member_level
+
+    async def switch(settings, user, *, force):
+        level = await lookup(settings, user, force=force)
+        await service.configure(BOT, OWNER, primary_group_id=OTHER_GROUP)
+        return level
+
+    monkeypatch.setattr(service, "_member_level", switch)
+    with pytest.raises(ScopeError, match="申请所属主群已变更"):
+        await service.review(BOT, app["id"], REVIEWER, "REVIEWER", approve=True)
+    assert await service.grant(BOT, USER, "PRIVATE") is None
+    assert (await service.application(BOT, app["id"]))["status"] == "CANCELLED"
+
+
+@pytest.mark.parametrize("rotate_primary", [False, True])
+async def test_inflight_lookup_cannot_cross_unban_or_primary_generation(scoped, monkeypatch, rotate_primary):
+    service, napcat = scoped
+    napcat.set_member(OTHER_GROUP, BOT, "25")
+    await service.apply(BOT, USER, "GROUP", "")
+    await service.configure(BOT, OWNER, cache_ttl=0)
+    first_entered, release_first = asyncio.Event(), asyncio.Event()
+    original = napcat.get_group_member_info
+
+    async def lookup(**kwargs):
+        result = await original(**kwargs)
+        if kwargs["user_id"] == USER and not first_entered.is_set():
+            first_entered.set()
+            await release_first.wait()
+        return result
+
+    monkeypatch.setattr(napcat, "get_group_member_info", lookup)
+    old = asyncio.create_task(service.check_chat(BOT, USER, "GROUP"))
+    try:
+        await asyncio.wait_for(first_entered.wait(), 2)
+        if rotate_primary:
+            await service.configure(BOT, OWNER, primary_group_id=OTHER_GROUP)
+            await service.configure(BOT, OWNER, primary_group_id=PRIMARY)
+        else:
+            await service.restrict(BOT, USER, ["GROUP"], OWNER, "OWNER", kind="BLACKLIST")
+            await service.restrict(BOT, USER, ["GROUP"], OWNER, "OWNER", kind="BLACKLIST", remove=True)
+        napcat.set_member(PRIMARY, USER, "1")
+        current = await asyncio.wait_for(service.check_chat(BOT, USER, "GROUP"), 2)
+        assert "LV1" in current
+    finally:
+        release_first.set()
+        assert await asyncio.wait_for(old, 2)
+    assert (await service.overview(BOT))["levels"][0]["level"] == 1
+
+
+async def test_primary_switch_rolls_back_cache_settings_and_cancellation_on_audit_failure(scoped, monkeypatch):
+    service, napcat = scoped
+    napcat.set_member(PRIMARY, USER, "25")
+    napcat.set_member(OTHER_GROUP, BOT, "25")
+    await service.apply(BOT, USER, "PRIVATE", "")
+    before = await service.overview(BOT)
+    original = service.audit.log
+
+    async def fail_settings(**kwargs):
+        await original(**kwargs)
+        if kwargs["action"] == "LLM_SETTINGS_UPDATED":
+            raise RuntimeError("audit failure")
+
+    monkeypatch.setattr(service.audit, "log", fail_settings)
+    with pytest.raises(RuntimeError, match="audit failure"):
+        await service.configure(BOT, OWNER, primary_group_id=OTHER_GROUP)
+    assert await service.overview(BOT) == before
+    assert not await service.db.fetchone("SELECT id FROM audit_log WHERE action = 'LLM_APPLICATION_CANCELLED'")
+
+
 async def test_hourly_limit_only_charges_new_pending_and_remains_independent(scoped, monkeypatch):
     service, napcat = scoped
     service.config.application.rate_limit_per_hour = 1
