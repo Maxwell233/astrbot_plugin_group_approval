@@ -82,4 +82,4 @@ jobs:
         run: node --test tests/dashboard_bot_scope.test.cjs
 
       - name: Run real-framework component tests
-        run: python -m pytest tests/test_framework_handler_order.py tests/test_native_llm.py -q -p no:cacheprovider
+        run: python -m pytest tests/test_framework_handler_order.py tests/test_native_llm.py tests/test_guard_lifecycle.py -q -p no:cacheprovider

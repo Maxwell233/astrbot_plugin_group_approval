@@ -344,7 +344,9 @@ async function loadBots() {
   }
   select.value = state.verifiedBots.includes(previous) ? previous :
     (state.verifiedBots.length === 1 ? state.verifiedBots[0] : "");
-  $("guard-status").textContent = data.guard_active ? "原生聊天准入已启用" : "原生聊天准入未启用";
+  const status = data.guard_status;
+  $("guard-status").textContent = data.guard_active ? "原生聊天准入已启用" :
+    (status && status !== "INACTIVE" ? `原生聊天准入异常（${status}）` : "原生聊天准入未启用");
 }
 
 async function loadState() {

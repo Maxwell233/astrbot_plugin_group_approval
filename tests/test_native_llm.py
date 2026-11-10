@@ -68,7 +68,7 @@ async def test_native_gate_preserves_plugin_provider_requests(monkeypatch, plugi
         assert checks == ([] if plugin_request else [event])
         assert len(prompts) == (0 if plugin_request else 1)
     finally:
-        guard.uninstall()
+        await guard.uninstall()
 
 
 @pytest.mark.parametrize(("message", "private", "allowed"), [
@@ -128,7 +128,7 @@ async def test_native_chat_checks_once_before_any_runtime_or_history(monkeypatch
         assert len(notices) == int(not allowed)
         assert runtime_steps == (["history", "provider", "tool", "provider", "stream"] if allowed else [])
     finally:
-        guard.uninstall()
+        await guard.uninstall()
 
 
 @pytest.mark.parametrize("name", ["签到", "塔罗", "今日小猪", "GroupGuardian", "独立模型插件"])
@@ -184,4 +184,4 @@ async def test_independent_handler_runs_before_default_llm_denial(monkeypatch, n
         assert order == expected.get(name, [name])
         assert not event.is_stopped()
     finally:
-        guard.uninstall()
+        await guard.uninstall()

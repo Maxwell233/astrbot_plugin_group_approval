@@ -270,13 +270,13 @@ class GroupApprovalPlugin(Star):
                 self.notification_service.start_worker()
             self._initialized = True
         except BaseException:
-            self.native_guard.uninstall()
+            await self.native_guard.uninstall()
             await self.db.close()
             raise
         logger.info("Group Approval 0.1.2 initialized. Native LLM guard active: %s", self.native_guard.installed)
 
     async def terminate(self) -> None:
-        self.native_guard.uninstall()
+        await self.native_guard.uninstall()
         try:
             await self.notification_service.stop_worker()
         finally:
@@ -337,7 +337,12 @@ class GroupApprovalPlugin(Star):
     async def _web_bots(self):
         if not await self._dashboard_owner():
             return self._err("需要 AstrBot Dashboard 管理员登录。", 403)
-        return self._ok({"verified_bots": await self.napcat.list_bots(), "guard_active": self.native_guard.installed})
+        status = self.native_guard.status
+        return self._ok({
+            "verified_bots": await self.napcat.list_bots(),
+            "guard_active": status == "ACTIVE",
+            "guard_status": status,
+        })
 
     async def _web_state(self):
         if not await self._dashboard_owner():
