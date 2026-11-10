@@ -1,12 +1,4 @@
-"""AstrBot Plugin: Group Approval (群等级准入与管理员审批).
-
-Main entrypoint integrating Star lifecycle, message gate, commands, and WebUI API.
-
-Compatibility floor: **AstrBot >= 4.26.0**.
-  * ``astrbot.api.web`` (``request``/``json_response``) does not exist before 4.26.0.
-  * ``event.stop_event()`` does not stop later plugin handlers before 4.25.0.
-The previous ``>=4.16.0`` claim was wrong; see COMPATIBILITY.md.
-"""
+"""AstrBot 0.1.2 entry point for Bot-wide native LLM chat admission."""
 
 from __future__ import annotations
 
@@ -17,47 +9,38 @@ from typing import Any
 
 try:
     from .approval import (
-        AccessService,
-        AdmissionGate,
-        ApprovalService,
         AuditService,
         AuthorizationService,
-        CommandDispatcher,
         Database,
-        HandlerDiagnostics,
         LevelService,
         NapCatClient,
         NotificationService,
         PluginConfig,
-        WebApiHandler,
+        ReviewerService,
     )
     from .approval.auth_service import build_dashboard_username_getter
-    from .approval.gate import GATE_PRIORITY, AdmissionKind
-    from .approval.web_api import parse_bool
+    from .approval.native_llm import NativeLLMGuard
+    from .approval.scope_commands import ScopeCommands
+    from .approval.scope_service import ScopeError, ScopeService, valid_qq
 except ImportError:
-    from approval import (  # type: ignore
-        AccessService,
-        AdmissionGate,
-        ApprovalService,
+    from approval import (
         AuditService,
         AuthorizationService,
-        CommandDispatcher,
         Database,
-        HandlerDiagnostics,
         LevelService,
         NapCatClient,
         NotificationService,
         PluginConfig,
-        WebApiHandler,
+        ReviewerService,
     )
-    from approval.auth_service import build_dashboard_username_getter  # type: ignore
-    from approval.gate import GATE_PRIORITY, AdmissionKind  # type: ignore
-    from approval.web_api import parse_bool  # type: ignore
+    from approval.auth_service import build_dashboard_username_getter
+    from approval.native_llm import NativeLLMGuard
+    from approval.scope_commands import ScopeCommands
+    from approval.scope_service import ScopeError, ScopeService, valid_qq
 
 logger = logging.getLogger("astrbot_plugin_group_approval")
 
 PLUGIN_NAME = "astrbot_plugin_group_approval"
-LIVINGMEMORY_CAPTURE_KEY = "group_approval.livingmemory_capture"
 
 # Graceful AstrBot import with standalone fallback
 try:
@@ -174,7 +157,7 @@ def _is_chat_message(event: Any, msg_obj: Any) -> bool:
         post_type = source.get("post_type") if isinstance(source, dict) else getattr(source, "post_type", None)
         if post_type:
             return str(post_type).strip().lower() == "message"
-    return True
+    return False
 
 
 def _get_query_param(req: Any, name: str, default: Any = None) -> Any:
@@ -249,457 +232,200 @@ class GroupApprovalPlugin(Star):
             client=self.napcat,
             max_retries=self.plugin_config.notifications.max_retries,
             retry_interval_seconds=self.plugin_config.notifications.retry_interval_seconds,
-            user_group_fallback_enabled=self.plugin_config.notifications.user_group_fallback_enabled,
-            user_group_fallback_text=self.plugin_config.notifications.user_group_fallback_text,
         )
-        self.approval_service = ApprovalService(
-            db=self.db,
-            level_service=self.level_service,
-            audit_service=self.audit_service,
-            notification_service=self.notification_service,
-            config=self.plugin_config,
+        self.reviewers = ReviewerService(self.db, self.plugin_config)
+        self.scopes = ScopeService(
+            self.db, self.level_service, self.audit_service, self.notification_service,
+            self.plugin_config, self.reviewers,
         )
-        self.access_service = AccessService(
-            db=self.db,
-            approval_service=self.approval_service,
-            level_service=self.level_service,
-            audit_service=self.audit_service,
-            config=self.plugin_config,
-        )
-        self.dispatcher = CommandDispatcher(
-            db=self.db,
-            approval_service=self.approval_service,
-            audit_service=self.audit_service,
-            config=self.plugin_config,
-        )
-        self.gate = AdmissionGate(self.access_service, self.plugin_config)
-        self.web_api = WebApiHandler(
-            db=self.db,
-            approval_service=self.approval_service,
-            audit_service=self.audit_service,
-            config=self.plugin_config,
-            client=self.napcat,
-        )
+        self.commands = ScopeCommands(self.scopes)
+        self.native_guard = NativeLLMGuard(self._check_native_chat)
         self.auth = AuthorizationService(
-            config=self.plugin_config,
             dashboard_username_getter=build_dashboard_username_getter(context),
         )
-        self.diagnostics = HandlerDiagnostics(self.context)
-
         self._initialized = False
 
-    # ------------------------------------------------------------------
-    # AstrBot lifecycle
-    # ------------------------------------------------------------------
     async def initialize(self) -> None:
-        """Awaited by AstrBot before the plugin is considered loaded.
-
-        Startup work is deliberately NOT a fire-and-forget task from ``__init__``: AstrBot
-        awaits this hook, so the SQLite schema, the cleanup pass and the outbox worker are
-        ready before the first message is dispatched, and failures are visible at load time.
-        """
         if self._initialized:
             return
         await self.db.init()
-        await self.approval_service.clean_expired()
-        keep_days = int(self.plugin_config.security.keep_audit_days)
-        if keep_days > 0:
-            try:
-                await self.audit_service.cleanup_old_logs(keep_days)
-            except Exception as e:  # noqa: BLE001 - retention must not block startup
-                logger.warning("Audit log retention cleanup failed: %s", e)
-        await self.approval_service.sync_reviewers_from_db()
-        if self.plugin_config.notifications.retry_enabled:
-            self.notification_service.start_worker()
-        self._register_web_routes()
-        self._initialized = True
-        self._report_moderation_precedence()
-        logger.info("GroupApprovalPlugin v0.1.1 initialized successfully.")
-
-    @filter.on_astrbot_loaded()
-    async def _check_moderation_after_startup(self) -> None:
-        self._report_moderation_precedence()
-
-    def _report_moderation_precedence(self) -> None:
-        """Log the real, registry-verified moderation precedence (never assume it)."""
         try:
-            report = self.diagnostics.diagnose_handlers()
-        except Exception:  # noqa: BLE001 - diagnostics must never break startup
-            logger.exception("Handler diagnostics failed")
-            return
-        status = report.get("moderation_precedence")
-        message = report.get("message", "")
-        if status in {"CONFLICT", "DISABLED"}:
-            logger.error("内容审核优先级未满足安全要求：%s %s", message, report.get("recommendations", ""))
-        elif status == "VERIFIED":
-            logger.info("内容审核优先级已验证：%s", message)
-        elif status == "UNVERIFIED":
-            logger.warning("内容审核优先级无法验证：%s", message)
-        else:
-            logger.warning("未检测到 GroupGuardian：%s", message)
+            keep_days = self.plugin_config.security.keep_audit_days
+            if keep_days > 0:
+                await self.audit_service.cleanup_old_logs(keep_days)
+            if ASTRBOT_AVAILABLE and self.plugin_config.enabled:
+                self.native_guard.install()
+            self._register_web_routes()
+            if self.plugin_config.notifications.retry_enabled:
+                self.notification_service.start_worker()
+            self._initialized = True
+        except BaseException:
+            await self.native_guard.uninstall()
+            await self.db.close()
+            raise
+        logger.info("Group Approval 0.1.2 initialized. Native LLM guard active: %s", self.native_guard.installed)
 
     async def terminate(self) -> None:
-        """Clean up background workers and close database connections upon unloading."""
-        logger.info("Terminating GroupApprovalPlugin...")
+        await self.native_guard.uninstall()
         try:
             await self.notification_service.stop_worker()
+        finally:
             await self.db.close()
-            logger.info("GroupApprovalPlugin terminated cleanly.")
-        except Exception as e:  # noqa: BLE001 - unload must not raise
-            logger.error("Error during GroupApprovalPlugin termination: %s", e)
+            self._initialized = False
 
-    # ------------------------------------------------------------------
-    # Web routes
-    # ------------------------------------------------------------------
+    async def _event_identity(self, event: AstrMessageEvent) -> tuple[str, str]:
+        bot, user = _bot_self_id(event), str(event.get_sender_id() or "").strip()
+        if not valid_qq(bot) or not valid_qq(user) or not await self.napcat.has_verified_bot(
+            bot, event.get_platform_id()
+        ):
+            raise ScopeError("无法核验当前 OneBot 或 QQ 用户身份。")
+        return bot, user
+
+    async def _check_native_chat(self, event: AstrMessageEvent) -> str | None:
+        if not _is_chat_message(event, event.message_obj):
+            return "无法确认原生 AI 聊天的会话类型。"
+        try:
+            bot, user = await self._event_identity(event)
+        except ScopeError as exc:
+            return str(exc)
+        if event.is_private_chat():
+            return await self.scopes.check_chat(bot, user, "PRIVATE")
+        if not _group_id(event):
+            return "无法确认当前 QQ 群会话。"
+        return await self.scopes.check_chat(bot, user, "GROUP")
+
     def _register_web_routes(self) -> None:
-        """Register routes with AstrBot's plugin web framework (4.26+)."""
         if self.context is None or not hasattr(self.context, "register_web_api"):
             return
 
-        def wrap(fn: Any) -> Any:
-            async def handler(*args: Any, **kwargs: Any) -> Any:
-                res = await fn(*args, **kwargs)
-                return json_response(res)
-
+        def wrap(fn):
+            async def handler(*args, **kwargs):
+                return json_response(await fn())
             return handler
 
-        routes = [
-            (f"/{PLUGIN_NAME}/bots", self._web_bots, ["GET"], "List connected bots"),
-            (f"/{PLUGIN_NAME}/dashboard", self._web_dashboard, ["GET"], "Dashboard metrics"),
-            (f"/{PLUGIN_NAME}/diagnostics", self._web_diagnostics, ["GET"], "Handler precedence diagnostics"),
-            (f"/{PLUGIN_NAME}/applications", self._web_applications, ["GET"], "List applications"),
-            (f"/{PLUGIN_NAME}/applications/approve", self._web_approve, ["POST"], "Approve application"),
-            (f"/{PLUGIN_NAME}/applications/reject", self._web_reject, ["POST"], "Reject application"),
-            (f"/{PLUGIN_NAME}/users", self._web_users, ["GET"], "List user grants"),
-            (f"/{PLUGIN_NAME}/users/grant", self._web_manual_grant, ["POST"], "Manual grant"),
-            (f"/{PLUGIN_NAME}/users/revoke", self._web_revoke_grant, ["POST"], "Revoke grant"),
-            (f"/{PLUGIN_NAME}/users/ban", self._web_ban, ["POST"], "Ban user"),
-            (f"/{PLUGIN_NAME}/users/unban", self._web_unban, ["POST"], "Unban user"),
-            (f"/{PLUGIN_NAME}/groups", self._web_groups, ["GET"], "List group policies"),
-            (f"/{PLUGIN_NAME}/groups/update", self._web_update_group, ["POST"], "Update group policy"),
-            (f"/{PLUGIN_NAME}/audit_logs", self._web_audit_logs, ["GET"], "List audit logs"),
-            (f"/{PLUGIN_NAME}/audit_logs/export", self._web_export_audit_logs, ["GET"], "Export audit logs"),
-        ]
+        for path, method, fn in (
+            ("bots", "GET", self._web_bots),
+            ("scope/state", "GET", self._web_state),
+            ("scope/action", "POST", self._web_action),
+        ):
+            self.context.register_web_api(f"/{PLUGIN_NAME}/{path}", wrap(fn), [method], path)
 
-        for path, handler_fn, methods, desc in routes:
-            try:
-                self.context.register_web_api(path, wrap(handler_fn), methods, desc)
-            except Exception as e:  # noqa: BLE001 - missing route must not break loading
-                logger.warning("Could not register web route %s: %s", path, e)
-
-    # --- Web Route Handlers with Authentication & Server-Side Authorization ---
-    async def _web_bots(self) -> dict[str, Any]:
+    async def _dashboard_owner(self) -> str | None:
         operator = self.auth.get_authenticated_user(request)
+        if operator and await self.auth.get_user_role(operator) == "OWNER":
+            return operator
+        return None
+
+    @staticmethod
+    def _ok(data):
+        return {"status": "ok", "retcode": 0, "data": data}
+
+    @staticmethod
+    def _err(message, code=400):
+        return {"status": "error", "retcode": code, "message": message}
+
+    async def _web_bots(self):
+        if not await self._dashboard_owner():
+            return self._err("需要 AstrBot Dashboard 管理员登录。", 403)
+        status = self.native_guard.status
+        return self._ok({
+            "verified_bots": await self.napcat.list_bots(),
+            "guard_active": status == "ACTIVE",
+            "guard_status": status,
+        })
+
+    async def _web_state(self):
+        if not await self._dashboard_owner():
+            return self._err("需要 AstrBot Dashboard 管理员登录。", 403)
+        bot = str(_get_query_param(request, "bot_self_id", "")).strip()
+        if not valid_qq(bot) or bot not in await self.napcat.list_bots():
+            return self._err("请选择已核验的 OneBot 账号。", 403)
+        user = str(_get_query_param(request, "user_id", "")).strip()
+        if user and not valid_qq(user):
+            return self._err("QQ 格式无效。")
+        return self._ok(await self.scopes.overview(bot, user=user, include_audit=True))
+
+    async def _web_action(self):
+        operator = await self._dashboard_owner()
         if not operator:
-            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
-        return await self.web_api.list_bots(context=self.context)
-
-    async def _web_dashboard(self) -> dict[str, Any]:
-        operator = self.auth.get_authenticated_user(request)
-        if not operator:
-            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
-        return await self.web_api.get_dashboard_stats(_get_query_param(request, "bot_self_id"))
-
-    async def _web_diagnostics(self) -> dict[str, Any]:
-        operator = self.auth.get_authenticated_user(request)
-        if not operator:
-            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
-        return {"status": "ok", "retcode": 0, "data": self.diagnostics.diagnose_handlers()}
-
-    async def _web_applications(self) -> dict[str, Any]:
-        operator = self.auth.get_authenticated_user(request)
-        if not operator:
-            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
-        return await self.web_api.list_applications(
-            group_id=_get_query_param(request, "group_id"),
-            status=_get_query_param(request, "status"),
-            user_id=_get_query_param(request, "user_id"),
-            bot_self_id=_get_query_param(request, "bot_self_id"),
-        )
-
-    async def _web_approve(self) -> dict[str, Any]:
-        return await self._authorized_mutation("approve", self.web_api.approve_application)
-
-    async def _web_reject(self) -> dict[str, Any]:
-        return await self._authorized_mutation("reject", self.web_api.reject_application)
-
-    async def _web_manual_grant(self) -> dict[str, Any]:
-        data = await _get_request_json(request)
-        is_level_exempt = parse_bool(data.get("is_level_exempt", False))
-        return await self._authorized_mutation(
-            "grant", self.web_api.manual_grant, is_level_exempt=is_level_exempt
-        )
-
-    async def _web_revoke_grant(self) -> dict[str, Any]:
-        return await self._authorized_mutation("revoke", self.web_api.revoke_grant)
-
-    async def _web_ban(self) -> dict[str, Any]:
-        return await self._authorized_mutation("ban", self.web_api.ban_user)
-
-    async def _web_unban(self) -> dict[str, Any]:
-        return await self._authorized_mutation("unban", self.web_api.unban_user)
-
-    async def _web_update_group(self) -> dict[str, Any]:
-        return await self._authorized_mutation("update_group", self.web_api.update_group_policy)
-
-    async def _authorized_mutation(
-        self,
-        action: str,
-        method: Any,
-        *,
-        is_level_exempt: bool = False,
-    ) -> dict[str, Any]:
-        operator = self.auth.get_authenticated_user(request)
-        if not operator:
-            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
-        ok, role, reason = await self.auth.authorize_action(
-            operator, action, is_level_exempt=is_level_exempt
-        )
-        if not ok:
-            return {"status": "error", "retcode": 403, "message": f"Forbidden: {reason}"}
-        data = await _get_request_json(request)
-        return await method(data, actor_id=operator, actor_role=role)
-
-    async def _web_users(self) -> dict[str, Any]:
-        operator = self.auth.get_authenticated_user(request)
-        if not operator:
-            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
-        return await self.web_api.list_users(
-            group_id=_get_query_param(request, "group_id"),
-            user_id=_get_query_param(request, "user_id"),
-            status=_get_query_param(request, "status"),
-            bot_self_id=_get_query_param(request, "bot_self_id"),
-        )
-
-    async def _web_groups(self) -> dict[str, Any]:
-        operator = self.auth.get_authenticated_user(request)
-        if not operator:
-            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
-        return await self.web_api.list_groups(bot_self_id=_get_query_param(request, "bot_self_id"))
-
-    async def _web_audit_logs(self) -> dict[str, Any]:
-        operator = self.auth.get_authenticated_user(request)
-        if not operator:
-            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
-        return await self.web_api.list_audit_logs(
-            group_id=_get_query_param(request, "group_id"),
-            user_id=_get_query_param(request, "user_id"),
-            action=_get_query_param(request, "action"),
-            bot_self_id=_get_query_param(request, "bot_self_id"),
-        )
-
-    async def _web_export_audit_logs(self) -> dict[str, Any]:
-        operator = self.auth.get_authenticated_user(request)
-        if not operator:
-            return {"status": "error", "retcode": 401, "message": "Unauthorized: Dashboard login required"}
-        ok, role, reason = await self.auth.authorize_action(operator, "export_logs")
-        if not ok:
-            return {"status": "error", "retcode": 403, "message": f"Forbidden: {reason}"}
-        # Return the WebApiHandler payload directly: it already contains
-        # status/retcode/format/filename/data and its own 400 response for invalid input.
-        return await self.web_api.export_audit_logs(
-            format_type=str(_get_query_param(request, "format", "json")).strip().lower(),
-            bot_self_id=_get_query_param(request, "bot_self_id"),
-            group_id=_get_query_param(request, "group_id"),
-            action=_get_query_param(request, "action"),
-        )
-
-    # ------------------------------------------------------------------
-    # Trusted admission dispatcher (priority GATE_PRIORITY = 50)
-    # ------------------------------------------------------------------
-    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=GATE_PRIORITY)
-    async def on_message_gate(self, event: AstrMessageEvent) -> None:
-        """Single trusted admission entry point.
-
-        Ordering: moderation (patched GroupGuardian, priority > 50) -> this gate (50) ->
-        ordinary business plugins (0). Reply-producing admission commands are executed HERE
-        and the event is stopped, so they can never leak to other plugins or the LLM.
-        """
-        if not _is_onebot_event(event):
-            return
-        msg_obj = getattr(event, "message_obj", None)
-        if msg_obj is None:
-            return
-
-        # Only chat messages are admission-relevant; notices/requests carry no message text.
-        if not _is_chat_message(event, msg_obj):
-            return
-        group_id = _group_id(event)
-        is_private = bool(getattr(event, "is_private_chat", lambda: False)())
-        if not group_id and not is_private:
-            return
-
-        bot_self_id = _bot_self_id(event)
-        user_id = str(event.get_sender_id() or "").strip()
-        message_str = getattr(event, "message_str", "") or ""
-        is_command = bool(getattr(event, "is_at_or_wake_command", False))
-
-        # Registry-less OneBot clients can learn short-lived routing candidates from events.
+            return self._err("需要 AstrBot Dashboard 管理员登录。", 403)
+        payload = await _get_request_json(request)
+        bot = str(payload.get("bot_self_id", "")).strip()
+        if not valid_qq(bot) or not await self.napcat.verify_bot(bot):
+            return self._err("当前 OneBot 账号未通过连接核验。", 403)
         try:
-            await self.napcat.remember_event_identity(event)
-        except Exception:  # noqa: BLE001 - identity attestation must not break the gate
-            logger.debug("Could not attest bot identity from event", exc_info=True)
+            result = await self.commands.action(bot, operator, "OWNER", str(payload.get("action", "")), payload)
+        except ScopeError as exc:
+            return self._err(str(exc))
+        return self._ok({"message": result})
 
-        is_group_admin = False
-        sender_obj = getattr(msg_obj, "sender", None)
-        if sender_obj is not None and getattr(sender_obj, "role", "") in ("owner", "admin"):
-            is_group_admin = True
+    async def _command(self, event: AstrMessageEvent, name: str) -> str | None:
+        if not self.plugin_config.enabled or not _is_onebot_event(event):
+            return None
+        # Suppress only this command's implicit native chat; the next plugin
+        # handler can still run, including one that explicitly yields a request.
+        event.should_call_llm(True)
+        try:
+            bot, user = await self._event_identity(event)
+            args = (event.message_str or "").split()[1:]
+            if name == "ga":
+                return await self.commands.admin(bot, user, event.is_private_chat(), args)
+            return await self.commands.user(bot, user, event.is_private_chat(), name, args, _group_id(event) or "")
+        except ScopeError as exc:
+            return str(exc)
 
-        is_at_bot = False
-        for comp in getattr(msg_obj, "message", None) or []:
-            if getattr(comp, "type", "") == "at" and str(getattr(comp, "qq", "")) == bot_self_id:
-                is_at_bot = True
-                break
-
-        decision = await self.gate.decide(
-            bot_self_id=bot_self_id,
-            group_id=group_id,
-            user_id=user_id,
-            message_str=message_str,
-            is_command=is_command,
-            is_at_bot=is_at_bot,
-            is_group_admin=is_group_admin,
-        )
-
-        if decision.kind is AdmissionKind.BLOCK:
-            if self.plugin_config.security.log_denied_messages:
-                logger.info(
-                    "Admission blocked: bot=%s group=%s user=%s text=%r",
-                    bot_self_id,
-                    group_id,
-                    user_id,
-                    message_str[:100],
-                )
-            event.stop_event()
-            if decision.notice:
-                yield event.plain_result(decision.notice)
-            return
-
-        if decision.kind is AdmissionKind.USER_COMMAND:
-            reply = await self._execute_user_command(
-                decision.command, bot_self_id, group_id or "", user_id, message_str
-            )
-            event.stop_event()
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.command("申请群聊")
+    async def cmd_apply_group(self, event: AstrMessageEvent):
+        reply = await self._command(event, "申请群聊")
+        if reply is not None:
             yield event.plain_result(reply)
-            return
 
-        if decision.kind is AdmissionKind.ADMIN_COMMAND:
-            reply = await self.dispatcher.handle_admin_command(
-                bot_self_id=bot_self_id,
-                sender_id=user_id,
-                group_id=group_id,
-                args=decision.args,
-            )
-            event.stop_event()
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.command("申请私聊")
+    async def cmd_apply_private(self, event: AstrMessageEvent):
+        reply = await self._command(event, "申请私聊")
+        if reply is not None:
             yield event.plain_result(reply)
-            return
 
-        # The LivingMemory compatibility patch defers its pre-handler filter side effect.
-        # Only a successful group admission may release the queued callback.
-        if group_id and self.plugin_config.enabled:
-            capture = event.get_extra(LIVINGMEMORY_CAPTURE_KEY)
-            if callable(capture):
-                event.set_extra(LIVINGMEMORY_CAPTURE_KEY, None)
-                try:
-                    capture()
-                except Exception:
-                    logger.exception("Could not schedule admitted LivingMemory capture")
-
-    async def _execute_user_command(
-        self,
-        command: str,
-        bot_self_id: str,
-        group_id: str,
-        user_id: str,
-        message_str: str,
-    ) -> str:
-        """Execute a classified admission command via the command dispatcher."""
-        parts = str(message_str or "").strip().split()
-        reason = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
-        if command == "申请使用":
-            return await self.dispatcher.handle_apply(bot_self_id, group_id, user_id, reason)
-        if command == "我的权限":
-            return await self.dispatcher.handle_my_status(bot_self_id, group_id, user_id)
-        if command == "申请状态":
-            return await self.dispatcher.handle_application_status(bot_self_id, group_id, user_id)
-        if command == "取消申请":
-            return await self.dispatcher.handle_cancel_application(bot_self_id, group_id, user_id)
-        if command == "使用规则":
-            return await self.dispatcher.handle_rules(bot_self_id, group_id)
-        return "未知的准入指令"
-
-    # ------------------------------------------------------------------
-    # Command handlers (defense in depth; the gate executes commands first)
-    # ------------------------------------------------------------------
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("申请使用")
-    async def cmd_apply(self, event: AstrMessageEvent) -> None:
-        if not _is_onebot_event(event):
-            return
-        bot_self_id = _bot_self_id(event)
-        group_id = _group_id(event) or ""
-        user_id = str(event.get_sender_id() or "").strip()
-        reason = getattr(event, "message_str", "").replace("/申请使用", "").replace("申请使用", "").strip()
-        reply = await self.dispatcher.handle_apply(bot_self_id, group_id, user_id, reason)
-        event.stop_event()
-        yield event.plain_result(reply)
+    async def cmd_apply(self, event: AstrMessageEvent):
+        reply = await self._command(event, "申请使用")
+        if reply is not None:
+            yield event.plain_result(reply)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("我的权限")
-    async def cmd_my_status(self, event: AstrMessageEvent) -> None:
-        if not _is_onebot_event(event):
-            return
-        reply = await self.dispatcher.handle_my_status(
-            _bot_self_id(event), _group_id(event) or "", str(event.get_sender_id() or "").strip()
-        )
-        event.stop_event()
-        yield event.plain_result(reply)
+    async def cmd_my_status(self, event: AstrMessageEvent):
+        reply = await self._command(event, "我的权限")
+        if reply is not None:
+            yield event.plain_result(reply)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("申请状态")
-    async def cmd_application_status(self, event: AstrMessageEvent) -> None:
-        if not _is_onebot_event(event):
-            return
-        reply = await self.dispatcher.handle_application_status(
-            _bot_self_id(event), _group_id(event) or "", str(event.get_sender_id() or "").strip()
-        )
-        event.stop_event()
-        yield event.plain_result(reply)
+    async def cmd_application_status(self, event: AstrMessageEvent):
+        reply = await self._command(event, "申请状态")
+        if reply is not None:
+            yield event.plain_result(reply)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("取消申请")
-    async def cmd_cancel_application(self, event: AstrMessageEvent) -> None:
-        if not _is_onebot_event(event):
-            return
-        reply = await self.dispatcher.handle_cancel_application(
-            _bot_self_id(event), _group_id(event) or "", str(event.get_sender_id() or "").strip()
-        )
-        event.stop_event()
-        yield event.plain_result(reply)
+    async def cmd_cancel(self, event: AstrMessageEvent):
+        reply = await self._command(event, "取消申请")
+        if reply is not None:
+            yield event.plain_result(reply)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("使用规则")
-    async def cmd_rules(self, event: AstrMessageEvent) -> None:
-        if not _is_onebot_event(event):
-            return
-        reply = await self.dispatcher.handle_rules(_bot_self_id(event), _group_id(event) or "")
-        event.stop_event()
-        yield event.plain_result(reply)
+    async def cmd_rules(self, event: AstrMessageEvent):
+        reply = await self._command(event, "使用规则")
+        if reply is not None:
+            yield event.plain_result(reply)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.command("ga")
-    async def cmd_ga(self, event: AstrMessageEvent) -> None:
-        if not _is_onebot_event(event):
-            return
-        msg = getattr(event, "message_str", "").strip()
-        parts = [p for p in msg.split() if p]
-        args = parts[1:] if len(parts) > 1 else []
-        reply = await self.dispatcher.handle_admin_command(
-            bot_self_id=_bot_self_id(event),
-            sender_id=str(event.get_sender_id() or "").strip(),
-            group_id=_group_id(event),
-            args=args,
-        )
-        event.stop_event()
-        yield event.plain_result(reply)
+    async def cmd_ga(self, event: AstrMessageEvent):
+        reply = await self._command(event, "ga")
+        if reply is not None:
+            yield event.plain_result(reply)

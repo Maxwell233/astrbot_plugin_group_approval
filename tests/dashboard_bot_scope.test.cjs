@@ -4,20 +4,13 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 function dashboard() {
-  const window = { confirm: () => true, prompt: () => "test" };
+  const window = {};
   window.parent = window;
   const inputs = new Map();
   const document = {
     addEventListener() {},
-    querySelectorAll: () => [],
     getElementById(id) {
-      if (!inputs.has(id)) {
-        inputs.set(id, {
-          value: "",
-          classList: { add() {}, remove() {} },
-          addEventListener(type, fn) { this[type] = fn; },
-        });
-      }
+      if (!inputs.has(id)) inputs.set(id, { value: "", checked: false });
       return inputs.get(id);
     },
   };
@@ -28,46 +21,42 @@ function dashboard() {
     state.verifiedBots = ["10001", "20002"];
     $("global-bot-select").value = "10001";
     apiCall = async (path, method, payload) => {
-      calls.push({ path, method, bot: payload.bot_self_id });
+      calls.push({ path, method, ...payload });
       return {};
     };
-    toast = () => {};
-    toastError = (error) => { throw error; };
-    loadApplications = loadDashboard = loadUsers = loadGroups = async () => {};
-    initModals();
   `, context);
   return { calls, run: (code) => vm.runInContext(code, context) };
 }
 
-test("review and grant actions keep the row's Bot identity", async () => {
+test("review and grant actions keep the row's Bot and scope", async () => {
   const { calls, run } = dashboard();
   await run(`(async () => {
-    const application = { id: "A1", bot_self_id: "20002" };
-    openApprovalModal("approve", application);
-    await $("modal-btn-confirm").click();
-    openApprovalModal("reject", application);
-    await $("modal-btn-confirm").click();
-    await revokeGrant({ bot_self_id: "20002", user_id: "30001", group_id: "40001" });
-    await banUser({ bot_self_id: "99999", user_id: "30001", group_id: "40001" });
+    const application = { id: "L123456789abc", bot_self_id: "20002" };
+    await reviewApplication(application, "approve");
+    await reviewApplication(application, "reject");
+    await changeGrant({ bot_self_id: "20002", user_id: "30001", scope: "PRIVATE" }, "revoke");
   })()`);
-  assert.deepEqual(calls.map(({ path, bot }) => [path, bot]), [
-    ["applications/approve", "20002"],
-    ["applications/reject", "20002"],
-    ["users/revoke", "20002"],
+  await assert.rejects(run(`changeGrant({ bot_self_id: "99999", scope: "GROUP" }, "revoke")`), /已核验/);
+  assert.deepEqual(calls.map(c => [c.path, c.action, c.bot_self_id]), [
+    ["scope/action", "approve", "20002"],
+    ["scope/action", "reject", "20002"],
+    ["scope/action", "revoke", "20002"],
   ]);
+  assert.equal(calls[2].scope, "PRIVATE");
 });
 
-test("editing a policy keeps its Bot when the dashboard selection changes", async () => {
+test("policy save stays bound to the Bot whose settings were loaded", async () => {
   const { calls, run } = dashboard();
   await run(`(async () => {
-    state.groupPolicies = [{ bot_self_id: "20002", group_id: "40001", enabled: true,
-      min_level: 10, grant_duration_seconds: 0, recheck_interval_seconds: 30,
-      restore_policy: "automatic" }];
     $("global-bot-select").value = "20002";
-    openGroupModal(0);
+    state.settingsBot = "20002";
+    $("level-PRIVATE").value = "20";
+    $("approval-GROUP").checked = true;
     $("global-bot-select").value = "10001";
-    await $("modal-group-save").click();
+    await saveSettings();
   })()`);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].bot, "20002");
+  assert.equal(calls[0].bot_self_id, "20002");
+  assert.equal(calls[0].private.min_level, "20");
+  assert.equal(calls[0].group.approval_required, true);
 });

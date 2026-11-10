@@ -32,7 +32,7 @@ class LevelService:
         self._cache: dict[tuple[str, str, str], tuple[GroupMemberLevelResult, float]] = {}
 
         # Request coalescing (single-flight): key -> Future[GroupMemberLevelResult]
-        self._in_flight: dict[tuple[str, str, str, bool], asyncio.Future[GroupMemberLevelResult]] = {}
+        self._in_flight: dict[tuple[str, str, str, bool, tuple[int, int] | None], asyncio.Future[GroupMemberLevelResult]] = {}
         self._lock = asyncio.Lock()
 
     def parse_level(self, raw_level: Any) -> int | None:
@@ -66,13 +66,15 @@ class LevelService:
         group_id: str,
         user_id: str,
         force_refresh: bool = False,
+        *,
+        lookup_generation: tuple[int, int] | None = None,
     ) -> GroupMemberLevelResult:
         """Query member group level with caching and single-flight concurrency."""
         b_id = str(bot_id).strip()
         g_id = str(group_id).strip()
         u_id = str(user_id).strip()
         key = (b_id, g_id, u_id)
-        request_key = (*key, force_refresh)
+        request_key = (*key, force_refresh, lookup_generation)
         now = time.time()
 
         # 1. Check cache if not forcing refresh
@@ -105,7 +107,7 @@ class LevelService:
                 need_wait = False
 
         if need_wait:
-            return await future
+            return await asyncio.shield(future)
 
         # 3. Perform actual remote query
         try:
@@ -113,12 +115,21 @@ class LevelService:
             # Store in cache only on successful member lookup
             expires_at = now + self.cache_ttl
             cached = self._cache.get(key)
-            if result.success and result.is_member and (cached is None or cached[1] <= expires_at):
+            if (lookup_generation is None and result.success and result.is_member
+                    and (cached is None or cached[1] <= expires_at)):
                 self._cache[key] = (result, expires_at)
 
             if not future.done():
                 future.set_result(result)
             return result
+        except asyncio.CancelledError:
+            # Followers deny this request instead of waiting forever. The
+            # leader still propagates the framework's cancellation.
+            if not future.done():
+                future.set_result(GroupMemberLevelResult(
+                    success=False, group_id=g_id, user_id=u_id, error_code="QUERY_CANCELLED",
+                ))
+            raise
         except Exception as e:
             err_res = GroupMemberLevelResult(
                 success=False,

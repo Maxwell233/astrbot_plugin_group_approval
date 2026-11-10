@@ -171,3 +171,23 @@ async def test_concurrent_request_coalescing(mock_napcat: MockNapCatClient):
         assert r.success is True
         assert r.level == 10
     assert call_count == 1
+
+
+async def test_cancelled_leader_resolves_shared_lookup_for_followers(monkeypatch, mock_napcat):
+    service = LevelService(mock_napcat)
+    entered = asyncio.Event()
+
+    async def blocked(**kwargs):
+        entered.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(mock_napcat, "get_group_member_info", blocked)
+    leader = asyncio.create_task(service.get_group_member_level("bot1", "10001", "20001", True))
+    await asyncio.wait_for(entered.wait(), 2)
+    follower = asyncio.create_task(service.get_group_member_level("bot1", "10001", "20001", True))
+    await asyncio.sleep(0)
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+    result = await asyncio.wait_for(follower, 2)
+    assert not result.success and result.error_code == "QUERY_CANCELLED"

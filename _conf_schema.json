@@ -1,123 +1,78 @@
 {
   "enabled": {
-    "description": "是否启用插件",
+    "description": "启用原生 LLM 聊天准入",
     "type": "bool",
     "default": true
   },
-  "default_policy": {
-    "description": "未显式配置群的默认准入策略",
-    "type": "string",
-    "options": [
-      "deny",
-      "allow"
-    ],
-    "labels": [
-      "默认拒绝（需配置后才开放申请）",
-      "默认允许（不设门槛）"
-    ],
-    "default": "deny"
-  },
   "owner_qq_ids": {
-    "description": "插件最高管理员（Owner）QQ 号列表",
+    "description": "Owner QQ 号列表",
     "type": "list",
-    "hint": "拥有全局群策略配置、手动授权、黑名单及审核员管理权限",
     "default": []
   },
   "reviewer_qq_ids": {
-    "description": "插件审核员（Reviewer）QQ 号列表",
+    "description": "初始审核员 QQ 号列表",
     "type": "list",
-    "hint": "拥有查看待审申请、批准、拒绝与撤销授权权限",
     "default": []
   },
-  "application": {
-    "description": "申请参数配置",
+  "private_chat": {
+    "description": "私聊管理指令",
     "type": "object",
     "items": {
-      "expire_hours": {
-        "description": "待审核申请有效期（小时）",
-        "type": "int",
-        "default": 72
-      },
-      "reject_cooldown_hours": {
-        "description": "申请被拒绝后的再次申请冷却时间（小时）",
-        "type": "int",
-        "default": 24
-      },
-      "rate_limit_per_hour": {
-        "description": "单用户每小时最大提交申请次数",
-        "type": "int",
-        "default": 5
+      "admin_commands_enabled": {
+        "description": "允许 Owner 和 Reviewer 在私聊执行 /ga",
+        "type": "bool",
+        "default": true
       }
     }
   },
-  "private_chat": {
-    "description": "私聊行为设置",
+  "application": {
+    "description": "申请限频",
     "type": "object",
     "items": {
-      "enabled_for_normal_users": {
-        "description": "是否对普通用户开放 Bot 私聊对话",
-        "type": "bool",
-        "default": false
+      "rate_limit_per_hour": {
+        "description": "每 Bot、用户、域每小时可新建的待审申请数。0 表示不限频",
+        "type": "int",
+        "default": 5
       },
-      "admin_commands_enabled": {
-        "description": "是否允许管理员在私聊中执行 /ga 管理指令",
-        "type": "bool",
-        "default": true
+      "query_limit": {
+        "description": "每 Bot、用户、域在窗口内允许发起等级查询的申请次数",
+        "type": "int",
+        "default": 3
+      },
+      "query_window_seconds": {
+        "description": "申请命令限频窗口（秒）",
+        "type": "int",
+        "default": 60
       }
     }
   },
   "notifications": {
-    "description": "通知与提醒设置",
+    "description": "私聊通知队列",
     "type": "object",
     "items": {
-      "reviewer_private_message": {
-        "description": "有新申请时向审核员发送私聊提醒",
-        "type": "bool",
-        "default": true
-      },
-      "fallback_group_id": {
-        "description": "审核通知备用群群号（私聊发送失败时推送）",
-        "type": "string",
-        "default": ""
-      },
       "retry_enabled": {
-        "description": "开启持久化通知发信队列与重试",
+        "description": "启动私聊通知队列发送器",
         "type": "bool",
         "default": true
       },
       "max_retries": {
-        "description": "通知发送最大重试次数",
+        "description": "通知最大尝试次数",
         "type": "int",
         "default": 5
       },
       "retry_interval_seconds": {
-        "description": "通知重试基础间隔（秒，指数退避）",
+        "description": "通知重试基准间隔（秒）",
         "type": "int",
         "default": 60
-      },
-      "user_group_fallback_enabled": {
-        "description": "私聊通知失败时是否允许向申请来源群发送简短提醒（默认关闭；开启后仅发送不含审批理由的提示）",
-        "type": "bool",
-        "default": false
-      },
-      "user_group_fallback_text": {
-        "description": "用户通知群内兜底文案（仅在上一项开启时使用，禁止包含审批理由/备注）",
-        "type": "string",
-        "default": ""
       }
     }
   },
   "security": {
-    "description": "安全与审计策略",
+    "description": "审计保留",
     "type": "object",
     "items": {
-      "log_denied_messages": {
-        "description": "记录被拦截消息的详细日志",
-        "type": "bool",
-        "default": false
-      },
       "keep_audit_days": {
-        "description": "审计日志保留天数（启动时清理更早的记录；0 表示不清理）",
+        "description": "启动时保留最近多少天的审计。0 表示保留全部",
         "type": "int",
         "default": 90
       }

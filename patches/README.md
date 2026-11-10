@@ -29,3 +29,7 @@ git apply "/path/to/group-approval/patches/livingmemory_admission.patch"
 补丁把 AIOCQHTTP 的采集调度延后到 Group Approval 的群消息准入通过时。准入未运行、禁用、拒绝或处理准入专用指令时，采集保持关闭。其他平台沿用 LivingMemory 原路径。补丁覆盖该版本的被动采集入口。历史记录、主动记忆工具、其他来源和按会话共享的记忆另行检查。完整插件和实际落库仍待联调。
 
 LivingMemory 衍生补丁 `livingmemory_admission.patch` 按上游 AGPL-3.0 许可提供。 [对应上游源码与许可](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory/tree/1a216d78083af9fd80d72223ca7ead7e7100642d)
+
+## 0.1.2 状态
+
+新版 LLM 准入位于普通消息 Handler 之后，GroupGuardian 优先级补丁无需为新版单独安装，已安装的可以保留。LivingMemory 补丁依赖 0.1.1 的全消息闸门。0.1.2 请直接使用上游 LivingMemory。若曾应用该补丁，请先恢复其原文件或在对应插件目录用 `git apply --reverse` 撤销，再重载。
