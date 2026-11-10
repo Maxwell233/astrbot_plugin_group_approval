@@ -1,4 +1,4 @@
-"""AstrBot 0.1.2 entry point for Bot-wide native LLM chat admission."""
+"""AstrBot plugin entry point for Bot-wide native LLM chat admission."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ try:
         NotificationService,
         PluginConfig,
         ReviewerService,
+        __version__,
     )
     from .approval.auth_service import build_dashboard_username_getter
     from .approval.native_llm import NativeLLMGuard
@@ -33,6 +34,7 @@ except ImportError:
         NotificationService,
         PluginConfig,
         ReviewerService,
+        __version__,
     )
     from approval.auth_service import build_dashboard_username_getter
     from approval.native_llm import NativeLLMGuard
@@ -145,7 +147,7 @@ class GroupApprovalPlugin(Star):
             await self.native_guard.uninstall()
             await self.db.close()
             raise
-        logger.info("Group Approval 0.1.2 initialized. Native LLM guard active: %s", self.native_guard.installed)
+        logger.info("Group Approval %s initialized. Native LLM guard active: %s", __version__, self.native_guard.installed)
 
     async def terminate(self) -> None:
         self._initialized = False
