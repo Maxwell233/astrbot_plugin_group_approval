@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from astrbot.api import logger
 
 try:
     from .approval import (
@@ -40,8 +41,6 @@ except ImportError:
     from approval.native_llm import NativeLLMGuard
     from approval.scope_commands import ScopeCommands
     from approval.scope_service import ScopeError, ScopeService, valid_qq
-
-logger = logging.getLogger("astrbot_plugin_group_approval")
 
 PLUGIN_NAME = "astrbot_plugin_group_approval"
 

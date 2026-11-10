@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Awaitable, Callable
 from contextlib import aclosing
 from dataclasses import dataclass, field
@@ -12,7 +11,8 @@ from inspect import ismethod
 from typing import Any
 from weakref import WeakMethod
 
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
+
 SUPPORTED_FRAMEWORK = "4.29.4"
 STATE_ATTRIBUTE = "_astrbot_group_approval_native_runtime"
 

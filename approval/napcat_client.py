@@ -22,11 +22,12 @@ Identity policy (fail closed):
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
+
+from astrbot.api import logger
 
 try:
     from aiocqhttp.exceptions import ActionFailed
@@ -34,8 +35,6 @@ except ImportError:  # Standalone service tests do not install AstrBot's OneBot 
     ACTION_FAILED_ERRORS = ()
 else:
     ACTION_FAILED_ERRORS = (ActionFailed,)
-
-logger = logging.getLogger("astrbot_plugin_group_approval.napcat")
 
 AIOCQHTTP_PLATFORM_NAME = "aiocqhttp"
 

@@ -6,13 +6,12 @@ Stable event keys deduplicate enqueue. Delivery is at-least-once after a worker 
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
+
+from astrbot.api import logger
 
 from .database import Database
 from .napcat_client import NapCatClient
-
-logger = logging.getLogger("astrbot_plugin_group_approval.notification")
 
 # A row claimed by a worker but not updated for this long is considered abandoned
 # (crash/restart) and may be reclaimed. Delivery may be retried at-least-once.

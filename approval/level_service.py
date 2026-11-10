@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 from typing import Any
+
+from astrbot.api import logger
 
 from .models import GroupMemberLevelResult
 from .napcat_client import (
     BOT_IDENTITY_ERROR_CODES,
     NapCatClient,
 )
-
-logger = logging.getLogger("astrbot_plugin_group_approval.level")
 
 # Regex to strictly parse level strings (e.g., "LV18", "lv 18", "等级18", "18")
 STRICT_LEVEL_REGEX = re.compile(r"^(?:LV|lv|Lv|等级)?\s*(\d+)$")

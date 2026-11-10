@@ -1,7 +1,7 @@
 name: astrbot_plugin_group_approval
 display_name: AstrBot AI 聊天准入
 author: Maxwell233
-version: 0.1.3
+version: 0.1.4
 desc: 为 OneBot QQ Bot 的原生 AI 聊天提供主群等级、GROUP / PRIVATE 双域授权和人工审批。
 help: |
   /申请群聊、/申请私聊、/申请使用

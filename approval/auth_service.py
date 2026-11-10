@@ -20,11 +20,11 @@ Identity model (verified against AstrBot 4.29.4 source):
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 from typing import Any
 
-logger = logging.getLogger("astrbot_plugin_group_approval.auth")
+from astrbot.api import logger
+
 
 class AuthorizationService:
     """Authenticates dashboard requests and authorizes actions server-side."""

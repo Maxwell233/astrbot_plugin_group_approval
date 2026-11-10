@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import AsyncGenerator
+from importlib.util import find_spec
+from types import ModuleType
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import pytest_asyncio
 
-from approval.config import PluginConfig
-from approval.database import Database
-from approval.napcat_client import NapCatClient
+# The unit job runs without AstrBot. Supply only its logger API so framework
+# tests still skip when the real framework is absent.
+if find_spec("astrbot") is None and "astrbot.api" not in sys.modules:
+    api = ModuleType("astrbot.api")
+    api.logger = Mock(spec=["debug", "info", "warning", "error", "exception"])
+    sys.modules["astrbot.api"] = api
+
+from approval.config import PluginConfig  # noqa: E402
+from approval.database import Database  # noqa: E402
+from approval.napcat_client import NapCatClient  # noqa: E402
 
 
 class MockNapCatClient(NapCatClient):
