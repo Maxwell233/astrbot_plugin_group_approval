@@ -157,33 +157,41 @@ class ScopeService:
         bot, group = settings.bot_self_id, settings.primary_group_id
         if not group:
             raise ScopeError("此 Bot 尚未配置主群。")
-        if not force and settings.cache_ttl:
-            row = await self.db.fetchone(
-                """SELECT level FROM primary_group_levels WHERE bot_self_id = ? AND primary_group_id = ?
-                   AND user_id = ? AND primary_revision = ? AND verified_at > ?""",
-                (bot, group, user, settings.primary_revision, int(time.time()) - settings.cache_ttl),
-            )
-            if row:
-                return row["level"]
-        result = await self.level.get_group_member_level(bot, group, user, force_refresh=True)
+        row = await self.db.fetchone(
+            """SELECT level, verified_at, lookup_epoch FROM primary_group_levels
+               WHERE bot_self_id = ? AND primary_group_id = ? AND user_id = ? AND primary_revision = ?""",
+            (bot, group, user, settings.primary_revision),
+        )
+        epoch = row["lookup_epoch"] if row else 0
+        if (not force and settings.cache_ttl and row
+                and row["verified_at"] > int(time.time()) - settings.cache_ttl):
+            return row["level"]
+        result = await self.level.get_group_member_level(
+            bot, group, user, force_refresh=True, lookup_generation=(settings.primary_revision, epoch),
+        )
         if not result.success or not result.is_member:
             await self.db.execute(
-                """DELETE FROM primary_group_levels WHERE bot_self_id = ? AND primary_group_id = ?
-                   AND user_id = ? AND primary_revision = ?""", (bot, group, user, settings.primary_revision)
+                """UPDATE primary_group_levels SET verified_at = 0 WHERE bot_self_id = ? AND primary_group_id = ?
+                   AND user_id = ? AND primary_revision = ? AND lookup_epoch = ?""",
+                (bot, group, user, settings.primary_revision, epoch),
             )
             if result.error_code == "NOT_MEMBER":
                 return None
             raise ScopeError("暂时无法核验主群成员身份或等级，请稍后再试。")
 
-        await self.db.execute(
-            """INSERT INTO primary_group_levels (bot_self_id, primary_group_id, user_id, primary_revision, level, verified_at)
-               SELECT bot_self_id, primary_group_id, ?, primary_revision, ?, ? FROM bot_settings
+        written = await self.db.execute(
+            """INSERT INTO primary_group_levels
+                   (bot_self_id, primary_group_id, user_id, primary_revision, level, verified_at, lookup_epoch)
+               SELECT bot_self_id, primary_group_id, ?, primary_revision, ?, ?, ? FROM bot_settings
                WHERE bot_self_id = ? AND primary_group_id = ? AND primary_revision = ?
                ON CONFLICT(bot_self_id, primary_group_id, user_id) DO UPDATE SET
                  primary_revision = excluded.primary_revision, level = excluded.level, verified_at = excluded.verified_at
-               WHERE primary_group_levels.verified_at <= excluded.verified_at""",
-            (user, result.level, result.checked_at, bot, group, settings.primary_revision),
+               WHERE primary_group_levels.lookup_epoch = excluded.lookup_epoch
+                 AND primary_group_levels.verified_at <= excluded.verified_at""",
+            (user, result.level, result.checked_at, epoch, bot, group, settings.primary_revision),
         )
+        if written.rowcount != 1:
+            raise ScopeError("Bot 的主群或成员核验状态已变更，请重试。")
         return result.level
 
     @staticmethod
@@ -204,7 +212,10 @@ class ScopeService:
         if await self._restricted(bot, user, scope):
             return "此域的 AI 聊天权限已受限制。"
         if settings.owner_bypass and self.config.is_owner(user):
-            return None
+            async with self.db.transaction():
+                current = await self.settings(bot)
+                if current.owner_bypass and not await self._restricted(bot, user, scope):
+                    return None
         grant = await self.grant(bot, user, scope)
         if not grant or grant["status"] != "ACTIVE":
             return f"尚无可用的{LABELS[scope]} AI 权限，请发送 /申请{LABELS[scope]}。"
@@ -451,29 +462,49 @@ class ScopeService:
         return f"已恢复{LABELS[scope]}授权。"
 
     async def restrict(self, bot, user, scopes, actor, role, *, kind="REVOKED", remove=False):
+        if kind not in {"REVOKED", "BLACKLIST"} or (remove and kind != "BLACKLIST"):
+            raise ScopeError("人工撤销只能由 Owner 明确重新授权解除。")
         async with self.db.transaction():
+            unbanned = False
             for scope in scopes:
                 if remove:
-                    await self.db.execute(
+                    changed = await self.db.execute(
                         "DELETE FROM grant_restrictions WHERE bot_self_id = ? AND user_id = ? AND scope = ? AND kind = ?",
                         (bot, user, scope, kind),
                     )
+                    unbanned |= changed.rowcount > 0
                 else:
-                    await self.db.execute(
+                    changed = await self.db.execute(
                         "INSERT OR IGNORE INTO grant_restrictions VALUES (?, ?, ?, ?)", (bot, user, scope, kind)
                     )
                     await self.db.execute(
-                        """UPDATE grants_v2 SET status = 'REVOKED', revision = revision + 1, updated_at = ?
-                           WHERE bot_self_id = ? AND user_id = ? AND scope = ?""",
-                        (int(time.time()), bot, user, scope),
-                    )
-                    await self.db.execute(
-                        """UPDATE applications_v2 SET status = 'CANCELLED', reviewed_at = ?, reviewer_id = ?
+                        """UPDATE applications_v2 SET status = 'CANCELLED', reviewed_at = ?,
+                           reviewer_id = ?, review_note = ?
                            WHERE bot_self_id = ? AND user_id = ? AND scope = ? AND status = 'PENDING'""",
-                        (int(time.time()), actor, bot, user, scope),
+                        (int(time.time()), actor, "黑名单限制" if kind == "BLACKLIST" else "管理员撤销授权",
+                         bot, user, scope),
                     )
-                await self._log(bot, actor, role, "LLM_RESTRICTION_UPDATED", user=user, scope=scope,
-                                kind=kind, removed=remove)
+                if changed.rowcount > 0:
+                    await self.db.execute(
+                        """UPDATE grants_v2 SET status = CASE WHEN ? = 'REVOKED' THEN 'REVOKED' ELSE status END,
+                           revision = revision + 1, updated_at = ?
+                           WHERE bot_self_id = ? AND user_id = ? AND scope = ?""",
+                        (kind, int(time.time()), bot, user, scope),
+                    )
+                    await self._log(bot, actor, role, "LLM_RESTRICTION_UPDATED", user=user, scope=scope,
+                                    kind=kind, removed=remove)
+            if unbanned:
+                # Keep an invalidation marker so a lookup that started before
+                # unban cannot refill the cache or be shared by a newer check.
+                await self.db.execute(
+                    """INSERT INTO primary_group_levels
+                           (bot_self_id, primary_group_id, user_id, primary_revision, level, verified_at, lookup_epoch)
+                       SELECT bot_self_id, primary_group_id, ?, primary_revision, 0, 0, 1 FROM bot_settings
+                       WHERE bot_self_id = ? AND primary_group_id != ''
+                       ON CONFLICT(bot_self_id, primary_group_id, user_id) DO UPDATE SET
+                         verified_at = 0, lookup_epoch = primary_group_levels.lookup_epoch + 1""",
+                    (user, bot),
+                )
         return "已更新限制。"
 
     async def overview(self, bot: str, *, user: str = "", include_audit: bool = False) -> dict:
@@ -489,7 +520,7 @@ class ScopeService:
         )
         levels = await self.db.fetchall(
             "SELECT user_id, level, verified_at FROM primary_group_levels WHERE bot_self_id = ?"
-            " AND primary_group_id = ? AND primary_revision = ?" + scope + " ORDER BY verified_at DESC LIMIT 100",
+            " AND primary_group_id = ? AND primary_revision = ? AND verified_at > 0" + scope + " ORDER BY verified_at DESC LIMIT 100",
             (bot, settings.primary_group_id, settings.primary_revision, *((user,) if user else ())),
         )
         data = {

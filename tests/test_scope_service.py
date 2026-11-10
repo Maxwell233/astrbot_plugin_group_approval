@@ -237,3 +237,59 @@ async def test_main_group_change_during_a_live_check_denies_old_response(scoped,
     monkeypatch.setattr(service.level, "get_group_member_level", change_main)
     assert "已变更" in await service.check_chat(BOT, USER, "GROUP")
     assert not (await service.overview(BOT))["levels"]
+
+
+@pytest.mark.parametrize("prior", ["ACTIVE", "SUSPENDED", "REVOKED", None])
+async def test_blacklist_preserves_grant_and_unban_requires_current_level(scoped, prior):
+    service, napcat = scoped
+    if prior:
+        await service.apply(BOT, USER, "GROUP", "")
+        if prior == "SUSPENDED":
+            await service.db.execute("UPDATE grants_v2 SET status = 'SUSPENDED' WHERE bot_self_id = ?", (BOT,))
+        if prior == "REVOKED":
+            await service.restrict(BOT, USER, ["GROUP"], REVIEWER, "REVIEWER")
+    await service.restrict(BOT, USER, ["GROUP"], OWNER, "OWNER", kind="BLACKLIST")
+    grant = await service.grant(BOT, USER, "GROUP")
+    assert (grant["status"] if grant else None) == prior
+    assert await service.check_chat(BOT, USER, "GROUP")
+    with pytest.raises(ScopeError, match="黑名单"):
+        await service.apply(BOT, USER, "GROUP", "")
+    await service.restrict(BOT, USER, ["GROUP"], OWNER, "OWNER", kind="BLACKLIST", remove=True)
+    grant = await service.grant(BOT, USER, "GROUP")
+    assert (grant["status"] if grant else None) == prior
+    if prior == "ACTIVE":
+        napcat.set_member(PRIMARY, USER, "25")
+        assert await service.check_chat(BOT, USER, "GROUP") is None
+        assert (await service.overview(BOT))["levels"][0]["level"] == 25
+    else:
+        assert await service.check_chat(BOT, USER, "GROUP")
+
+
+async def test_blacklist_all_scope_and_failed_audit_rollback(scoped, monkeypatch):
+    service, napcat = scoped
+    napcat.set_member(PRIMARY, USER, "25")
+    await service.apply(BOT, USER, "GROUP", "")
+    await service.apply(BOT, USER, "PRIVATE", "")
+    await service.restrict(BOT, USER, ["GROUP"], OWNER, "OWNER", kind="BLACKLIST")
+    assert await service.check_chat(BOT, USER, "GROUP")
+    app = (await service.overview(BOT))["applications"][0]
+    assert app["status"] == "PENDING"
+    original = service.audit.log
+
+    async def fail_private(**kwargs):
+        await original(**kwargs)
+        if kwargs["details"]["scope"] == "PRIVATE":
+            raise RuntimeError("audit failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(service.audit, "log", fail_private)
+        with pytest.raises(RuntimeError):
+            await service.restrict(BOT, USER, ["GROUP", "PRIVATE"], OWNER, "OWNER", kind="BLACKLIST")
+    assert (await service.application(BOT, app["id"]))["status"] == "PENDING"
+    assert not await service._restricted(BOT, USER, "PRIVATE")
+    await service.restrict(BOT, USER, ["GROUP", "PRIVATE"], OWNER, "OWNER", kind="BLACKLIST")
+    assert await service._restricted(BOT, USER, "PRIVATE")
+    assert (await service.application(BOT, app["id"]))["status"] == "CANCELLED"
+    await service.restrict(BOT, USER, ["GROUP", "PRIVATE"], OWNER, "OWNER", kind="BLACKLIST", remove=True)
+    assert await service.check_chat(BOT, USER, "GROUP") is None
+    assert await service.check_chat(BOT, USER, "PRIVATE")

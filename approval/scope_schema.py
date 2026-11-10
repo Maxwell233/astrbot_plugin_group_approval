@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS primary_group_levels (
     primary_revision INTEGER NOT NULL,
     level INTEGER NOT NULL,
     verified_at INTEGER NOT NULL,
+    lookup_epoch INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (bot_self_id, primary_group_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS grant_restrictions (
