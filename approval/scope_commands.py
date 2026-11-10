@@ -74,9 +74,7 @@ class ScopeCommands:
             )
         user = _qq(payload.get("user_id", ""), "QQ")
         if action in {"reviewer_add", "reviewer_remove"}:
-            if action == "reviewer_add":
-                return (await self.service.legacy.add_reviewer(user, actor))[1]
-            return (await self.service.legacy.remove_reviewer(user))[1]
+            return await self.service.reviewers.set_reviewer(user, actor, enabled=action == "reviewer_add")
         if action in {"ban", "unban", "revoke"}:
             raw_scope = str(payload.get("scope", "")).lower()
             scopes = SCOPES if raw_scope == "all" else (parse_scope(raw_scope),)
@@ -124,7 +122,7 @@ class ScopeCommands:
             return "此 Bot 的管理指令已关闭。"
         if not private:
             return "请私聊 Bot 使用管理指令。"
-        if not await self.service.legacy.is_reviewer(user):
+        if not await self.service.reviewers.can_review(user):
             return "需要 Owner 或 Reviewer 权限。"
         role = "OWNER" if self.service.config.is_owner(user) else "REVIEWER"
         if not args:

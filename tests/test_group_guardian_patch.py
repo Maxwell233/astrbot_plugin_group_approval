@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from approval.gate import GATE_PRIORITY, MODERATION_RECOMMENDED_PRIORITY
+GATE_PRIORITY, MODERATION_RECOMMENDED_PRIORITY = 50, 100
 
 PATCH_PATH = Path(__file__).resolve().parents[1] / "patches" / "group_guardian_priority.patch"
 

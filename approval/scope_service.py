@@ -7,12 +7,13 @@ import uuid
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from .approval_service import ApprovalService
 from .audit_service import AuditService
 from .config import PluginConfig
 from .database import Database
 from .level_service import LevelService
 from .notification_service import NotificationService
+from .rate_limit import RateLimiter
+from .reviewers import ReviewerService
 
 Scope = Literal["GROUP", "PRIVATE"]
 SCOPES = ("GROUP", "PRIVATE")
@@ -58,14 +59,15 @@ class Policy:
 class ScopeService:
     def __init__(
         self, db: Database, level: LevelService, audit: AuditService,
-        notifications: NotificationService, config: PluginConfig, legacy: ApprovalService,
+        notifications: NotificationService, config: PluginConfig, reviewers: ReviewerService,
     ):
         self.db = db
         self.level = level
         self.audit = audit
         self.notifications = notifications
         self.config = config
-        self.legacy = legacy
+        self.reviewers = reviewers
+        self.limiter = RateLimiter(db)
 
     async def settings(self, bot: str) -> Settings:
         row = await self.db.fetchone("SELECT * FROM bot_settings WHERE bot_self_id = ?", (bot,))
@@ -80,12 +82,12 @@ class ScopeService:
 
     async def grant(self, bot: str, user: str, scope: Scope):
         return await self.db.fetchone(
-            "SELECT * FROM grants_v2 WHERE bot_self_id = ? AND user_id = ? AND scope = ?", (bot, user, scope)
+            "SELECT * FROM grants WHERE bot_self_id = ? AND user_id = ? AND scope = ?", (bot, user, scope)
         )
 
     async def application(self, bot: str, app_id: str):
         return await self.db.fetchone(
-            "SELECT * FROM applications_v2 WHERE bot_self_id = ? AND id = ?", (bot, app_id)
+            "SELECT * FROM applications WHERE bot_self_id = ? AND id = ?", (bot, app_id)
         )
 
     async def _restricted(self, bot: str, user: str, scope: Scope, *, owner_override: bool = False) -> bool:
@@ -148,7 +150,7 @@ class ScopeService:
             if primary_changed:
                 await self.db.execute("DELETE FROM primary_group_levels WHERE bot_self_id = ?", (bot,))
                 cancelled = await self.db.fetchall(
-                    """UPDATE applications_v2 SET status = 'CANCELLED', reviewed_at = ?, reviewer_id = ?,
+                    """UPDATE applications SET status = 'CANCELLED', reviewed_at = ?, reviewer_id = ?,
                        review_note = ? WHERE bot_self_id = ? AND status = 'PENDING'
                          AND (primary_revision != ? OR primary_group_id != ?)
                        RETURNING id, user_id, scope""",
@@ -247,7 +249,7 @@ class ScopeService:
                 reason = self._qualification(level, policy, current)
                 if reason:
                     await self.db.execute(
-                        """UPDATE grants_v2 SET status = 'SUSPENDED', revision = revision + 1, updated_at = ?
+                        """UPDATE grants SET status = 'SUSPENDED', revision = revision + 1, updated_at = ?
                            WHERE bot_self_id = ? AND user_id = ? AND scope = ? AND revision = ?""",
                         (int(time.time()), bot, user, scope, grant["revision"]),
                     )
@@ -259,19 +261,19 @@ class ScopeService:
 
     async def _write_grant(self, bot, user, scope, source, actor, *, app_id=None, flags=(False, False)):
         await self.db.execute(
-            """INSERT INTO grants_v2 (bot_self_id, user_id, scope, status, source, source_application_id,
+            """INSERT INTO grants (bot_self_id, user_id, scope, status, source, source_application_id,
                level_exempt, membership_exempt, actor_id, updated_at)
                VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?)
                ON CONFLICT(bot_self_id, user_id, scope) DO UPDATE SET status = 'ACTIVE', source = excluded.source,
                  source_application_id = excluded.source_application_id, level_exempt = excluded.level_exempt,
                  membership_exempt = excluded.membership_exempt, actor_id = excluded.actor_id,
-                 updated_at = excluded.updated_at, revision = grants_v2.revision + 1""",
+                 updated_at = excluded.updated_at, revision = grants.revision + 1""",
             (bot, user, scope, source, app_id, *flags, actor, int(time.time())),
         )
 
     async def _restore(self, grant, settings, actor, role):
         await self.db.execute(
-            """UPDATE grants_v2 SET status = 'ACTIVE', revision = revision + 1, updated_at = ?
+            """UPDATE grants SET status = 'ACTIVE', revision = revision + 1, updated_at = ?
                WHERE bot_self_id = ? AND user_id = ? AND scope = ? AND status = 'SUSPENDED' AND revision = ?""",
             (int(time.time()), grant["bot_self_id"], grant["user_id"], grant["scope"], grant["revision"]),
         )
@@ -280,7 +282,7 @@ class ScopeService:
 
     async def _pending(self, bot, user, scope):
         return await self.db.fetchone(
-            """SELECT id FROM applications_v2 WHERE bot_self_id = ? AND user_id = ?
+            """SELECT id FROM applications WHERE bot_self_id = ? AND user_id = ?
                AND scope = ? AND status = 'PENDING'""", (bot, user, scope)
         )
 
@@ -314,7 +316,7 @@ class ScopeService:
             return f"已有待审批申请 {existing['id']}。"
 
         limits = self.config.application
-        if not await self.legacy.check_and_increment_rate_limit(
+        if not await self.limiter.allow(
             f"llm-query:{bot}:{user}:{scope}", limits.query_limit, limits.query_window_seconds
         ):
             raise ScopeError("申请核验过于频繁，请稍后重试。")
@@ -340,7 +342,7 @@ class ScopeService:
                 app_id = existing["id"] if existing else None
                 if app_id:
                     await self.db.execute(
-                        """UPDATE applications_v2 SET status = 'APPROVED', reviewed_at = ?,
+                        """UPDATE applications SET status = 'APPROVED', reviewed_at = ?,
                            reviewer_id = 'SYSTEM', review_note = ? WHERE id = ? AND status = 'PENDING'""",
                         (int(time.time()), source_type, app_id),
                     )
@@ -352,13 +354,13 @@ class ScopeService:
                 return f"已有待审批申请 {existing['id']}。"
 
             limit = self.config.application.rate_limit_per_hour
-            if limit > 0 and not await self.legacy.check_and_increment_rate_limit(
+            if limit > 0 and not await self.limiter.allow(
                 f"llm-apply:{bot}:{user}:{scope}", limit
             ):
                 raise ScopeError("申请过于频繁，请稍后重试。")
             app_id = f"L{uuid.uuid4().hex[:12]}"
             await self.db.execute(
-                """INSERT INTO applications_v2 (id, bot_self_id, user_id, scope, source_group_id, primary_group_id,
+                """INSERT INTO applications (id, bot_self_id, user_id, scope, source_group_id, primary_group_id,
                    primary_revision, level, reason, status, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
                 (app_id, bot, user, scope, source_group, settings.primary_group_id,
@@ -366,10 +368,10 @@ class ScopeService:
             )
             await self._log(bot, user, "USER", "LLM_APPLICATION_SUBMITTED", user=user, scope=scope,
                             primary=settings.primary_group_id, app_id=app_id, source_group_id=source_group)
-            reviewers = set(self.config.owner_qq_ids) | set(await self.legacy.list_reviewers())
+            reviewers = set(self.config.owner_qq_ids) | set(await self.reviewers.list_reviewers())
             for reviewer in sorted(reviewers):
                 await self.notifications.enqueue(
-                    f"LLM_REVIEW_{app_id}_{reviewer}", reviewer, "private",
+                    f"LLM_REVIEW_{app_id}_{reviewer}", reviewer,
                     f"{LABELS[scope]} AI 申请 {app_id}（QQ {user}，主群 LV{level}）。\n"
                     f"私聊 /ga approve {app_id} 或 /ga reject {app_id}。",
                     bot_self_id=bot,
@@ -415,7 +417,7 @@ class ScopeService:
                 if existing and existing["status"] == "ACTIVE":
                     raise ScopeError("该用户已有此域授权。")
             changed = await self.db.execute(
-                """UPDATE applications_v2 SET status = ?, reviewed_at = ?, reviewer_id = ?, review_note = ?
+                """UPDATE applications SET status = ?, reviewed_at = ?, reviewer_id = ?, review_note = ?
                    WHERE bot_self_id = ? AND id = ? AND status = 'PENDING'""",
                 (status, int(time.time()), actor, note, bot, app_id),
             )
@@ -427,7 +429,7 @@ class ScopeService:
                             primary=settings.primary_group_id, app_id=app_id, note=note)
             label = "已批准" if approve else "已拒绝"
             await self.notifications.enqueue(
-                f"LLM_RESULT_{app_id}", user, "private",
+                f"LLM_RESULT_{app_id}", user,
                 f"你的{LABELS[scope]} AI 申请 {app_id} {label}。{note}", bot_self_id=bot,
             )
         return f"{LABELS[scope]}申请 {app_id} {label}。"
@@ -435,12 +437,12 @@ class ScopeService:
     async def cancel(self, bot, user, scope) -> str:
         async with self.db.transaction():
             row = await self.db.fetchone(
-                """SELECT id FROM applications_v2 WHERE bot_self_id = ? AND user_id = ?
+                """SELECT id FROM applications WHERE bot_self_id = ? AND user_id = ?
                    AND scope = ? AND status = 'PENDING'""", (bot, user, scope)
             )
             if not row:
                 raise ScopeError("此域没有待审申请。")
-            await self.db.execute("UPDATE applications_v2 SET status = 'CANCELLED' WHERE id = ?", (row["id"],))
+            await self.db.execute("UPDATE applications SET status = 'CANCELLED' WHERE id = ?", (row["id"],))
             await self._log(bot, user, "USER", "LLM_APPLICATION_CANCELLED", user=user, scope=scope, app_id=row["id"])
         return "已取消申请。"
 
@@ -463,7 +465,7 @@ class ScopeService:
                    AND scope = ? AND kind = 'REVOKED'""", (bot, user, scope)
             )
             await self.db.execute(
-                """UPDATE applications_v2 SET status = 'CANCELLED', reviewed_at = ?, reviewer_id = ?
+                """UPDATE applications SET status = 'CANCELLED', reviewed_at = ?, reviewer_id = ?
                    WHERE bot_self_id = ? AND user_id = ? AND scope = ? AND status = 'PENDING'""",
                 (int(time.time()), actor, bot, user, scope),
             )
@@ -488,7 +490,7 @@ class ScopeService:
         async with self.db.transaction():
             await self._ensure_current(settings)
             changed = await self.db.execute(
-                """UPDATE grants_v2 SET level_exempt = ?, membership_exempt = ?, status = ?,
+                """UPDATE grants SET level_exempt = ?, membership_exempt = ?, status = ?,
                    updated_at = ?, revision = revision + 1
                    WHERE bot_self_id = ? AND user_id = ? AND scope = ? AND revision = ? AND status != 'REVOKED'""",
                 (level_exempt, membership_exempt, status, int(time.time()), bot, user, scope, grant["revision"]),
@@ -537,7 +539,7 @@ class ScopeService:
                         "INSERT OR IGNORE INTO grant_restrictions VALUES (?, ?, ?, ?)", (bot, user, scope, kind)
                     )
                     await self.db.execute(
-                        """UPDATE applications_v2 SET status = 'CANCELLED', reviewed_at = ?,
+                        """UPDATE applications SET status = 'CANCELLED', reviewed_at = ?,
                            reviewer_id = ?, review_note = ?
                            WHERE bot_self_id = ? AND user_id = ? AND scope = ? AND status = 'PENDING'""",
                         (int(time.time()), actor, "黑名单限制" if kind == "BLACKLIST" else "管理员撤销授权",
@@ -545,7 +547,7 @@ class ScopeService:
                     )
                 if changed.rowcount > 0:
                     await self.db.execute(
-                        """UPDATE grants_v2 SET status = CASE WHEN ? = 'REVOKED' THEN 'REVOKED' ELSE status END,
+                        """UPDATE grants SET status = CASE WHEN ? = 'REVOKED' THEN 'REVOKED' ELSE status END,
                            revision = revision + 1, updated_at = ?
                            WHERE bot_self_id = ? AND user_id = ? AND scope = ?""",
                         (kind, int(time.time()), bot, user, scope),
@@ -571,11 +573,11 @@ class ScopeService:
         scope = " AND user_id = ?" if user else ""
         params = (bot, user) if user else (bot,)
         applications = await self.db.fetchall(
-            "SELECT * FROM applications_v2 WHERE bot_self_id = ?" + scope
+            "SELECT * FROM applications WHERE bot_self_id = ?" + scope
             + " ORDER BY status != 'PENDING', created_at DESC LIMIT 100", params
         )
         grants = await self.db.fetchall(
-            "SELECT * FROM grants_v2 WHERE bot_self_id = ?" + scope + " ORDER BY updated_at DESC LIMIT 100", params
+            "SELECT * FROM grants WHERE bot_self_id = ?" + scope + " ORDER BY updated_at DESC LIMIT 100", params
         )
         levels = await self.db.fetchall(
             "SELECT user_id, level, verified_at FROM primary_group_levels WHERE bot_self_id = ?"

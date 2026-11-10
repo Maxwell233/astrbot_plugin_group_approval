@@ -5,21 +5,10 @@ import asyncio
 import pytest
 
 from approval.scope_commands import ScopeCommands
-from approval.scope_service import ScopeError, ScopeService
+from approval.scope_service import ScopeError
 
 BOT, OTHER_BOT, PRIMARY, OTHER_GROUP, USER = "11111", "22222", "10001", "10002", "20001"
 OWNER, REVIEWER = "99999", "88888"
-
-
-@pytest.fixture
-async def scoped(access_system):
-    _, legacy, db, napcat, config = access_system
-    service = ScopeService(db, legacy.level_service, legacy.audit, legacy.notifications, config, legacy)
-    napcat.set_member(PRIMARY, BOT, "30")
-    napcat.set_member(PRIMARY, OTHER_BOT, "30")
-    napcat.set_member(PRIMARY, USER, "15")
-    await service.configure(BOT, OWNER, primary_group_id=PRIMARY, policies={"GROUP": {"approval_required": False}})
-    return service, napcat
 
 
 async def test_group_is_bot_wide_and_scope_isolated(scoped):
@@ -202,12 +191,11 @@ async def test_audit_and_outbox_failure_rolls_back_approval(scoped, monkeypatch)
     assert not await service.db.fetchone("SELECT id FROM notification_outbox WHERE event_key = ?", (f"LLM_RESULT_{app['id']}",))
 
 
-async def test_legacy_grant_does_not_authorize_any_scope(scoped):
+async def test_fresh_install_has_no_preexisting_authorization(scoped):
     service, _napcat = scoped
-    assert (await service.legacy.grant_manually(OWNER, "OWNER", BOT, PRIMARY, USER))[0]
     assert await service.check_chat(BOT, USER, "GROUP")
     assert await service.check_chat(BOT, USER, "PRIVATE")
-    assert await service.db.fetchone("SELECT 1 FROM grants WHERE bot_self_id = ? AND user_id = ?", (BOT, USER))
+    assert not await service.db.fetchone("SELECT 1 FROM grants")
 
 
 async def test_cross_grant_does_not_bypass_target_level_or_membership(scoped):
@@ -246,7 +234,7 @@ async def test_blacklist_preserves_grant_and_unban_requires_current_level(scoped
     if prior:
         await service.apply(BOT, USER, "GROUP", "")
         if prior == "SUSPENDED":
-            await service.db.execute("UPDATE grants_v2 SET status = 'SUSPENDED' WHERE bot_self_id = ?", (BOT,))
+            await service.db.execute("UPDATE grants SET status = 'SUSPENDED' WHERE bot_self_id = ?", (BOT,))
         if prior == "REVOKED":
             await service.restrict(BOT, USER, ["GROUP"], REVIEWER, "REVIEWER")
     await service.restrict(BOT, USER, ["GROUP"], OWNER, "OWNER", kind="BLACKLIST")

@@ -51,7 +51,7 @@ from typing import Any, AsyncIterator
 
 import aiosqlite
 
-from .migrations import run_migrations
+from .schema import initialize_schema
 
 logger = logging.getLogger("astrbot_plugin_group_approval.database")
 
@@ -74,7 +74,6 @@ class Database:
         self._transaction_state: contextvars.ContextVar[
             tuple[asyncio.Task[Any] | None, aiosqlite.Connection] | None
         ] = contextvars.ContextVar("group_approval_transaction", default=None)
-        self._closed = False
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -91,14 +90,14 @@ class Database:
         return conn
 
     async def init(self) -> None:
-        """Initialize the shared connection, pragmas, and schema migrations once."""
+        """Initialize the shared connection, pragmas, and initial schema."""
         async with self._init_lock:
             if self._shared_conn is not None:
                 return
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
             conn = await self._open(pooled=True)
             try:
-                await run_migrations(conn)
+                await initialize_schema(conn)
             except BaseException:
                 await conn.close()
                 raise
@@ -150,7 +149,7 @@ class Database:
         # held for the duration of the transaction: writes are short and never await
         # external I/O inside the block.
         async with self._tx_lock:
-            await self.get_connection()  # guarantees migrations ran first
+            await self.get_connection()  # guarantees schema initialization
             conn = await self._open(pooled=False)
             token = self._transaction_state.set((asyncio.current_task(), conn))
             try:
@@ -236,4 +235,3 @@ class Database:
             if self._shared_conn is not None:
                 await self._shared_conn.close()
                 self._shared_conn = None
-            self._closed = True

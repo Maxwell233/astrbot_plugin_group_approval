@@ -150,72 +150,52 @@ async def temp_db() -> AsyncGenerator[Database, None]:
 
 @pytest.fixture
 def test_config() -> PluginConfig:
-    return PluginConfig.from_dict({
-        "enabled": True,
-        "default_policy": "deny",
-        "owner_qq_ids": ["99999"],
-        "reviewer_qq_ids": ["88888"],
-        "groups": {
-            "10001": {
-                "enabled": True,
-                "min_level": 10,
-                "approval_required": True,
-                "grant_duration_days": 0,
-                "recheck_interval_seconds": 300,
-                "restore_policy": "automatic",
-                "owner_bypass": True,
-                "group_admin_bypass": False,
-            }
-        },
-        "application": {
-            "expire_hours": 72,
-            "reject_cooldown_hours": 24,
-            "duplicate_pending_allowed": False,
-        },
-        "private_chat": {
-            "enabled_for_normal_users": False,
-            "admin_commands_enabled": True,
-        },
-        "notifications": {
-            "reviewer_private_message": True,
-            "fallback_group_id": "90001",
-            "retry_enabled": True,
-        },
-        "security": {
-            "fail_closed": True,
-            "gate_priority": 50,
-            "keep_audit_days": 90,
-        },
-    })
+    return PluginConfig.from_dict({"owner_qq_ids": ["99999"], "reviewer_qq_ids": ["88888"]})
+
+
+@pytest_asyncio.fixture
+async def scoped(temp_db, mock_napcat, test_config):
+    from approval import AuditService, LevelService, NotificationService, ReviewerService
+    from approval.scope_service import ScopeService
+
+    service = ScopeService(
+        temp_db, LevelService(mock_napcat), AuditService(temp_db),
+        NotificationService(temp_db, mock_napcat), test_config,
+        ReviewerService(temp_db, test_config),
+    )
+    for bot in ("11111", "22222"):
+        mock_napcat.set_member("10001", bot, "30")
+    mock_napcat.set_member("10001", "20001", "15")
+    await service.configure(
+        "11111", "99999", primary_group_id="10001", policies={"GROUP": {"approval_required": False}},
+    )
+    return service, mock_napcat
 
 
 @pytest.fixture
-def access_system(temp_db: Database, mock_napcat: MockNapCatClient, test_config: PluginConfig):
-    from approval.access_service import AccessService
-    from approval.approval_service import ApprovalService
-    from approval.audit_service import AuditService
-    from approval.level_service import LevelService
-    from approval.notification_service import NotificationService
+async def dashboard_plugin(tmp_path, monkeypatch):
+    from types import SimpleNamespace
 
-    audit = AuditService(temp_db)
-    notif = NotificationService(temp_db, mock_napcat)
-    lvl = LevelService(mock_napcat)
-    approval = ApprovalService(temp_db, lvl, audit, notif, test_config)
-    access = AccessService(temp_db, approval, lvl, audit, test_config)
-    return access, approval, temp_db, mock_napcat, test_config
+    import main
+    from approval.auth_service import AuthorizationService
 
+    monkeypatch.setattr(main, "StarTools", SimpleNamespace(get_data_dir=lambda: tmp_path))
+    monkeypatch.setattr(main, "ASTRBOT_AVAILABLE", True)
+    instance = main.GroupApprovalPlugin(
+        config={"enabled": False, "notifications": {"retry_enabled": False}}
+    )
+    instance.auth = AuthorizationService(lambda: "dashboard-admin")
 
-@pytest.fixture
-def web_system(temp_db: Database, mock_napcat: MockNapCatClient, test_config: PluginConfig):
-    from approval.approval_service import ApprovalService
-    from approval.audit_service import AuditService
-    from approval.level_service import LevelService
-    from approval.notification_service import NotificationService
-    from approval.web_api import WebApiHandler
+    async def verify(bot):
+        return bot in {"11111", "22222"}
 
-    audit = AuditService(temp_db)
-    notif = NotificationService(temp_db, mock_napcat)
-    lvl = LevelService(mock_napcat)
-    approval = ApprovalService(temp_db, lvl, audit, notif, test_config)
-    web = WebApiHandler(temp_db, approval, audit, test_config, client=mock_napcat)
-    return web, approval, temp_db, mock_napcat, test_config
+    async def list_bots():
+        return ["11111", "22222"]
+
+    monkeypatch.setattr(instance.napcat, "verify_bot", verify)
+    monkeypatch.setattr(instance.napcat, "list_bots", list_bots)
+    await instance.initialize()
+    try:
+        yield instance
+    finally:
+        await instance.terminate()

@@ -9,7 +9,6 @@ from typing import Any
 
 try:
     from .approval import (
-        ApprovalService,
         AuditService,
         AuthorizationService,
         Database,
@@ -17,6 +16,7 @@ try:
         NapCatClient,
         NotificationService,
         PluginConfig,
+        ReviewerService,
     )
     from .approval.auth_service import build_dashboard_username_getter
     from .approval.native_llm import NativeLLMGuard
@@ -24,7 +24,6 @@ try:
     from .approval.scope_service import ScopeError, ScopeService, valid_qq
 except ImportError:
     from approval import (
-        ApprovalService,
         AuditService,
         AuthorizationService,
         Database,
@@ -32,6 +31,7 @@ except ImportError:
         NapCatClient,
         NotificationService,
         PluginConfig,
+        ReviewerService,
     )
     from approval.auth_service import build_dashboard_username_getter
     from approval.native_llm import NativeLLMGuard
@@ -232,24 +232,15 @@ class GroupApprovalPlugin(Star):
             client=self.napcat,
             max_retries=self.plugin_config.notifications.max_retries,
             retry_interval_seconds=self.plugin_config.notifications.retry_interval_seconds,
-            user_group_fallback_enabled=self.plugin_config.notifications.user_group_fallback_enabled,
-            user_group_fallback_text=self.plugin_config.notifications.user_group_fallback_text,
         )
-        self.approval_service = ApprovalService(
-            db=self.db,
-            level_service=self.level_service,
-            audit_service=self.audit_service,
-            notification_service=self.notification_service,
-            config=self.plugin_config,
-        )
+        self.reviewers = ReviewerService(self.db, self.plugin_config)
         self.scopes = ScopeService(
             self.db, self.level_service, self.audit_service, self.notification_service,
-            self.plugin_config, self.approval_service,
+            self.plugin_config, self.reviewers,
         )
         self.commands = ScopeCommands(self.scopes)
         self.native_guard = NativeLLMGuard(self._check_native_chat)
         self.auth = AuthorizationService(
-            config=self.plugin_config,
             dashboard_username_getter=build_dashboard_username_getter(context),
         )
         self._initialized = False
@@ -262,7 +253,6 @@ class GroupApprovalPlugin(Star):
             keep_days = self.plugin_config.security.keep_audit_days
             if keep_days > 0:
                 await self.audit_service.cleanup_old_logs(keep_days)
-            await self.approval_service.sync_reviewers_from_db()
             if ASTRBOT_AVAILABLE and self.plugin_config.enabled:
                 self.native_guard.install()
             self._register_web_routes()

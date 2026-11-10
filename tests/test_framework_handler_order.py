@@ -273,47 +273,8 @@ async def test_non_onebot_event_skips_registered_commands(tmp_path):
         await plugin.terminate()
 
 
-def test_diagnostics_does_not_mistake_a_high_priority_sibling_for_main(monkeypatch):
-    from copy import copy
-    from types import SimpleNamespace
-
-    from astrbot.core.star.star import star_map
-
-    from approval.diagnostics import HandlerDiagnostics
-
-    module = "data.plugins.astrbot_plugin_group_guardian.main"
-    gate = copy(next(h for h in star_handlers_registry if h.handler_name == "proxy_gate_50"))
-    from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterTypeFilter
-    gate.handler_name = "on_message_gate"
-    gate.handler_full_name = f"{gate.handler_module_path}_on_message_gate"
-    gate.event_filters = [*gate.event_filters, PlatformAdapterTypeFilter("aiocqhttp")]
-    star_handlers_registry.append(gate)
-    monkeypatch.setitem(star_map, gate.handler_module_path, SimpleNamespace(
-        activated=True, name="astrbot_plugin_group_approval",
-    ))
-    metadata = SimpleNamespace(activated=True, name="astrbot_plugin_group_guardian")
-    monkeypatch.setitem(star_map, module, metadata)
-    sibling = copy(next(h for h in star_handlers_registry if h.handler_name == "patched_moderation_100"))
-    sibling.handler_module_path = module
-    sibling.handler_full_name = f"{module}_other_handler"
-    main_handler = copy(next(h for h in star_handlers_registry if h.handler_name == "stock_moderation_default"))
-    main_handler.handler_module_path = module
-    main_handler.handler_name = "_handle_message"
-    main_handler.handler_full_name = f"{module}__handle_message"
-    main_handler.event_filters = [*main_handler.event_filters, PlatformAdapterTypeFilter("aiocqhttp")]
-    star_handlers_registry.append(sibling)
-    star_handlers_registry.append(main_handler)
-    assert HandlerDiagnostics().diagnose_handlers()["moderation_precedence"] == "CONFLICT"
-    star_handlers_registry._handlers.remove(main_handler)
-    main_handler.extras_configs = {"priority": 100}
-    star_handlers_registry.append(main_handler)
-    assert HandlerDiagnostics().diagnose_handlers()["moderation_precedence"] == "VERIFIED"
-    metadata.activated = False
-    assert HandlerDiagnostics().diagnose_handlers()["moderation_precedence"] == "DISABLED"
-    star_handlers_registry._handlers.remove(main_handler)
-    metadata.activated = True
-    assert HandlerDiagnostics().diagnose_handlers()["moderation_precedence"] == "UNVERIFIED"
-
+def test_plugin_has_no_legacy_priority_diagnostics_route():
+    assert not hasattr(GroupApprovalPlugin, "_web_diagnostics")
 
 
 async def test_native_admission_leaves_passive_capture_alone(tmp_path, monkeypatch):

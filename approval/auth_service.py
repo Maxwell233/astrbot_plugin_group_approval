@@ -24,38 +24,15 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from .config import PluginConfig
-
 logger = logging.getLogger("astrbot_plugin_group_approval.auth")
-
-# Read-only actions: any authenticated dashboard identity may perform them.
-READ_ACTIONS: frozenset[str] = frozenset(
-    {
-        "view_dashboard",
-        "list_bots",
-        "list_applications",
-        "list_users",
-        "list_groups",
-        "list_audit_logs",
-        "diagnostics",
-    }
-)
-
-# Every mutating/export action requires the verified dashboard administrator.
-OWNER_ACTIONS: frozenset[str] = frozenset(
-    {"approve", "reject", "revoke", "grant", "ban", "unban", "update_group", "export_logs"}
-)
-
 
 class AuthorizationService:
     """Authenticates dashboard requests and authorizes actions server-side."""
 
     def __init__(
         self,
-        config: PluginConfig,
         dashboard_username_getter: Callable[[], str | None] | None = None,
     ):
-        self.config = config
         self._dashboard_username_getter = dashboard_username_getter
 
     # ------------------------------------------------------------------
@@ -108,39 +85,6 @@ class AuthorizationService:
         if u == dashboard_user:
             return "OWNER"
         return "DASHBOARD_USER"
-
-    # ------------------------------------------------------------------
-    # Authorization
-    # ------------------------------------------------------------------
-    async def authorize_action(
-        self,
-        username: str,
-        action: str,
-        bot_self_id: str = "",
-        group_id: str | None = None,
-        is_level_exempt: bool = False,
-    ) -> tuple[bool, str, str]:
-        """Authorize a dashboard action. Returns ``(allowed, role, reason)``."""
-        u = str(username or "").strip()
-        if not u:
-            return False, "UNAUTHENTICATED", "未登录或登录凭证已失效"
-
-        action = str(action or "").strip()
-        role = await self.get_user_role(u)
-
-        if role == "OWNER":
-            return True, role, ""
-
-        if action in READ_ACTIONS:
-            return True, role, ""
-
-        if role == "DASHBOARD_USER":
-            return (
-                False,
-                role,
-                "仅 AstrBot Dashboard 管理员可执行该操作（QQ Owner/Reviewer 身份不影响 Dashboard 权限）",
-            )
-        return False, role, "身份未通过验证，已拒绝管理操作"
 
 
 def build_dashboard_username_getter(context: Any) -> Callable[[], str | None]:

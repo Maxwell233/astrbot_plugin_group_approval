@@ -1,4 +1,4 @@
-"""Additive 0.1.2 schema. Old group-scoped rows do not confer LLM access."""
+"""Complete 0.1.2 schema for new installations."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS scope_policies (
     approval_required INTEGER NOT NULL CHECK (approval_required IN (0, 1)),
     PRIMARY KEY (bot_self_id, scope)
 );
-CREATE TABLE IF NOT EXISTS applications_v2 (
+CREATE TABLE IF NOT EXISTS applications (
     id TEXT PRIMARY KEY,
     bot_self_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
@@ -39,16 +39,16 @@ CREATE TABLE IF NOT EXISTS applications_v2 (
     reviewer_id TEXT,
     review_note TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_scope_pending ON applications_v2 (bot_self_id, user_id, scope)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_scope_pending ON applications (bot_self_id, user_id, scope)
     WHERE status = 'PENDING';
-CREATE INDEX IF NOT EXISTS idx_scope_applications ON applications_v2 (bot_self_id, created_at DESC);
-CREATE TABLE IF NOT EXISTS grants_v2 (
+CREATE INDEX IF NOT EXISTS idx_scope_applications ON applications (bot_self_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS grants (
     bot_self_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
     scope TEXT NOT NULL CHECK (scope IN ('GROUP', 'PRIVATE')),
     status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'SUSPENDED', 'REVOKED')),
     source TEXT NOT NULL CHECK (source IN ('MANUAL_APPROVAL', 'AUTO_NO_APPROVAL', 'CROSS_GRANT', 'OWNER_MANUAL')),
-    source_application_id TEXT REFERENCES applications_v2(id),
+    source_application_id TEXT REFERENCES applications(id),
     level_exempt INTEGER NOT NULL DEFAULT 0 CHECK (level_exempt IN (0, 1)),
     membership_exempt INTEGER NOT NULL DEFAULT 0 CHECK (membership_exempt IN (0, 1)),
     actor_id TEXT NOT NULL,
@@ -73,12 +73,53 @@ CREATE TABLE IF NOT EXISTS grant_restrictions (
     kind TEXT NOT NULL CHECK (kind IN ('REVOKED', 'BLACKLIST')),
     PRIMARY KEY (bot_self_id, user_id, scope, kind)
 );
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (7, strftime('%s', 'now'));
+CREATE TABLE IF NOT EXISTS reviewer_overrides (
+    qq_id TEXT PRIMARY KEY,
+    action TEXT NOT NULL CHECK (action IN ('ADDED', 'REMOVED')),
+    changed_by TEXT NOT NULL,
+    changed_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rate_limits (
+    key TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    window_start INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    actor_id TEXT NOT NULL,
+    actor_type TEXT NOT NULL,
+    bot_self_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    target_user_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    old_state TEXT,
+    new_state TEXT,
+    request_id TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log (timestamp);
+CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log (target_user_id, group_id);
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    recipient_id TEXT NOT NULL,
+    bot_self_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    claimed_at INTEGER NOT NULL DEFAULT 0,
+    sent_at INTEGER,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_pending ON notification_outbox (status, next_retry_at);
 COMMIT;
 """
 
 
-async def apply_v7(db: aiosqlite.Connection) -> None:
+async def initialize_schema(db: aiosqlite.Connection) -> None:
     try:
         await db.executescript(SCHEMA)
     except BaseException:
