@@ -241,3 +241,131 @@ async def test_real_aiocqhttp_routes_multiple_accounts_in_one_adapter():
     del transport._wsr_api_clients["10001"]
     assert not await client.verify_bot("10001")
     assert await client.verify_bot("20002")
+
+
+async def test_denial_notice_cooldown_survives_restart_and_spans_sessions(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from astrbot.core.pipeline.process_stage.stage import AgentRequestSubStage
+    from astrbot.core.platform.message_type import MessageType
+
+    from approval import native_llm, rate_limit
+
+    now = 100_000
+    monkeypatch.setattr(rate_limit, "time", SimpleNamespace(time=lambda: now))
+    model_requests = []
+
+    async def downstream(self, event):
+        model_requests.append(event)
+        yield
+
+    monkeypatch.setattr(AgentRequestSubStage, "process", downstream)
+    monkeypatch.setattr(AgentRequestSubStage, native_llm.STATE_ATTRIBUTE, None, raising=False)
+    stage = AgentRequestSubStage()
+
+    async def try_chat(*, bot="11111", user="30001", private=False, group="10001"):
+        event = _make_event()
+        event.message_obj.self_id = bot
+        event.message_obj.sender = MessageMember(user_id=user, nickname="tester")
+        if private:
+            event.message_obj.type = MessageType.FRIEND_MESSAGE
+            event.session.message_type = MessageType.FRIEND_MESSAGE
+        else:
+            event.message_obj.group.group_id = group
+        monkeypatch.setattr(event, "send", AsyncMock())
+        async for _ in stage.process(event):
+            pass
+        assert not event.is_stopped()
+        return event.send.await_count
+
+    plugin = await _make_plugin(tmp_path, monkeypatch)
+    try:
+        monkeypatch.setattr(plugin.napcat, "has_verified_bot", _verified)
+        assert sum(await asyncio.gather(
+            try_chat(), try_chat(private=True), try_chat(group="10002")
+        )) == 1
+        assert await try_chat(bot="22222") == 1
+        assert await try_chat(user="30002") == 1
+        assert not model_requests
+    finally:
+        await plugin.terminate()
+
+    plugin = await _make_plugin(tmp_path, monkeypatch)
+    try:
+        monkeypatch.setattr(plugin.napcat, "has_verified_bot", _verified)
+        now += 24 * 60 * 60 - 1
+        assert await try_chat() == 0
+        now += 1
+        assert await try_chat() == 1
+        assert await try_chat(private=True) == 0
+        assert not model_requests
+
+        await plugin.scopes.manual_grant(
+            "11111", "30001", "GROUP", "99999", level_exempt=True, membership_exempt=True
+        )
+        assert await try_chat() == 0
+        assert len(model_requests) == 1
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.parametrize("wake_prefix", ["/", "!"])
+async def test_private_apply_returns_status_through_real_dispatch(tmp_path, monkeypatch, wake_prefix):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from astrbot.core.pipeline.process_stage.method.star_request import StarRequestSubStage
+    from astrbot.core.pipeline.process_stage.stage import ProcessStage
+    from astrbot.core.pipeline.waking_check.stage import WakingCheckStage
+    from astrbot.core.platform.message_type import MessageType
+    from astrbot.core.star import session_plugin_manager
+    from astrbot.core.star.star import star_map
+
+    plugin = await _make_plugin(tmp_path, monkeypatch)
+    try:
+        plugin.plugin_config.owner_qq_ids.append("30001")
+        monkeypatch.setattr(plugin.napcat, "has_verified_bot", _verified)
+        monkeypatch.setattr(session_plugin_manager.sp, "get_async", AsyncMock(return_value={}))
+        handler = next(h for h in _adapter_handlers_in_dispatch_order() if h.handler_name == "cmd_apply_private")
+        star_handlers_registry.remove(handler)
+        star_handlers_registry.append(replace(handler, handler=plugin.cmd_apply_private))
+        monkeypatch.setitem(star_map, handler.handler_module_path, SimpleNamespace(
+            name="astrbot_plugin_group_approval", activated=True, display_name="", reserved=False,
+        ))
+
+        ctx = SimpleNamespace(
+            astrbot_config={"wake_prefix": [wake_prefix], "platform_settings": {}, "admins_id": [],
+                            "provider_settings": {"enable": True}},
+            db_helper=None, astrbot_config_id="test",
+        )
+        waking = WakingCheckStage()
+        await waking.initialize(ctx)
+        event = _make_event("/申请私聊")
+        event.message_obj.type = MessageType.FRIEND_MESSAGE
+        event.session.message_type = MessageType.FRIEND_MESSAGE
+
+        assert "Owner 原生聊天豁免" in await plugin._check_native_chat(event)
+
+        await waking.process(event)
+        assert [h.handler_name for h in event.get_extra("activated_handlers")] == ["cmd_apply_private"]
+
+        class NoModel:
+            async def process(self, event):
+                pytest.fail("The application command entered the native model stage")
+                yield
+
+        stage = ProcessStage()
+        stage.ctx = ctx
+        stage.star_request_sub_stage = StarRequestSubStage()
+        stage.agent_sub_stage = NoModel()
+        replies = []
+        async for _ in stage.process(event):
+            replies.extend(part.text for part in event.get_result().chain)
+        assert replies == ["此 Bot 尚未配置主群。"]
+        assert not event.is_stopped()
+        await plugin.scopes.configure("11111", "30001", owner_bypass=True)
+        assert await plugin._check_native_chat(event) is None
+    finally:
+        await plugin.terminate()

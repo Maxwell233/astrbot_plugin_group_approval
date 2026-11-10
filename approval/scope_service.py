@@ -234,6 +234,8 @@ class ScopeService:
                     return None
         grant = await self.grant(bot, user, scope)
         if not grant or grant["status"] != "ACTIVE":
+            if scope == "PRIVATE" and self.config.is_owner(user) and not settings.owner_bypass:
+                return "你已是 Owner。可在 Group Approval Dashboard 为当前 Bot 开启「Owner 原生聊天豁免」，或发送 /申请私聊。"
             return f"尚无可用的{LABELS[scope]} AI 权限，请发送 /申请{LABELS[scope]}。"
         policy = await self.policy(bot, scope)
         try:

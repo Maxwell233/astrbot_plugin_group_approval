@@ -22,7 +22,7 @@ try:
         __version__,
     )
     from .approval.auth_service import build_dashboard_username_getter
-    from .approval.native_llm import NativeLLMGuard
+    from .approval.native_llm import SUPPRESS_DENIAL_NOTICE, NativeLLMGuard
     from .approval.scope_commands import ScopeCommands
     from .approval.scope_service import ScopeError, ScopeService, valid_qq
 except ImportError:
@@ -38,11 +38,12 @@ except ImportError:
         __version__,
     )
     from approval.auth_service import build_dashboard_username_getter
-    from approval.native_llm import NativeLLMGuard
+    from approval.native_llm import SUPPRESS_DENIAL_NOTICE, NativeLLMGuard
     from approval.scope_commands import ScopeCommands
     from approval.scope_service import ScopeError, ScopeService, valid_qq
 
 PLUGIN_NAME = "astrbot_plugin_group_approval"
+DENIAL_NOTICE_COOLDOWN_SECONDS = 24 * 60 * 60
 
 # Graceful AstrBot import with standalone fallback
 try:
@@ -175,11 +176,21 @@ class GroupApprovalPlugin(Star):
             bot, user = await self._event_identity(event)
         except ScopeError as exc:
             return str(exc)
-        if event.is_private_chat():
-            return await self.scopes.check_chat(bot, user, "PRIVATE")
-        if not event.get_group_id():
+        private = event.is_private_chat()
+        if not private and not event.get_group_id():
             return "无法确认当前 QQ 群会话。"
-        return await self.scopes.check_chat(bot, user, "GROUP")
+        notice = await self.scopes.check_chat(bot, user, "PRIVATE" if private else "GROUP")
+        if notice:
+            try:
+                can_notify = await self.scopes.limiter.allow(
+                    f"llm-denial-notice:{bot}:{user}", 1, DENIAL_NOTICE_COOLDOWN_SECONDS,
+                )
+            except Exception:
+                logger.exception("Could not reserve native chat denial notice")
+                can_notify = False
+            # Keep the denial result even when no message should be sent.
+            event.set_extra(SUPPRESS_DENIAL_NOTICE, not can_notify)
+        return notice
 
     def _register_web_routes(self) -> None:
         if self.context is None:
@@ -281,21 +292,21 @@ class GroupApprovalPlugin(Star):
             return str(exc)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    @filter.command("申请群聊")
+    @filter.command("申请群聊", alias={"/申请群聊"})
     async def cmd_apply_group(self, event: AstrMessageEvent):
         reply = await self._command(event, "申请群聊")
         if reply is not None:
             yield event.plain_result(reply)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    @filter.command("申请私聊")
+    @filter.command("申请私聊", alias={"/申请私聊"})
     async def cmd_apply_private(self, event: AstrMessageEvent):
         reply = await self._command(event, "申请私聊")
         if reply is not None:
             yield event.plain_result(reply)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    @filter.command("申请使用")
+    @filter.command("申请使用", alias={"/申请使用"})
     async def cmd_apply(self, event: AstrMessageEvent):
         reply = await self._command(event, "申请使用")
         if reply is not None:

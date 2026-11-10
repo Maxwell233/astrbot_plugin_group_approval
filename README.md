@@ -11,6 +11,8 @@
 
 审批只管 **AstrBot 原生 AI 聊天**。签到、塔罗、今日小猪、GroupGuardian 审核和其他独立插件仍按各自规则工作。独立插件自发调用 LLM，以及 LivingMemory 后台总结，也由各插件自己的配置管理。
 
+未获原生 AI 聊天权限时，每个 Bot 对同一 QQ 用户每 24 小时最多提示一次，群聊和私聊共用提示间隔。期间再次尝试会静默拒绝，仍可使用申请指令。
+
 ## 两种授权
 
 | 域 | 可以做什么 | 默认门槛 | 默认人工审批 |
@@ -27,7 +29,8 @@
 1. 将插件安装到 AstrBot 4.29.4 的插件目录，配置 Owner QQ，确认 NapCat 账号已连接。
 2. 打开 Group Approval Dashboard，确认显示「原生聊天准入已启用」。选择 QQ Bot，保存主群和两个授权域的策略。Bot 须已加入主群并能查询群成员等级。
 3. 用测试群账号分别试用未授权的原生聊天和独立插件，再申请并测试 GROUP、PRIVATE。更换主群会取消旧主群的待审申请。已有授权保留，下一次原生聊天重新核验。
-4. GroupGuardian 可按原配置审核全群。原生聊天准入无需修改 GroupGuardian 或 LivingMemory 的代码。 [兼容性与验证范围](COMPATIBILITY.md)
+4. 更新已运行的插件后，请重启 AstrBot 进程以加载新的提示逻辑。
+5. GroupGuardian 可按原配置审核全群。原生聊天准入无需修改 GroupGuardian 或 LivingMemory 的代码。 [兼容性与验证范围](COMPATIBILITY.md)
 
 ## 指令
 
@@ -48,6 +51,7 @@
 Owner 与 Reviewer 的管理资格不自动授予 AI 聊天。两类豁免由 Owner 分别授予或解除。只有双重豁免可以完全跳过主群资格核验。Dashboard 也可查看申请、授权来源、最近等级核验和审计记录。
 
 - [配置说明](docs/CONFIGURATION.md)
+- [Owner 私聊与申请指令排查](docs/TROUBLESHOOTING.md)
 - [首次安装与数据存储](docs/MIGRATION.md)
 - [安全边界](docs/SECURITY.md)
 - [组件测试与验收](INTEGRATION_TEST_REPORT.md)

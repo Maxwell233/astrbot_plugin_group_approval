@@ -15,6 +15,7 @@ from astrbot.api import logger
 
 SUPPORTED_FRAMEWORK = "4.29.4"
 STATE_ATTRIBUTE = "_astrbot_group_approval_native_runtime"
+SUPPRESS_DENIAL_NOTICE = "group_approval.suppress_denial_notice"
 
 Check = Callable[[Any], Awaitable[str | None]]
 
@@ -56,7 +57,8 @@ class _Runtime:
                     if registration.callback is None:
                         return  # uninstall began while the check was suspended
                     if notice:
-                        await event.send(chain_type().message(notice))
+                        if not event.get_extra(SUPPRESS_DENIAL_NOTICE):
+                            await event.send(chain_type().message(notice))
                         return
             async with aclosing(self.original(instance, event)) as generator:
                 async for part in generator:

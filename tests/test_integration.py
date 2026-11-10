@@ -28,7 +28,7 @@ def event(*, bot=BOT, private=False, user=USER, text="hello", message_type=None)
         ),
         get_self_id=lambda: bot, get_sender_id=lambda: user, get_platform_id=lambda: "adapter-1",
         get_platform_name=lambda: "aiocqhttp", get_group_id=lambda: "" if private else PRIMARY,
-        is_private_chat=lambda: private, should_call_llm=lambda flag: None,
+        is_private_chat=lambda: private, should_call_llm=lambda flag: None, set_extra=lambda key, value: None,
     )
 
 
