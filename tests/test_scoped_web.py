@@ -9,7 +9,7 @@ class Request:
     def __init__(self, username, payload):
         self.username = username
         self.payload = payload
-        self.query = {"bot_self_id": payload.get("bot_self_id", "")}
+        self.query = {"bot_self_id": payload.get("bot_self_id", "")} if isinstance(payload, dict) else {}
 
     async def json(self, default=None):
         return self.payload
@@ -33,6 +33,12 @@ async def test_dashboard_checks_owner_and_current_bot_before_mutating(dashboard_
     assert (await dashboard_plugin._web_state())["data"]["grants"][0]["bot_self_id"] == "11111"
     monkeypatch.setattr(main, "request", Request("dashboard-admin", {**payload, "bot_self_id": "22222"}))
     assert not (await dashboard_plugin._web_state())["data"]["grants"]
+
+
+async def test_dashboard_rejects_a_non_object_request_body(dashboard_plugin, monkeypatch):
+    monkeypatch.setattr(main, "request", Request("dashboard-admin", []))
+    assert (await dashboard_plugin._web_action())["retcode"] == 400
+    assert not await dashboard_plugin.db.fetchone("SELECT 1 FROM audit_log")
 
 
 @pytest.mark.parametrize("action", ["approve", "reject"])

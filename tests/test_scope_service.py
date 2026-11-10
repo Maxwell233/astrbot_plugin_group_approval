@@ -11,6 +11,17 @@ BOT, OTHER_BOT, PRIMARY, OTHER_GROUP, USER = "11111", "22222", "10001", "10002",
 OWNER, REVIEWER = "99999", "88888"
 
 
+@pytest.mark.parametrize(("scope", "minimum"), [("GROUP", 20), ("PRIVATE", 50)])
+async def test_default_level_policy_accepts_the_threshold(scoped, scope, minimum):
+    service, napcat = scoped
+    await service.configure(OTHER_BOT, OWNER, primary_group_id=PRIMARY)
+    napcat.set_member(PRIMARY, USER, str(minimum - 1))
+    with pytest.raises(ScopeError, match=f"需要 LV{minimum}"):
+        await service.apply(OTHER_BOT, USER, scope, "")
+    napcat.set_member(PRIMARY, USER, str(minimum))
+    assert "已提交" in await service.apply(OTHER_BOT, USER, scope, "")
+
+
 async def test_group_is_bot_wide_and_scope_isolated(scoped):
     service, napcat = scoped
     napcat.set_member(OTHER_GROUP, USER, "0")
@@ -294,7 +305,7 @@ async def test_ineligible_and_failed_queries_consume_pre_network_rate_limit(scop
     async def record(**kwargs):
         calls.append(kwargs)
         if network_error:
-            return {"status": "failed", "retcode": 100}
+            return False, None, "Network failure", 100
         return await original(**kwargs)
 
     monkeypatch.setattr(napcat, "get_group_member_info", record)
@@ -320,7 +331,47 @@ async def test_pending_and_active_repeat_without_network(scoped, monkeypatch):
 
     monkeypatch.setattr(napcat, "get_group_member_info", unexpected)
     assert "已有" in await service.apply(BOT, USER, "GROUP", "")
-    assert pending.split("编号 ")[1].rstrip("。") in await service.apply(BOT, USER, "PRIVATE", "")
+    repeated = await service.apply(BOT, USER, "PRIVATE", "")
+    assert "已有待审批" in repeated
+    assert pending.split("编号 ")[1].rstrip("。") in repeated
+    assert len((await service.overview(BOT))["applications"]) == 1
+
+
+async def test_double_exempt_user_can_reapply_without_querying_napcat(scoped, monkeypatch):
+    service, napcat = scoped
+    await service.configure(BOT, OWNER, cache_ttl=0)
+    await service.apply(BOT, USER, "GROUP", "")
+    napcat.set_member(PRIMARY, USER, "0")
+    assert await service.check_chat(BOT, USER, "GROUP")
+    assert (await service.grant(BOT, USER, "GROUP"))["status"] == "SUSPENDED"
+    await service.set_exemptions(BOT, USER, "GROUP", OWNER, level_exempt=True, membership_exempt=True)
+
+    async def unexpected(**kwargs):
+        pytest.fail("double exemption should skip the NapCat lookup")
+
+    monkeypatch.setattr(napcat, "get_group_member_info", unexpected)
+    assert "已恢复" in await service.apply(BOT, USER, "GROUP", "")
+    assert await service.check_chat(BOT, USER, "GROUP") is None
+
+
+async def test_boolean_level_cannot_satisfy_level_one_policy(scoped):
+    service, napcat = scoped
+    await service.configure(BOT, OWNER, policies={"GROUP": {"min_level": 1}})
+    napcat.set_member(PRIMARY, USER, True)
+    with pytest.raises(ScopeError, match="无法核验"):
+        await service.apply(BOT, USER, "GROUP", "")
+    assert await service.grant(BOT, USER, "GROUP") is None
+
+
+async def test_chat_uses_sqlite_level_until_snapshot_expires(scoped):
+    service, napcat = scoped
+    await service.apply(BOT, USER, "GROUP", "")
+    napcat.set_member(PRIMARY, USER, "0")
+    assert await service.check_chat(BOT, USER, "GROUP") is None
+
+    await service.db.execute("UPDATE primary_group_levels SET verified_at = 0")
+    assert "需要 LV10" in await service.check_chat(BOT, USER, "GROUP")
+    assert (await service.grant(BOT, USER, "GROUP"))["status"] == "SUSPENDED"
 
 
 async def test_concurrent_failed_applications_cannot_exceed_query_limit(scoped, monkeypatch):
@@ -330,7 +381,7 @@ async def test_concurrent_failed_applications_cannot_exceed_query_limit(scoped, 
     async def fail(**kwargs):
         nonlocal calls
         calls += 1
-        return {"status": "failed", "retcode": 100}
+        return False, None, "Network failure", 100
 
     monkeypatch.setattr(napcat, "get_group_member_info", fail)
     outcomes = await asyncio.gather(

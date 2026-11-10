@@ -78,7 +78,7 @@ class ScopeService:
             "SELECT min_level, approval_required FROM scope_policies WHERE bot_self_id = ? AND scope = ?",
             (bot, scope),
         )
-        return Policy(**dict(row)) if row else Policy(10 if scope == "GROUP" else 20)
+        return Policy(**dict(row)) if row else Policy(20 if scope == "GROUP" else 50)
 
     async def grant(self, bot: str, user: str, scope: Scope):
         return await self.db.fetchone(
@@ -119,7 +119,7 @@ class ScopeService:
         if primary_changed:
             if not valid_qq(primary_group_id):
                 raise ScopeError("主群号格式无效。")
-            probe = await self.level.get_group_member_level(bot, primary_group_id, bot, force_refresh=True)
+            probe = await self.level.get_group_member_level(bot, primary_group_id, bot)
             if not probe.success or not probe.is_member:
                 raise ScopeError("无法确认 Bot 已加入新主群且可查询成员等级。")
             changes["primary_group_id"] = primary_group_id
@@ -183,7 +183,7 @@ class ScopeService:
                 and row["verified_at"] > int(time.time()) - settings.cache_ttl):
             return row["level"]
         result = await self.level.get_group_member_level(
-            bot, group, user, force_refresh=True, lookup_generation=(settings.primary_revision, epoch),
+            bot, group, user, lookup_generation=(settings.primary_revision, epoch),
         )
         if not result.success or not result.is_member:
             await self.db.execute(
@@ -315,12 +315,14 @@ class ScopeService:
         if existing and not grant and policy.approval_required and not await self._cross_source(settings, user, scope):
             return f"已有待审批申请 {existing['id']}。"
 
-        limits = self.config.application
-        if not await self.limiter.allow(
-            f"llm-query:{bot}:{user}:{scope}", limits.query_limit, limits.query_window_seconds
-        ):
-            raise ScopeError("申请核验过于频繁，请稍后重试。")
-        level = await self._member_level(settings, user, force=True)
+        level = None
+        if not (grant and grant["level_exempt"] and grant["membership_exempt"]):
+            limits = self.config.application
+            if not await self.limiter.allow(
+                f"llm-query:{bot}:{user}:{scope}", limits.query_limit, limits.query_window_seconds
+            ):
+                raise ScopeError("申请核验过于频繁，请稍后重试。")
+            level = await self._member_level(settings, user, force=True)
         async with self.db.transaction():
             await self._ensure_current(settings)
             grant = await self._application_grant(bot, user, scope)
@@ -592,6 +594,5 @@ class ScopeService:
             "levels": [dict(row) for row in levels],
         }
         if include_audit:
-            entries = await self.audit.query(bot_self_id=bot, target_user_id=user or None, limit=100)
-            data["audit"] = [entry.to_dict() for entry in entries]
+            data["audit"] = await self.audit.query(bot, target_user_id=user)
         return data

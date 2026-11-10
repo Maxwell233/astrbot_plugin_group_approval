@@ -1,4 +1,4 @@
-"""Tests for NapCat group member level query service, parsing, and caching."""
+"""Tests for NapCat group member level query service and parsing."""
 
 from __future__ import annotations
 
@@ -18,12 +18,15 @@ async def test_level_parsing_formats(mock_napcat: MockNapCatClient):
     assert svc.parse_level("18") == 18
     assert svc.parse_level("LV18") == 18
     assert svc.parse_level("lv25") == 25
+    assert svc.parse_level("lv 18") == 18
+    assert svc.parse_level("Lv0") == 0
     assert svc.parse_level("等级30") == 30
     assert svc.parse_level("0") == 0
     assert svc.parse_level("") is None
     assert svc.parse_level(None) is None
     assert svc.parse_level("invalid_string") is None
-    assert svc.parse_level(-5) is None
+    for invalid in (-5, "-5", "rank_999_user", "VIP1234", "LV", "hello 18 world", True, False):
+        assert svc.parse_level(invalid) is None
 
 
 @pytest.mark.asyncio
@@ -87,7 +90,7 @@ async def test_timeout_handling(mock_napcat: MockNapCatClient):
     mock_napcat.timeout_on_next = True
     svc = LevelService(mock_napcat)
 
-    res = await svc.get_group_member_level("bot1", "10001", "20001", force_refresh=True)
+    res = await svc.get_group_member_level("bot1", "10001", "20001")
     assert res.success is False
     assert "RETCODE" in res.error_code or "TIMEOUT" in res.error_code
 
@@ -107,42 +110,13 @@ async def test_left_group_member(mock_napcat: MockNapCatClient):
 async def test_identity_mismatch_check():
     # 10. 查询返回的群号与QQ号不符
     class MismatchNapCat(MockNapCatClient):
-        async def get_group_member_info(self, group_id: str, user_id: str, no_cache: bool = True):
-            return {
-                "status": "ok",
-                "retcode": 0,
-                "data": {
-                    "group_id": 999999,  # Mismatched group
-                    "user_id": int(user_id),
-                    "level": "15",
-                    "role": "member",
-                },
-            }
+        async def get_group_member_info(self, group_id, user_id, bot_self_id=None, no_cache=True):
+            return True, {"group_id": 999999, "user_id": int(user_id), "level": "15"}, "", 0
 
     svc = LevelService(MismatchNapCat())
     res = await svc.get_group_member_level("bot1", "10001", "20001")
     assert res.success is False
     assert res.error_code == "GROUP_ID_MISMATCH"
-
-
-@pytest.mark.asyncio
-async def test_caching_and_force_refresh(mock_napcat: MockNapCatClient):
-    svc = LevelService(mock_napcat, cache_ttl=60.0)
-
-    # First lookup: query NapCat
-    res1 = await svc.get_group_member_level("bot1", "10001", "20001")
-    assert res1.level == 10
-
-    # Modify remote level without force_refresh
-    mock_napcat.set_member(group_id="10001", user_id="20001", level="18")
-
-    # Second lookup: cached result returned
-    res2 = await svc.get_group_member_level("bot1", "10001", "20001", force_refresh=False)
-    assert res2.level == 10
-
-    # Third lookup with force_refresh: fresh remote data fetched
-    res3 = await svc.get_group_member_level("bot1", "10001", "20001", force_refresh=True)
-    assert res3.level == 18
 
 
 @pytest.mark.asyncio
@@ -152,6 +126,8 @@ async def test_concurrent_request_coalescing(mock_napcat: MockNapCatClient):
 
     async def counting_get(*args, **kwargs):
         nonlocal call_count
+        assert kwargs["bot_self_id"] == "bot1"
+        assert kwargs["no_cache"] is True
         call_count += 1
         await asyncio.sleep(0.05)  # simulate network latency
         return await orig_get(*args, **kwargs)
@@ -161,7 +137,7 @@ async def test_concurrent_request_coalescing(mock_napcat: MockNapCatClient):
 
     # Launch 5 concurrent queries for the exact same user
     tasks = [
-        svc.get_group_member_level("bot1", "10001", "20001", force_refresh=True)
+        svc.get_group_member_level("bot1", "10001", "20001")
         for _ in range(5)
     ]
     results = await asyncio.gather(*tasks)
@@ -182,9 +158,9 @@ async def test_cancelled_leader_resolves_shared_lookup_for_followers(monkeypatch
         await asyncio.Future()
 
     monkeypatch.setattr(mock_napcat, "get_group_member_info", blocked)
-    leader = asyncio.create_task(service.get_group_member_level("bot1", "10001", "20001", True))
+    leader = asyncio.create_task(service.get_group_member_level("bot1", "10001", "20001"))
     await asyncio.wait_for(entered.wait(), 2)
-    follower = asyncio.create_task(service.get_group_member_level("bot1", "10001", "20001", True))
+    follower = asyncio.create_task(service.get_group_member_level("bot1", "10001", "20001"))
     await asyncio.sleep(0)
     leader.cancel()
     with pytest.raises(asyncio.CancelledError):

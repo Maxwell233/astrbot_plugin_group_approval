@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import tempfile
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -25,7 +23,6 @@ class MockNapCatClient(NapCatClient):
         self.verified_bot_ids = ["10001"]
         self.members: dict[tuple[str, str], dict[str, Any]] = {}
         self.sent_private_messages: list[tuple[str, str]] = []
-        self.sent_group_messages: list[tuple[str, str]] = []
         self.timeout_on_next = False
         self.network_error_on_next = False
 
@@ -52,45 +49,28 @@ class MockNapCatClient(NapCatClient):
         bot_self_id: str | None = None,
         no_cache: bool = True,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> tuple[bool, dict[str, Any] | None, str, int]:
         if self.timeout_on_next:
             self.timeout_on_next = False
             await asyncio.sleep(0.01)
-            return {"status": "failed", "retcode": -1, "msg": "Timeout"}
+            return False, None, "Timeout", -1
 
         if self.network_error_on_next:
             self.network_error_on_next = False
-            return {"status": "failed", "retcode": 100, "msg": "Network failure"}
+            return False, None, "Network failure", 100
 
         key = (str(group_id), str(user_id))
-        if key not in self.members:
-            return {
-                "status": "failed",
-                "retcode": 10001,
-                "msg": "Group member not found or left group",
-            }
+        if key not in self.members or not self.members[key]["is_member"]:
+            return False, None, "Group member not found or left group", 10001
 
-        m = self.members[key]
-        if not m.get("is_member", True):
-            return {
-                "status": "failed",
-                "retcode": 10001,
-                "msg": "User is not a member",
-            }
-
-        return {
-            "status": "ok",
-            "retcode": 0,
-            "data": {
-                "group_id": int(group_id),
-                "user_id": int(user_id),
-                "nickname": f"User_{user_id}",
-                "card": "",
-                "level": m.get("level"),
-                "role": m.get("role", "member"),
-                "qq_level": m.get("qq_level", 50),
-            },
-        }
+        member = self.members[key]
+        return True, {
+            "group_id": int(group_id),
+            "user_id": int(user_id),
+            "level": member["level"],
+            "role": member["role"],
+            "qq_level": member["qq_level"],
+        }, "", 0
 
     async def list_bots(self) -> list[str]:
         return list(self.verified_bot_ids)
@@ -104,19 +84,9 @@ class MockNapCatClient(NapCatClient):
         message: str,
         bot_self_id: str | None = None,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> tuple[bool, dict[str, Any] | None, str, int]:
         self.sent_private_messages.append((str(user_id), message))
-        return {"status": "ok", "retcode": 0, "data": {"message_id": 123}}
-
-    async def send_group_msg(
-        self,
-        group_id: str,
-        message: str,
-        bot_self_id: str | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        self.sent_group_messages.append((str(group_id), message))
-        return {"status": "ok", "retcode": 0, "data": {"message_id": 456}}
+        return True, {"message_id": 123}, "", 0
 
 
 @pytest.fixture
@@ -130,22 +100,13 @@ def mock_napcat() -> MockNapCatClient:
 
 
 @pytest_asyncio.fixture
-async def temp_db() -> AsyncGenerator[Database, None]:
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
-        db_path = tf.name
-
-    db = Database(db_path)
+async def temp_db(tmp_path) -> AsyncGenerator[Database, None]:
+    db = Database(tmp_path / "test.db")
     await db.init()
-    yield db
-    await db.close()
-
-    # Clean up temp files
-    for p in (db_path, f"{db_path}-wal", f"{db_path}-shm"):
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+    try:
+        yield db
+    finally:
+        await db.close()
 
 
 @pytest.fixture
@@ -167,7 +128,8 @@ async def scoped(temp_db, mock_napcat, test_config):
         mock_napcat.set_member("10001", bot, "30")
     mock_napcat.set_member("10001", "20001", "15")
     await service.configure(
-        "11111", "99999", primary_group_id="10001", policies={"GROUP": {"approval_required": False}},
+        "11111", "99999", primary_group_id="10001",
+        policies={"GROUP": {"min_level": 10, "approval_required": False}, "PRIVATE": {"min_level": 20}},
     )
     return service, mock_napcat
 
@@ -179,7 +141,7 @@ async def dashboard_plugin(tmp_path, monkeypatch):
     import main
     from approval.auth_service import AuthorizationService
 
-    monkeypatch.setattr(main, "StarTools", SimpleNamespace(get_data_dir=lambda: tmp_path))
+    monkeypatch.setattr(main, "StarTools", SimpleNamespace(get_data_dir=lambda *_: tmp_path))
     monkeypatch.setattr(main, "ASTRBOT_AVAILABLE", True)
     instance = main.GroupApprovalPlugin(
         config={"enabled": False, "notifications": {"retry_enabled": False}}

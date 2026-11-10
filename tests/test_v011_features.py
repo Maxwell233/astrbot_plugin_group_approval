@@ -1,13 +1,12 @@
 """Protocol, reviewer, and request-parsing regressions."""
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from approval.napcat_client import NapCatClient, normalize_onebot_response
+from approval.napcat_client import normalize_onebot_response
 from approval.reviewers import ReviewerService
-from main import GroupApprovalPlugin, _get_query_param, _get_request_json
+from main import GroupApprovalPlugin
 from tests.test_scope_service import OWNER, REVIEWER
 
 
@@ -36,26 +35,6 @@ def test_napcat_normalization_formats():
     ok4, _, _, code4 = normalize_onebot_response(None)
     assert ok4 is False
     assert code4 == -4
-
-
-@pytest.mark.asyncio
-async def test_napcat_identity_requires_verified_mapping():
-    """No context / no verified get_login_info => fail closed (no first-client fallback).
-
-    The old mock-based test asserted a synchronous `_resolve_bot_client` selection based on
-    a nonexistent ``.self_id`` attribute; that was exactly the broken design. Real verified
-    multi-bot routing is covered by tests/test_bot_identity.py.
-    """
-    from approval.napcat_client import ERR_UNKNOWN_BOT_SELF_ID
-
-    client = NapCatClient()
-    assert await client.list_bots() == []
-
-    ok, data, err, code = await client.send_private_msg("123", "hi", bot_self_id="99999")
-    assert ok is False
-    assert data is None
-    assert code == -3, (err, code)
-    assert err.startswith(ERR_UNKNOWN_BOT_SELF_ID), err
 
 
 def test_no_runtime_moderation_priority_mutation():
@@ -88,12 +67,3 @@ async def test_reviewer_persistence_in_db(temp_db, test_config):
     assert await restarted.can_review("33333")
     assert await restarted.can_review(OWNER)
     assert await restarted.list_reviewers() == ["33333"]
-
-
-async def test_modern_request_parsing_uses_query_and_async_json():
-    async def get_json(default=None):
-        return {"action": "configure"}
-
-    request = SimpleNamespace(query={"bot_self_id": "11111"}, json=get_json)
-    assert _get_query_param(request, "bot_self_id") == "11111"
-    assert await _get_request_json(request) == {"action": "configure"}

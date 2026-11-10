@@ -1,18 +1,16 @@
-"""Group member level lookup service with TTL caching and request coalescing."""
+"""Group member level lookup service with request coalescing."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
-import time
 from typing import Any
 
 from .models import GroupMemberLevelResult
 from .napcat_client import (
     BOT_IDENTITY_ERROR_CODES,
     NapCatClient,
-    normalize_onebot_response,
 )
 
 logger = logging.getLogger("astrbot_plugin_group_approval.level")
@@ -22,18 +20,14 @@ STRICT_LEVEL_REGEX = re.compile(r"^(?:LV|lv|Lv|等级)?\s*(\d+)$")
 
 
 class LevelService:
-    """Manages group member level lookups, caching, and concurrent request coalescing."""
+    """Fetch fresh NapCat levels and share equivalent in-flight lookups."""
 
-    def __init__(self, napcat_client: NapCatClient, cache_ttl: float = 300.0):
+    def __init__(self, napcat_client: NapCatClient):
         self.client = napcat_client
-        self.cache_ttl = cache_ttl
-
-        # Cache key: (bot_id, group_id, user_id) -> (GroupMemberLevelResult, expire_timestamp)
-        self._cache: dict[tuple[str, str, str], tuple[GroupMemberLevelResult, float]] = {}
-
-        # Request coalescing (single-flight): key -> Future[GroupMemberLevelResult]
-        self._in_flight: dict[tuple[str, str, str, bool, tuple[int, int] | None], asyncio.Future[GroupMemberLevelResult]] = {}
-        self._lock = asyncio.Lock()
+        self._in_flight: dict[
+            tuple[str, str, str, tuple[int, int] | None],
+            asyncio.Future[GroupMemberLevelResult],
+        ] = {}
 
     def parse_level(self, raw_level: Any) -> int | None:
         """Strictly parse member level.
@@ -41,7 +35,7 @@ class LevelService:
         Returns integer if valid, or None if invalid/missing.
         Rejects arbitrary messy strings like 'rank_999_user'.
         """
-        if raw_level is None:
+        if raw_level is None or isinstance(raw_level, bool):
             return None
 
         if isinstance(raw_level, int):
@@ -65,113 +59,40 @@ class LevelService:
         bot_id: str,
         group_id: str,
         user_id: str,
-        force_refresh: bool = False,
         *,
         lookup_generation: tuple[int, int] | None = None,
     ) -> GroupMemberLevelResult:
-        """Query member group level with caching and single-flight concurrency."""
-        b_id = str(bot_id).strip()
-        g_id = str(group_id).strip()
-        u_id = str(user_id).strip()
-        key = (b_id, g_id, u_id)
-        request_key = (*key, force_refresh, lookup_generation)
-        now = time.time()
+        """Share only queries for the same Bot, member and snapshot generation."""
+        request_key = (bot_id, group_id, user_id, lookup_generation)
+        pending = self._in_flight.get(request_key)
+        if pending is not None:
+            return await asyncio.shield(pending)
 
-        # 1. Check cache if not forcing refresh
-        if not force_refresh:
-            cached = self._cache.get(key)
-            if cached is not None:
-                res, expire_at = cached
-                if now < expire_at:
-                    return res
-
-        # 2. Check in-flight requests (request coalescing)
-        async with self._lock:
-            # Re-check cache under lock
-            if not force_refresh:
-                cached = self._cache.get(key)
-                if cached is not None:
-                    res, expire_at = cached
-                    if now < expire_at:
-                        return res
-
-            # A forced lookup must not join a request that allowed NapCat caching.
-            future = self._in_flight.get(request_key)
-            if future is not None:
-                # Another task is currently fetching the exact same user info
-                need_wait = True
-            else:
-                loop = asyncio.get_running_loop()
-                future = loop.create_future()
-                self._in_flight[request_key] = future
-                need_wait = False
-
-        if need_wait:
-            return await asyncio.shield(future)
-
-        # 3. Perform actual remote query
+        pending = asyncio.get_running_loop().create_future()
+        self._in_flight[request_key] = pending
         try:
-            result = await self._fetch_from_napcat(b_id, g_id, u_id, force_refresh)
-            # Store in cache only on successful member lookup
-            expires_at = now + self.cache_ttl
-            cached = self._cache.get(key)
-            if (lookup_generation is None and result.success and result.is_member
-                    and (cached is None or cached[1] <= expires_at)):
-                self._cache[key] = (result, expires_at)
-
-            if not future.done():
-                future.set_result(result)
-            return result
+            result = await self._fetch_from_napcat(bot_id, group_id, user_id)
         except asyncio.CancelledError:
-            # Followers deny this request instead of waiting forever. The
-            # leader still propagates the framework's cancellation.
-            if not future.done():
-                future.set_result(GroupMemberLevelResult(
-                    success=False, group_id=g_id, user_id=u_id, error_code="QUERY_CANCELLED",
-                ))
+            pending.set_result(GroupMemberLevelResult(
+                success=False, group_id=group_id, user_id=user_id, error_code="QUERY_CANCELLED",
+            ))
             raise
-        except Exception as e:
-            err_res = GroupMemberLevelResult(
-                success=False,
-                level=0,
-                is_member=False,
-                group_id=g_id,
-                user_id=u_id,
-                error_code=f"QUERY_EXCEPTION_{type(e).__name__}",
+        except Exception as exc:
+            logger.exception("NapCat level lookup raised an unexpected exception")
+            result = GroupMemberLevelResult(
+                success=False, group_id=group_id, user_id=user_id,
+                error_code=f"QUERY_EXCEPTION_{type(exc).__name__}",
             )
-            if not future.done():
-                future.set_result(err_res)
-            return err_res
         finally:
-            async with self._lock:
-                self._in_flight.pop(request_key, None)
+            del self._in_flight[request_key]
 
-    async def _fetch_from_napcat(
-        self,
-        bot_id: str,
-        group_id: str,
-        user_id: str,
-        force_refresh: bool,
-    ) -> GroupMemberLevelResult:
-        """Call NapCat OneBot API and validate responses."""
-        try:
-            res = await self.client.get_group_member_info(
-                group_id=group_id,
-                user_id=user_id,
-                bot_self_id=bot_id,
-                no_cache=force_refresh,
-            )
-        except TypeError:
-            res = await self.client.get_group_member_info(
-                group_id=group_id,
-                user_id=user_id,
-                no_cache=force_refresh,
-            )
+        pending.set_result(result)
+        return result
 
-        if isinstance(res, tuple) and len(res) == 4:
-            ok, data, err_msg, retcode = res
-        else:
-            ok, data, err_msg, retcode = normalize_onebot_response(res)
+    async def _fetch_from_napcat(self, bot_id: str, group_id: str, user_id: str) -> GroupMemberLevelResult:
+        ok, data, err_msg, retcode = await self.client.get_group_member_info(
+            group_id=group_id, user_id=user_id, bot_self_id=bot_id, no_cache=True,
+        )
 
         # Check for successful OneBot response
         if not ok or not isinstance(data, dict):
@@ -274,12 +195,3 @@ class LevelService:
             user_id=user_id,
             raw_data=data,
         )
-
-    def invalidate_cache(self, bot_id: str, group_id: str, user_id: str) -> None:
-        """Evict cache entry."""
-        key = (str(bot_id).strip(), str(group_id).strip(), str(user_id).strip())
-        self._cache.pop(key, None)
-
-    def clear_cache(self) -> None:
-        """Clear all cached level entries."""
-        self._cache.clear()

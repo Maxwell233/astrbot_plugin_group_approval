@@ -76,6 +76,14 @@
       </table></div>
     </section>
   </div>
+  <dialog id="reject-dialog" aria-labelledby="reject-title">
+    <form method="dialog">
+      <h2 id="reject-title">拒绝申请</h2>
+      <label>原因（可选） <textarea id="reject-note" maxlength="500" rows="3"></textarea></label>
+      <button class="btn btn-secondary" type="submit" value="cancel">取消</button>
+      <button class="btn btn-primary" type="submit" value="reject">确认拒绝</button>
+    </form>
+  </dialog>
 </main>
 <script type="module" src="./app.js"></script>
 </body>

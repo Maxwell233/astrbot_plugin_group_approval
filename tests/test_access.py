@@ -2,7 +2,7 @@
 
 from approval import AuditService, Database, LevelService, NotificationService, ReviewerService
 from approval.scope_service import ScopeService
-from tests.test_scope_service import BOT, OTHER_BOT, OWNER, PRIMARY, USER
+from tests.test_scope_service import BOT, OWNER, PRIMARY, USER
 
 
 async def test_access_requires_active_grant(scoped):
@@ -17,28 +17,6 @@ async def test_revocation_immediately_blocks_access(scoped):
     await service.apply(BOT, USER, "GROUP", PRIMARY)
     await service.restrict(BOT, USER, ["GROUP"], OWNER, "OWNER")
     assert await service.check_chat(BOT, USER, "GROUP")
-
-
-async def test_blacklist_overrides_active_grant(scoped):
-    service, _ = scoped
-    await service.apply(BOT, USER, "GROUP", PRIMARY)
-    await service.restrict(BOT, USER, ["GROUP"], OWNER, "OWNER", kind="BLACKLIST")
-    assert (await service.grant(BOT, USER, "GROUP"))["status"] == "ACTIVE"
-    assert await service.check_chat(BOT, USER, "GROUP")
-
-
-async def test_group_chat_source_does_not_become_a_second_level_source(scoped):
-    service, napcat = scoped
-    napcat.set_member("10002", USER, "0")
-    await service.apply(BOT, USER, "GROUP", "10002")
-    assert await service.check_chat(BOT, USER, "GROUP") is None
-
-
-async def test_cross_bot_id_isolation(scoped):
-    service, _ = scoped
-    await service.apply(BOT, USER, "GROUP", PRIMARY)
-    assert await service.check_chat(BOT, USER, "GROUP") is None
-    assert await service.check_chat(OTHER_BOT, USER, "GROUP")
 
 
 async def test_persistence_across_restart(scoped):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -45,8 +46,9 @@ PLUGIN_NAME = "astrbot_plugin_group_approval"
 # Graceful AstrBot import with standalone fallback
 try:
     from astrbot.api.event import AstrMessageEvent, filter
-    from astrbot.api.star import Context, Star, StarTools
+    from astrbot.api.star import Star, StarTools
     from astrbot.api.web import json_response, request
+    from astrbot.core.platform.message_type import MessageType
 
     ASTRBOT_AVAILABLE = True
 except ImportError:
@@ -56,37 +58,24 @@ except ImportError:
         def __init__(self, context: Any = None):
             self.context = context
 
-    class Context:  # type: ignore
-        pass
+    StarTools = None  # type: ignore
 
-    class AstrTools:  # type: ignore
-        @staticmethod
-        def get_data_dir() -> Path:
-            return Path("data")
-
-    StarTools = AstrTools  # type: ignore
+    class MessageType(Enum):  # type: ignore
+        GROUP_MESSAGE = "GroupMessage"
+        FRIEND_MESSAGE = "FriendMessage"
+        OTHER_MESSAGE = "OtherMessage"
 
     class _FilterMock:
         class PlatformAdapterType:
             AIOCQHTTP = "aiocqhttp"
-
-        class EventMessageType:
-            ALL = "ALL"
-
-        def event_message_type(self, *args: Any, **kwargs: Any) -> Any:
-            def dec(f: Any) -> Any:
-                return f
-
-            return dec
-
-        platform_adapter_type = event_message_type
-        on_astrbot_loaded = event_message_type
 
         def command(self, *args: Any, **kwargs: Any) -> Any:
             def dec(f: Any) -> Any:
                 return f
 
             return dec
+
+        platform_adapter_type = command
 
     filter = _FilterMock()  # type: ignore
     AstrMessageEvent = Any  # type: ignore
@@ -97,104 +86,6 @@ except ImportError:
         return data
 
     request = Any  # type: ignore
-
-# Real AstrBot message types (only used to skip non-chat events such as notices/requests).
-try:
-    from astrbot.core.platform.message_type import MessageType as _RealMessageType
-except ImportError:  # pragma: no cover - standalone test mode
-    _RealMessageType = None
-
-
-def _is_onebot_event(event: Any) -> bool:
-    get_platform_name = getattr(event, "get_platform_name", None)
-    return callable(get_platform_name) and get_platform_name() == "aiocqhttp"
-
-
-def _bot_self_id(event: Any) -> str:
-    """Return the verified bot QQ id from an inbound event, or '' when unavailable.
-
-    NEVER substitutes a placeholder: a missing identity must fail closed, not silently bind
-    business data to a fake bot id.
-    """
-    try:
-        return str(event.get_self_id() or "").strip()
-    except Exception:  # noqa: BLE001 - defensive for odd adapters
-        return ""
-
-
-def _group_id(event: Any) -> str | None:
-    try:
-        gid = event.get_group_id()
-    except Exception:  # noqa: BLE001
-        return None
-    gid = str(gid).strip() if gid is not None else ""
-    return gid or None
-
-
-def _is_chat_message(event: Any, msg_obj: Any) -> bool:
-    """Return True only for real chat messages (group/private), never notices/requests.
-
-    AstrBot's ``EventMessageType.ALL`` also matches ``OTHER_MESSAGE``, so the gate must
-    filter explicitly. On real AstrBot the authoritative source is
-    ``event.get_message_type()``; the OneBot ``post_type`` fallback keeps the behaviour
-    testable without the framework.
-    """
-    getter = getattr(event, "get_message_type", None)
-    if callable(getter):
-        try:
-            message_type = getter()
-        except Exception:  # noqa: BLE001
-            message_type = None
-        if message_type is not None:
-            if _RealMessageType is not None:
-                return message_type in (_RealMessageType.GROUP_MESSAGE, _RealMessageType.FRIEND_MESSAGE)
-            name = str(message_type).upper()
-            return name.endswith("GROUP_MESSAGE") or name.endswith("FRIEND_MESSAGE")
-
-    for source in (msg_obj, getattr(event, "raw_message", None), getattr(event, "raw_event", None)):
-        if source is None:
-            continue
-        post_type = source.get("post_type") if isinstance(source, dict) else getattr(source, "post_type", None)
-        if post_type:
-            return str(post_type).strip().lower() == "message"
-    return False
-
-
-def _get_query_param(req: Any, name: str, default: Any = None) -> Any:
-    """Fetch query parameter supporting modern request.query and legacy request.args."""
-    query = getattr(req, "query", None)
-    if query and hasattr(query, "get"):
-        val = query.get(name)
-        if val is not None:
-            return val
-    args = getattr(req, "args", None)
-    if args and hasattr(args, "get"):
-        return args.get(name, default)
-    return default
-
-
-async def _get_request_json(req: Any) -> dict[str, Any]:
-    """Parse request JSON payload supporting await request.json(default={}) and get_json()."""
-    if hasattr(req, "json"):
-        try:
-            res = req.json(default={}) if callable(req.json) else req.json
-            if asyncio.iscoroutine(res):
-                res = await res
-            if isinstance(res, dict):
-                return res
-        except Exception:  # noqa: BLE001 - malformed body => empty payload
-            pass
-    if hasattr(req, "get_json"):
-        try:
-            res = req.get_json()
-            if asyncio.iscoroutine(res):
-                res = await res
-            if isinstance(res, dict):
-                return res
-        except Exception:  # noqa: BLE001
-            pass
-    return {}
-
 
 class GroupApprovalPlugin(Star):
     """Group Approval Star Plugin."""
@@ -207,20 +98,8 @@ class GroupApprovalPlugin(Star):
         raw_cfg = getattr(config, "to_dict", lambda: config)() if config else {}
         self.plugin_config = PluginConfig.from_dict(raw_cfg)
 
-        # 2. Resolve persistent data directory
-        if ASTRBOT_AVAILABLE and hasattr(StarTools, "get_data_dir"):
-            try:
-                self.data_dir = StarTools.get_data_dir()
-            except Exception:  # noqa: BLE001
-                self.data_dir = Path("data") / PLUGIN_NAME
-        else:
-            self.data_dir = Path("data") / PLUGIN_NAME
-
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.data_dir / "group_approval.db"
-
-        # 3. Instantiate database & core services
-        self.db = Database(self.db_path)
+        data_dir = StarTools.get_data_dir(PLUGIN_NAME) if ASTRBOT_AVAILABLE else Path("data") / PLUGIN_NAME
+        self.db = Database(data_dir / "group_approval.db")
         self.napcat = NapCatClient()
         if context is not None:
             self.napcat.set_context(context)
@@ -244,6 +123,8 @@ class GroupApprovalPlugin(Star):
             dashboard_username_getter=build_dashboard_username_getter(context),
         )
         self._initialized = False
+        self._web_handlers = []
+        self._web_requests: set[asyncio.Future[None]] = set()
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -260,21 +141,26 @@ class GroupApprovalPlugin(Star):
                 self.notification_service.start_worker()
             self._initialized = True
         except BaseException:
+            self._unregister_web_routes()
             await self.native_guard.uninstall()
             await self.db.close()
             raise
         logger.info("Group Approval 0.1.2 initialized. Native LLM guard active: %s", self.native_guard.installed)
 
     async def terminate(self) -> None:
+        self._initialized = False
+        self._unregister_web_routes()
         await self.native_guard.uninstall()
+        if self._web_requests:
+            await asyncio.wait(self._web_requests)
         try:
             await self.notification_service.stop_worker()
         finally:
             await self.db.close()
-            self._initialized = False
 
     async def _event_identity(self, event: AstrMessageEvent) -> tuple[str, str]:
-        bot, user = _bot_self_id(event), str(event.get_sender_id() or "").strip()
+        bot = str(event.get_self_id() or "").strip()
+        user = str(event.get_sender_id() or "").strip()
         if not valid_qq(bot) or not valid_qq(user) or not await self.napcat.has_verified_bot(
             bot, event.get_platform_id()
         ):
@@ -282,7 +168,7 @@ class GroupApprovalPlugin(Star):
         return bot, user
 
     async def _check_native_chat(self, event: AstrMessageEvent) -> str | None:
-        if not _is_chat_message(event, event.message_obj):
+        if event.get_message_type() not in (MessageType.GROUP_MESSAGE, MessageType.FRIEND_MESSAGE):
             return "无法确认原生 AI 聊天的会话类型。"
         try:
             bot, user = await self._event_identity(event)
@@ -290,17 +176,27 @@ class GroupApprovalPlugin(Star):
             return str(exc)
         if event.is_private_chat():
             return await self.scopes.check_chat(bot, user, "PRIVATE")
-        if not _group_id(event):
+        if not event.get_group_id():
             return "无法确认当前 QQ 群会话。"
         return await self.scopes.check_chat(bot, user, "GROUP")
 
     def _register_web_routes(self) -> None:
-        if self.context is None or not hasattr(self.context, "register_web_api"):
+        if self.context is None:
             return
 
         def wrap(fn):
-            async def handler(*args, **kwargs):
-                return json_response(await fn())
+            async def handler():
+                if not self._initialized:
+                    return json_response(self._err("插件当前不可用。", 503))
+                done = asyncio.get_running_loop().create_future()
+                self._web_requests.add(done)
+                try:
+                    return json_response(await fn())
+                finally:
+                    self._web_requests.remove(done)
+                    done.set_result(None)
+
+            self._web_handlers.append(handler)
             return handler
 
         for path, method, fn in (
@@ -309,6 +205,13 @@ class GroupApprovalPlugin(Star):
             ("scope/action", "POST", self._web_action),
         ):
             self.context.register_web_api(f"/{PLUGIN_NAME}/{path}", wrap(fn), [method], path)
+
+    def _unregister_web_routes(self) -> None:
+        if self._web_handlers:
+            # AstrBot 4.29.4 has no unregister API. Preserve any newer registrations.
+            routes = self.context.registered_web_apis
+            routes[:] = [entry for entry in routes if all(entry[1] is not handler for handler in self._web_handlers)]
+            self._web_handlers.clear()
 
     async def _dashboard_owner(self) -> str | None:
         operator = self.auth.get_authenticated_user(request)
@@ -337,10 +240,10 @@ class GroupApprovalPlugin(Star):
     async def _web_state(self):
         if not await self._dashboard_owner():
             return self._err("需要 AstrBot Dashboard 管理员登录。", 403)
-        bot = str(_get_query_param(request, "bot_self_id", "")).strip()
+        bot = str(request.query.get("bot_self_id", "")).strip()
         if not valid_qq(bot) or bot not in await self.napcat.list_bots():
             return self._err("请选择已核验的 OneBot 账号。", 403)
-        user = str(_get_query_param(request, "user_id", "")).strip()
+        user = str(request.query.get("user_id", "")).strip()
         if user and not valid_qq(user):
             return self._err("QQ 格式无效。")
         return self._ok(await self.scopes.overview(bot, user=user, include_audit=True))
@@ -349,7 +252,9 @@ class GroupApprovalPlugin(Star):
         operator = await self._dashboard_owner()
         if not operator:
             return self._err("需要 AstrBot Dashboard 管理员登录。", 403)
-        payload = await _get_request_json(request)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return self._err("请求正文必须为 JSON 对象。")
         bot = str(payload.get("bot_self_id", "")).strip()
         if not valid_qq(bot) or not await self.napcat.verify_bot(bot):
             return self._err("当前 OneBot 账号未通过连接核验。", 403)
@@ -360,7 +265,7 @@ class GroupApprovalPlugin(Star):
         return self._ok({"message": result})
 
     async def _command(self, event: AstrMessageEvent, name: str) -> str | None:
-        if not self.plugin_config.enabled or not _is_onebot_event(event):
+        if not self.plugin_config.enabled or event.get_platform_name() != "aiocqhttp":
             return None
         # Suppress only this command's implicit native chat; the next plugin
         # handler can still run, including one that explicitly yields a request.
@@ -370,7 +275,7 @@ class GroupApprovalPlugin(Star):
             args = (event.message_str or "").split()[1:]
             if name == "ga":
                 return await self.commands.admin(bot, user, event.is_private_chat(), args)
-            return await self.commands.user(bot, user, event.is_private_chat(), name, args, _group_id(event) or "")
+            return await self.commands.user(bot, user, event.is_private_chat(), name, args, event.get_group_id() or "")
         except ScopeError as exc:
             return str(exc)
 

@@ -12,6 +12,7 @@ import pytest
 pytest.importorskip("astrbot")
 
 from astrbot.core.pipeline.process_stage.stage import AgentRequestSubStage  # noqa: E402
+from astrbot.core.star.context import Context  # noqa: E402
 
 import approval.native_llm as native  # noqa: E402
 import main  # noqa: E402
@@ -155,7 +156,7 @@ async def test_uninstall_drains_checks_before_closing_database(stage, tmp_path, 
     agent, downstream, calls = stage
     entered, release = asyncio.Event(), asyncio.Event()
     checked = []
-    monkeypatch.setattr(main, "StarTools", SimpleNamespace(get_data_dir=lambda: tmp_path))
+    monkeypatch.setattr(main, "StarTools", SimpleNamespace(get_data_dir=lambda *_: tmp_path))
 
     async def check(self, event):
         checked.append(event)
@@ -184,6 +185,48 @@ async def test_uninstall_drains_checks_before_closing_database(stage, tmp_path, 
     assert plugin.db._shared_conn is None
     assert AgentRequestSubStage.process is downstream
     assert not calls
+
+
+async def test_unload_unregisters_and_drains_dashboard_routes(tmp_path, monkeypatch):
+    context = object.__new__(Context)
+    context.registered_web_apis = []
+    monkeypatch.setattr(main, "StarTools", SimpleNamespace(get_data_dir=lambda *_: tmp_path))
+    monkeypatch.setattr(main, "json_response", lambda data: data)
+    plugin = main.GroupApprovalPlugin(
+        context, config={"enabled": False, "notifications": {"retry_enabled": False}},
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def state():
+        entered.set()
+        await release.wait()
+        assert plugin.db._shared_conn is not None
+        return {"status": "ok"}
+
+    async def replacement():
+        return {}
+
+    monkeypatch.setattr(plugin, "_web_state", state)
+    await plugin.initialize()
+    routes = {entry[0]: entry[1] for entry in context.registered_web_apis}
+    state_handler = routes[f"/{main.PLUGIN_NAME}/scope/state"]
+    bots_path = f"/{main.PLUGIN_NAME}/bots"
+    context.register_web_api(bots_path, replacement, ["GET"], "replacement")
+    request = asyncio.create_task(state_handler())
+    await asyncio.wait_for(entered.wait(), 2)
+    closing = asyncio.create_task(plugin.terminate())
+    await asyncio.sleep(0)
+    try:
+        assert context.registered_web_apis == [(bots_path, replacement, ["GET"], "replacement")]
+        assert not closing.done()
+        assert (await asyncio.wait_for(state_handler(), 2))["retcode"] == 503
+    finally:
+        release.set()
+        await asyncio.gather(request, closing, return_exceptions=True)
+    assert request.result() == {"status": "ok"}
+    assert plugin.db._shared_conn is None
+    assert (await state_handler())["retcode"] == 503
+    assert plugin.db._shared_conn is None
 
 
 async def test_plugin_filter_cannot_skip_guard_and_cancel_propagates(stage):

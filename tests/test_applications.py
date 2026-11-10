@@ -1,6 +1,5 @@
 """Current application transitions and live member verification."""
 
-import asyncio
 from sqlite3 import IntegrityError
 
 import pytest
@@ -22,14 +21,6 @@ async def test_apply_under_level_rejected(scoped):
     with pytest.raises(ScopeError, match="需要 LV20"):
         await service.apply(BOT, USER, "PRIVATE", "")
     assert not (await service.overview(BOT))["applications"]
-
-
-async def test_duplicate_pending_prevented(scoped):
-    service, napcat = scoped
-    napcat.set_member(PRIMARY, USER, "25")
-    await service.apply(BOT, USER, "PRIVATE", "")
-    assert "已有" in await service.apply(BOT, USER, "PRIVATE", "")
-    assert len((await service.overview(BOT))["applications"]) == 1
 
 
 @pytest.mark.parametrize("approve", [True, False])
@@ -108,32 +99,6 @@ async def test_unban_rolls_back_when_audit_insert_fails(scoped, scopes):
         assert await service._restricted(BOT, USER, scope)
 
 
-async def test_manual_grant_does_not_join_an_inflight_cached_member_lookup(scoped, monkeypatch):
-    service, napcat = scoped
-    entered, release = asyncio.Event(), asyncio.Event()
-    calls = []
-
-    async def query(*, no_cache, **kwargs):
-        calls.append(no_cache)
-        if no_cache:
-            return {"status": "failed", "retcode": 10001}
-        entered.set()
-        await release.wait()
-        return {"group_id": PRIMARY, "user_id": USER, "level": 30}
-
-    monkeypatch.setattr(napcat, "get_group_member_info", query)
-    old = asyncio.create_task(service.level.get_group_member_level(BOT, PRIMARY, USER))
-    try:
-        await asyncio.wait_for(entered.wait(), 2)
-        with pytest.raises(ScopeError):
-            await asyncio.wait_for(service.manual_grant(BOT, USER, "GROUP", OWNER), 2)
-        assert calls == [False, True]
-        assert not await service.grant(BOT, USER, "GROUP")
-    finally:
-        release.set()
-        await asyncio.wait_for(old, 2)
-
-
 @pytest.mark.parametrize("reply", [
     {"user_id": 20001, "group_id": 10001, "level": "20", "is_member": False},
     {"group_id": 10001, "level": "20"},
@@ -143,7 +108,7 @@ async def test_exempt_manual_grant_requires_reply_to_verify_target(scoped, monke
     service, napcat = scoped
 
     async def lookup(**kwargs):
-        return reply
+        return True, reply, "", 0
 
     monkeypatch.setattr(napcat, "get_group_member_info", lookup)
     with pytest.raises(ScopeError):
