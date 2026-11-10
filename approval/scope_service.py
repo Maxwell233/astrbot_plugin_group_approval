@@ -264,35 +264,62 @@ class ScopeService:
         await self._log(grant["bot_self_id"], actor, role, "LLM_GRANT_RESTORED", user=grant["user_id"],
                         scope=grant["scope"], primary=settings.primary_group_id)
 
+    async def _pending(self, bot, user, scope):
+        return await self.db.fetchone(
+            """SELECT id FROM applications_v2 WHERE bot_self_id = ? AND user_id = ?
+               AND scope = ? AND status = 'PENDING'""", (bot, user, scope)
+        )
+
+    async def _cross_source(self, settings, user, scope):
+        other = "PRIVATE" if scope == "GROUP" else "GROUP"
+        enabled = settings.private_to_group if scope == "GROUP" else settings.group_to_private
+        if not enabled:
+            return None
+        bot = settings.bot_self_id
+        source = await self.grant(bot, user, other)
+        if source and source["status"] == "ACTIVE" and not await self._restricted(bot, user, other):
+            return source
+        return None
+
+    async def _application_grant(self, bot, user, scope):
+        if await self._restricted(bot, user, scope):
+            raise ScopeError("此域已被撤销或列入黑名单，请联系管理员。")
+        grant = await self.grant(bot, user, scope)
+        if grant and grant["status"] == "REVOKED":
+            raise ScopeError("此域已被人工撤销，请联系管理员。")
+        return grant
+
     async def apply(self, bot: str, user: str, scope: Scope, source_group: str, reason: str = "") -> str:
         settings = await self.settings(bot)
         policy = await self.policy(bot, scope)
+        grant = await self._application_grant(bot, user, scope)
+        if grant and grant["status"] == "ACTIVE":
+            return f"已有{LABELS[scope]} AI 聊天权限。"
+        existing = await self._pending(bot, user, scope)
+        if existing and not grant and policy.approval_required and not await self._cross_source(settings, user, scope):
+            return f"已有待审批申请 {existing['id']}。"
+
+        limits = self.config.application
+        if not await self.legacy.check_and_increment_rate_limit(
+            f"llm-query:{bot}:{user}:{scope}", limits.query_limit, limits.query_window_seconds
+        ):
+            raise ScopeError("申请核验过于频繁，请稍后重试。")
         level = await self._member_level(settings, user, force=True)
         async with self.db.transaction():
             await self._ensure_current(settings)
-            if await self._restricted(bot, user, scope):
-                raise ScopeError("此域已被撤销或列入黑名单，请联系管理员。")
-            grant = await self.grant(bot, user, scope)
-            if grant and grant["status"] == "REVOKED":
-                raise ScopeError("此域已被人工撤销，请联系管理员。")
+            grant = await self._application_grant(bot, user, scope)
+            if grant and grant["status"] == "ACTIVE":
+                return f"已有{LABELS[scope]} AI 聊天权限。"
             denied = self._qualification(level, policy, grant)
             if denied:
                 raise ScopeError(denied)
-            if grant and grant["status"] == "ACTIVE":
-                return f"已有{LABELS[scope]} AI 聊天权限。"
             if grant and grant["status"] == "SUSPENDED":
                 await self._restore(grant, settings, user, "USER")
                 return f"{LABELS[scope]} AI 聊天权限已恢复。"
-            existing = await self.db.fetchone(
-                """SELECT id FROM applications_v2 WHERE bot_self_id = ? AND user_id = ?
-                   AND scope = ? AND status = 'PENDING'""", (bot, user, scope)
-            )
-            other = "PRIVATE" if scope == "GROUP" else "GROUP"
-            cross_enabled = settings.private_to_group if scope == "GROUP" else settings.group_to_private
-            source = await self.grant(bot, user, other) if cross_enabled else None
+            existing = await self._pending(bot, user, scope)
+            source = await self._cross_source(settings, user, scope)
             cross = bool(
-                source and source["status"] == "ACTIVE" and not await self._restricted(bot, user, other)
-                and not self._qualification(level, await self.policy(bot, other), source)
+                source and not self._qualification(level, await self.policy(bot, source["scope"]), source)
             )
             if cross or not policy.approval_required:
                 source_type = "CROSS_GRANT" if cross else "AUTO_NO_APPROVAL"

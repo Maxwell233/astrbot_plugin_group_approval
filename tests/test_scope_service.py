@@ -143,6 +143,7 @@ async def test_administrators_do_not_automatically_get_chat_permissions(scoped):
 
 async def test_concurrent_application_and_review_are_idempotent(scoped):
     service, napcat = scoped
+    service.config.application.query_limit = 5
     napcat.set_member(PRIMARY, USER, "25")
     await service.configure(BOT, OWNER, policies={"GROUP": {"approval_required": True}})
     await asyncio.gather(*(service.apply(BOT, USER, "PRIVATE", "") for _ in range(5)))
@@ -293,3 +294,77 @@ async def test_blacklist_all_scope_and_failed_audit_rollback(scoped, monkeypatch
     await service.restrict(BOT, USER, ["GROUP", "PRIVATE"], OWNER, "OWNER", kind="BLACKLIST", remove=True)
     assert await service.check_chat(BOT, USER, "GROUP") is None
     assert await service.check_chat(BOT, USER, "PRIVATE")
+
+
+@pytest.mark.parametrize("network_error", [False, True])
+async def test_ineligible_and_failed_queries_consume_pre_network_rate_limit(scoped, monkeypatch, network_error):
+    service, napcat = scoped
+    await service.configure(OTHER_BOT, OWNER, primary_group_id=PRIMARY)
+    original = napcat.get_group_member_info
+    calls = []
+
+    async def record(**kwargs):
+        calls.append(kwargs)
+        if network_error:
+            return {"status": "failed", "retcode": 100}
+        return await original(**kwargs)
+
+    monkeypatch.setattr(napcat, "get_group_member_info", record)
+    napcat.set_member(PRIMARY, USER, "0")
+    for _ in range(8):
+        with pytest.raises(ScopeError):
+            await service.apply(BOT, USER, "GROUP", "")
+    assert len(calls) == 3
+    for bot, scope in [(BOT, "PRIVATE"), (OTHER_BOT, "GROUP")]:
+        with pytest.raises(ScopeError):
+            await service.apply(bot, USER, scope, "")
+    assert len(calls) == 5
+
+
+async def test_pending_and_active_repeat_without_network(scoped, monkeypatch):
+    service, napcat = scoped
+    napcat.set_member(PRIMARY, USER, "25")
+    await service.apply(BOT, USER, "GROUP", "")
+    pending = await service.apply(BOT, USER, "PRIVATE", "")
+
+    async def unexpected(**kwargs):
+        pytest.fail("repeat application should not query NapCat")
+
+    monkeypatch.setattr(napcat, "get_group_member_info", unexpected)
+    assert "已有" in await service.apply(BOT, USER, "GROUP", "")
+    assert pending.split("编号 ")[1].rstrip("。") in await service.apply(BOT, USER, "PRIVATE", "")
+
+
+async def test_concurrent_failed_applications_cannot_exceed_query_limit(scoped, monkeypatch):
+    service, napcat = scoped
+    calls = 0
+
+    async def fail(**kwargs):
+        nonlocal calls
+        calls += 1
+        return {"status": "failed", "retcode": 100}
+
+    monkeypatch.setattr(napcat, "get_group_member_info", fail)
+    outcomes = await asyncio.gather(
+        *(service.apply(BOT, USER, "GROUP", "") for _ in range(15)), return_exceptions=True
+    )
+    assert all(isinstance(result, ScopeError) for result in outcomes)
+    assert calls == 3
+    assert sum("频繁" in str(result) for result in outcomes) == 12
+
+
+async def test_hourly_limit_only_charges_new_pending_and_remains_independent(scoped, monkeypatch):
+    service, napcat = scoped
+    service.config.application.rate_limit_per_hour = 1
+    service.config.application.query_limit = 4
+    napcat.set_member(PRIMARY, USER, "25")
+    first = await service.apply(BOT, USER, "PRIVATE", "")
+    assert "已有" in await service.apply(BOT, USER, "PRIVATE", "")
+    await service.cancel(BOT, USER, "PRIVATE")
+    with pytest.raises(ScopeError, match="过于频繁"):
+        await service.apply(BOT, USER, "PRIVATE", "")
+    assert "已开通" in await service.apply(BOT, USER, "GROUP", "")
+    await service.configure(BOT, OWNER, group_to_private=True)
+    assert "已开通" in await service.apply(BOT, USER, "PRIVATE", "")
+    assert (await service.grant(BOT, USER, "PRIVATE"))["source"] == "CROSS_GRANT"
+    assert first.startswith("私聊申请已提交")

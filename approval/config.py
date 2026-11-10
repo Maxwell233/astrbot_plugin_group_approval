@@ -12,6 +12,8 @@ class ApplicationConfig:
     reject_cooldown_hours: int = 24
     duplicate_pending_allowed: bool = False
     rate_limit_per_hour: int = 5
+    query_limit: int = 3
+    query_window_seconds: int = 60
 
 
 @dataclass
@@ -70,6 +72,8 @@ class PluginConfig:
             reject_cooldown_hours=int(app_raw.get("reject_cooldown_hours", 24)),
             duplicate_pending_allowed=bool(app_raw.get("duplicate_pending_allowed", False)),
             rate_limit_per_hour=int(app_raw.get("rate_limit_per_hour", 5)),
+            query_limit=max(1, int(app_raw.get("query_limit", 3))),
+            query_window_seconds=max(1, int(app_raw.get("query_window_seconds", 60))),
         )
 
         # Parse private chat config

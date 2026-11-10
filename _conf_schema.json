@@ -33,6 +33,16 @@
         "description": "每 Bot、用户、域每小时可新建的待审申请数。0 表示不限频",
         "type": "int",
         "default": 5
+      },
+      "query_limit": {
+        "description": "每 Bot、用户、域在窗口内允许发起等级查询的申请次数",
+        "type": "int",
+        "default": 3
+      },
+      "query_window_seconds": {
+        "description": "申请命令限频窗口（秒）",
+        "type": "int",
+        "default": 60
       }
     }
   },
